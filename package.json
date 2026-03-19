@@ -1,0 +1,63 @@
+{
+  "name": "@abshahin/subscriptions",
+  "version": "0.1.0",
+  "description": "Type-safe subscription plans, feature gates, usage limits, invoices, and Elysia integration for multi-tenant TypeScript applications.",
+  "license": "MIT",
+  "type": "module",
+  "sideEffects": false,
+  "files": [
+    "src",
+    "docs",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "subscriptions",
+    "billing",
+    "saas",
+    "multi-tenant",
+    "elysia",
+    "prisma",
+    "feature-flags",
+    "usage-limits",
+    "moyasar",
+    "typescript"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/aashahin/subscriptions-sdk.git"
+  },
+  "homepage": "https://github.com/aashahin/subscriptions-sdk#readme",
+  "exports": {
+    ".": "./src/index.ts",
+    "./elysia": "./src/integrations/elysia.ts",
+    "./adapters/prisma": "./src/adapters/prisma.adapter.ts",
+    "./adapters/moyasar": "./src/adapters/moyasar.adapter.ts",
+    "./adapters/cache": "./src/adapters/cache.adapter.ts"
+  },
+  "peerDependencies": {
+    "elysia": "^1.4.22",
+    "@prisma/client": "^7.3.0"
+  },
+  "peerDependenciesMeta": {
+    "elysia": {
+      "optional": true
+    },
+    "@prisma/client": {
+      "optional": true
+    }
+  },
+  "dependencies": {
+    "@sinclair/typebox": "^0.34.48",
+    "decimal.js": "^10.6.0",
+    "handlebars": "^4.7.8",
+    "puppeteer-html-pdf": "^4.0.8"
+  },
+  "devDependencies": {
+    "bun-types": "^1.3.8",
+    "typescript": "^5.7.0"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit -p tsconfig.json"
+  }
+}

@@ -1,0 +1,525 @@
+<html lang="ar" dir="rtl">
+
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>فاتورة اشتراك</title>
+
+  <!-- Google Fonts: Cairo (Arabic) -->
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Cairo:wght@400;600;700;800&display=swap" rel="stylesheet" />
+
+  <style>
+    :root {
+      --bg: #fff;
+      --ink: #111;
+      --muted: #6b7280;
+      --line: #e5e7eb;
+      --accent: #3b82f6;
+      --accent-light: #dbeafe;
+      --success: #10b981;
+      --success-light: #d1fae5;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    html,
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--ink);
+      font:
+        14px/1.7 "Cairo",
+        system-ui,
+        -apple-system,
+        "Segoe UI",
+        "Noto Sans Arabic",
+        "Noto Naskh Arabic",
+        Tahoma,
+        Arial,
+        sans-serif;
+      -webkit-print-color-adjust: exact;
+      print-color-adjust: exact;
+      -webkit-font-smoothing: antialiased;
+      -moz-osx-font-smoothing: grayscale;
+    }
+
+    body {
+      padding: 24px 16px;
+      max-width: 800px;
+      margin: 0 auto;
+    }
+
+    header.head {
+      display: grid;
+      grid-template-columns: 1fr auto;
+      gap: 12px;
+      align-items: center;
+      padding-bottom: 16px;
+      border-bottom: 2px solid var(--accent);
+    }
+
+    .platform-info {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+
+    .platform-logo {
+      width: 48px;
+      height: 48px;
+      border-radius: 8px;
+      object-fit: contain;
+    }
+
+    .platform-name {
+      font-size: 24px;
+      font-weight: 800;
+      letter-spacing: 0.3px;
+      color: var(--accent);
+    }
+
+    .title-side {
+      text-align: left;
+    }
+
+    .title-side .title {
+      margin: 0;
+      font-size: 20px;
+      font-weight: 800;
+      color: var(--ink);
+    }
+
+    .title-side .sub {
+      margin-top: 4px;
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    .status-badge {
+      display: inline-block;
+      padding: 4px 12px;
+      border-radius: 999px;
+      font-size: 12px;
+      font-weight: 700;
+      text-transform: uppercase;
+    }
+
+    .status-paid {
+      background: var(--success-light);
+      color: var(--success);
+    }
+
+    .status-open {
+      background: var(--accent-light);
+      color: var(--accent);
+    }
+
+    .status-draft {
+      background: #f3f4f6;
+      color: var(--muted);
+    }
+
+    .status-void,
+    .status-uncollectible {
+      background: #fee2e2;
+      color: #ef4444;
+    }
+
+    .meta {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px 20px;
+      padding: 16px 0;
+      color: var(--muted);
+      border-bottom: 1px solid var(--line);
+    }
+
+    .meta b {
+      color: var(--ink);
+    }
+
+    .cols {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 24px;
+      padding: 20px 0;
+      border-bottom: 1px solid var(--line);
+    }
+
+    .block h3 {
+      margin: 0 0 12px 0;
+      font-size: 14px;
+      font-weight: 800;
+      color: var(--accent);
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .block h3::before {
+      content: "";
+      display: block;
+      width: 4px;
+      height: 16px;
+      background: var(--accent);
+      border-radius: 2px;
+    }
+
+    .kv {
+      display: grid;
+      grid-template-columns: 100px 1fr;
+      gap: 8px 12px;
+      font-size: 13px;
+    }
+
+    .kv .k {
+      color: var(--muted);
+    }
+
+    .plan-box {
+      background: linear-gradient(135deg, var(--accent-light) 0%, #fff 100%);
+      border: 1px solid var(--accent);
+      border-radius: 12px;
+      padding: 20px;
+      margin: 20px 0;
+    }
+
+    .plan-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+      margin-bottom: 12px;
+    }
+
+    .plan-name {
+      font-size: 18px;
+      font-weight: 800;
+      color: var(--ink);
+    }
+
+    .plan-price {
+      font-size: 24px;
+      font-weight: 800;
+      color: var(--accent);
+    }
+
+    .plan-interval {
+      font-size: 12px;
+      color: var(--muted);
+      font-weight: 400;
+    }
+
+    .plan-description {
+      color: var(--muted);
+      font-size: 13px;
+      margin: 0;
+    }
+
+    table.items {
+      width: 100%;
+      border-collapse: collapse;
+      margin-top: 20px;
+    }
+
+    .items thead th {
+      text-align: right;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 700;
+      border-bottom: 2px solid var(--line);
+      padding: 12px 8px;
+      background: #f9fafb;
+    }
+
+    .items tbody td {
+      padding: 14px 8px;
+      border-bottom: 1px solid var(--line);
+      vertical-align: top;
+    }
+
+    .num {
+      text-align: left;
+      white-space: nowrap;
+    }
+
+    .totals {
+      display: grid;
+      grid-template-columns: 1fr 320px;
+      gap: 24px;
+      margin-top: 20px;
+      align-items: start;
+    }
+
+    .note {
+      color: var(--muted);
+      padding: 12px 0;
+      font-size: 13px;
+      min-height: 48px;
+    }
+
+    .sum {
+      background: #f9fafb;
+      border-radius: 12px;
+      padding: 16px;
+    }
+
+    .sum-row {
+      display: grid;
+      grid-template-columns: 1fr auto;
+      gap: 8px;
+      padding: 8px 0;
+    }
+
+    .sum-row.total {
+      border-top: 2px solid var(--accent);
+      margin-top: 8px;
+      padding-top: 12px;
+      font-size: 18px;
+      font-weight: 800;
+      color: var(--accent);
+    }
+
+    .period-info {
+      background: #f9fafb;
+      border-radius: 8px;
+      padding: 12px 16px;
+      margin: 16px 0;
+      font-size: 13px;
+      color: var(--muted);
+    }
+
+    .period-info strong {
+      color: var(--ink);
+    }
+
+    footer.foot {
+      margin-top: 24px;
+      padding-top: 16px;
+      border-top: 2px solid var(--line);
+      color: var(--muted);
+      font-size: 12px;
+      text-align: center;
+    }
+
+    footer.foot .support {
+      margin-top: 8px;
+    }
+
+    @media (max-width: 760px) {
+      .cols {
+        grid-template-columns: 1fr;
+      }
+
+      .totals {
+        grid-template-columns: 1fr;
+      }
+
+      header.head {
+        grid-template-columns: 1fr;
+        text-align: center;
+      }
+
+      .title-side {
+        text-align: center;
+      }
+
+      .platform-info {
+        justify-content: center;
+      }
+    }
+
+    @media print {
+      body {
+        padding: 0;
+      }
+
+      @page {
+        size: A4;
+        margin: 14mm;
+      }
+    }
+  </style>
+</head>
+
+<body>
+  <header class="head">
+    <div class="platform-info">
+      {{#if platform.logo}}
+      <img src="{{platform.logo}}" alt="{{platform.name}}" class="platform-logo" />
+      {{/if}}
+      <div class="platform-name">{{#if platform.name}}{{platform.name}}{{else}}منصة اشتراكات{{/if}}</div>
+    </div>
+    <div class="title-side">
+      <h1 class="title">فاتورة اشتراك</h1>
+      <div class="sub">
+        <span>رقم:</span>
+        <b>{{#if invoice.id}}{{invoice.id}}{{else}}—{{/if}}</b>
+      </div>
+      <div style="margin-top: 8px;">
+        <span class="status-badge status-{{invoice.status}}">
+          {{translateInvoiceStatus invoice.status}}
+        </span>
+      </div>
+    </div>
+  </header>
+
+  <section class="meta">
+    <div><span>تاريخ الإصدار:</span>
+      <b>{{#if invoice.createdAt}}{{formatDate invoice.createdAt locale=locale}}{{else}}—{{/if}}</b>
+    </div>
+    {{#if invoice.dueDate}}
+    <div><span>تاريخ الاستحقاق:</span>
+      <b>{{formatDate invoice.dueDate locale=locale}}</b>
+    </div>
+    {{/if}}
+    {{#if invoice.paidAt}}
+    <div><span>تاريخ السداد:</span>
+      <b>{{formatDate invoice.paidAt locale=locale}}</b>
+    </div>
+    {{/if}}
+    <div><span>حالة الاشتراك:</span>
+      <b>{{translateSubscriptionStatus subscription.status}}</b>
+    </div>
+  </section>
+
+  <section class="cols">
+    <div class="block">
+      <h3>بيانات المشترك</h3>
+      <div class="kv">
+        {{#if subscriber.name}}
+        <div class="k">الاسم</div>
+        <div>{{subscriber.name}}</div>
+        {{/if}}
+        {{#if subscriber.email}}
+        <div class="k">البريد الإلكتروني</div>
+        <div>{{subscriber.email}}</div>
+        {{/if}}
+        {{#if subscriber.phone}}
+        <div class="k">الهاتف</div>
+        <div>{{subscriber.phone}}</div>
+        {{/if}}
+        {{#if subscriber.address}}
+        <div class="k">العنوان</div>
+        <div>{{subscriber.address}}</div>
+        {{/if}}
+        <div class="k">معرّف المشترك</div>
+        <div style="font-family: monospace; font-size: 11px;">{{subscription.subscriberId}}</div>
+      </div>
+    </div>
+    <div class="block">
+      <h3>معلومات المنصة</h3>
+      <div class="kv">
+        {{#if platform.name}}
+        <div class="k">الاسم</div>
+        <div>{{platform.name}}</div>
+        {{/if}}
+        {{#if platform.website}}
+        <div class="k">الموقع</div>
+        <div>{{platform.website}}</div>
+        {{/if}}
+        {{#if platform.supportEmail}}
+        <div class="k">الدعم</div>
+        <div>{{platform.supportEmail}}</div>
+        {{/if}}
+        {{#if platform.address}}
+        <div class="k">العنوان</div>
+        <div>{{platform.address}}</div>
+        {{/if}}
+      </div>
+    </div>
+  </section>
+
+  <section class="plan-box">
+    <div class="plan-header">
+      <div>
+        <div class="plan-name">{{plan.name}}</div>
+        {{#if plan.description}}
+        <p class="plan-description">{{plan.description}}</p>
+        {{/if}}
+      </div>
+      <div style="text-align: left;">
+        <div class="plan-price">
+          {{formatCurrency plan.price plan.currency locale=locale}}
+        </div>
+        <div class="plan-interval">
+          {{translateBillingInterval plan.interval plan.intervalCount}}
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <div class="period-info">
+    <strong>فترة الاشتراك:</strong>
+    من {{formatDate subscription.currentPeriodStart locale=locale}}
+    إلى {{formatDate subscription.currentPeriodEnd locale=locale}}
+  </div>
+
+  {{#if invoice.lineItems.length}}
+  <section>
+    <table class="items">
+      <thead>
+        <tr>
+          <th>البند</th>
+          <th class="num">الكمية</th>
+          <th class="num">سعر الوحدة</th>
+          <th class="num">الإجمالي</th>
+        </tr>
+      </thead>
+      <tbody>
+        {{#each invoice.lineItems}}
+        <tr>
+          <td>
+            <div style="font-weight:700;">{{this.description}}</div>
+          </td>
+          <td class="num">{{this.quantity}}</td>
+          <td class="num">{{formatCurrency this.unitPrice ../invoice.currency locale=../locale}}</td>
+          <td class="num">{{formatCurrency this.amount ../invoice.currency locale=../locale}}</td>
+        </tr>
+        {{/each}}
+      </tbody>
+    </table>
+  </section>
+  {{/if}}
+
+  <section class="totals">
+    <div class="note">
+      {{#if invoice.metadata.notes}}
+      {{invoice.metadata.notes}}
+      {{else}}
+      شكراً لاشتراكك معنا. في حال وجود أي استفسارات، يرجى التواصل مع فريق الدعم.
+      {{/if}}
+    </div>
+    <div class="sum">
+      {{#if invoice.lineItems.length}}
+      <div class="sum-row">
+        <div>المجموع الفرعي</div>
+        <div class="num">{{formatCurrency invoice.amount invoice.currency locale=locale}}</div>
+      </div>
+      {{/if}}
+      <div class="sum-row total">
+        <div>الإجمالي</div>
+        <div class="num">{{formatCurrency invoice.amount invoice.currency locale=locale}}</div>
+      </div>
+    </div>
+  </section>
+
+  <footer class="foot">
+    <div>
+      {{#if platform.website}}{{platform.website}}{{else}}www.example.com{{/if}}
+    </div>
+    {{#if platform.supportEmail}}
+    <div class="support">
+      للدعم الفني: {{platform.supportEmail}}
+    </div>
+    {{/if}}
+    <div style="margin-top: 8px; color: #9ca3af;">
+      تم إنشاء هذه الفاتورة إلكترونياً ولا تحتاج إلى توقيع
+    </div>
+  </footer>
+</body>
+
+</html>

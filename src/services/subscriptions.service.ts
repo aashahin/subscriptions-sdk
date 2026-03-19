@@ -1,0 +1,902 @@
+// file: packages/subscriptions/src/services/subscriptions.service.ts
+// Subscriptions service for lifecycle management
+
+import type {
+  Subscription,
+  SubscriptionWithPlan,
+  UpdateSubscriptionInput,
+  SubscriptionStatus,
+  FeatureRegistry,
+  SubscriberType,
+} from "../core/types";
+import type { DatabaseAdapter } from "../adapters/database.adapter";
+import type { CacheAdapter } from "../adapters/cache.adapter";
+import type {
+  PaymentGatewayAdapter,
+  CancelOptions,
+  ChargePaymentResult,
+} from "../adapters/payment.adapter";
+import { CacheKeys, noopCacheAdapter } from "../adapters/cache.adapter";
+import { noopPaymentAdapter } from "../adapters/payment.adapter";
+import {
+  SubscriptionNotFoundError,
+  SubscriptionInactiveError,
+  SubscriptionNotCanceledError,
+  DuplicateSubscriptionError,
+  PlanNotFoundError,
+  PaymentFailedError,
+} from "../core/errors";
+
+export interface SubscriptionsServiceOptions {
+  /**
+   * Default subscriber type
+   * @default 'tenant'
+   */
+  subscriberType?: SubscriberType;
+
+  /**
+   * Default trial period in days
+   * @default 0
+   */
+  trialDays?: number;
+
+  /**
+   * Grace period in days after expiration
+   * @default 0
+   */
+  gracePeriodDays?: number;
+
+  /**
+   * Cache TTL in seconds
+   * @default 300
+   */
+  cacheTtlSeconds?: number;
+}
+
+/**
+ * Result of a plan change operation
+ */
+export interface ChangePlanResult<
+  TFeatures extends FeatureRegistry = FeatureRegistry,
+> {
+  /** Updated subscription with new plan */
+  subscription: SubscriptionWithPlan<TFeatures>;
+  /** Whether payment was charged */
+  charged: boolean;
+  /** Payment ID if charged */
+  paymentId?: string;
+  /** Whether payment is pending 3DS verification */
+  paymentPending?: boolean;
+  /** 3DS verification URL if payment is pending */
+  verificationUrl?: string;
+}
+
+/**
+ * Preview of a plan change - shows what user will pay
+ */
+export interface PlanChangePreview {
+  /** Current plan details */
+  currentPlan: {
+    id: string;
+    name: string;
+    price: number;
+    currency: string;
+  };
+  /** New plan details */
+  newPlan: {
+    id: string;
+    name: string;
+    price: number;
+    currency: string;
+  };
+  /** Whether this is an upgrade (new plan is more expensive) */
+  isUpgrade: boolean;
+  /** Whether this is a downgrade (new plan is cheaper) */
+  isDowngrade: boolean;
+  /** Price difference (positive = upgrade, negative = downgrade) */
+  priceDifference: number;
+  /** Days remaining in current period */
+  daysRemaining: number;
+  /** Total days in current period */
+  totalDays: number;
+  /** Proration ratio (0-1) */
+  prorationRatio: number;
+  /** Amount to charge now (in smallest currency unit, e.g., halalas) */
+  amountDue: number;
+  /** Amount in regular units (e.g., SAR) */
+  amountDueFormatted: number;
+  /** Currency code */
+  currency: string;
+  /** When the new plan will take effect */
+  effectiveDate: Date;
+  /** Message describing the change */
+  message: string;
+}
+
+export class SubscriptionsService<TFeatures extends FeatureRegistry> {
+  private readonly cache: CacheAdapter;
+  private readonly payment: PaymentGatewayAdapter;
+  private readonly subscriberType: SubscriberType;
+  private readonly trialDays: number;
+  private readonly gracePeriodDays: number;
+  private readonly cacheTtl: number;
+
+  constructor(
+    private readonly db: DatabaseAdapter<TFeatures>,
+    cache?: CacheAdapter,
+    payment?: PaymentGatewayAdapter,
+    options?: SubscriptionsServiceOptions,
+  ) {
+    this.cache = cache ?? noopCacheAdapter;
+    this.payment = payment ?? noopPaymentAdapter;
+    this.subscriberType = options?.subscriberType ?? "tenant";
+    this.trialDays = options?.trialDays ?? 0;
+    this.gracePeriodDays = options?.gracePeriodDays ?? 0;
+    this.cacheTtl = options?.cacheTtlSeconds ?? 300;
+  }
+
+  /**
+   * Get subscription for a subscriber
+   */
+  async get(
+    subscriberId: string,
+  ): Promise<SubscriptionWithPlan<TFeatures> | null> {
+    const cacheKey = CacheKeys.subscription(subscriberId);
+
+    // Try cache first
+    const cached =
+      await this.cache.get<SubscriptionWithPlan<TFeatures>>(cacheKey);
+    if (cached) {
+      return this.finalizeEndedSubscriptionIfNeeded(subscriberId, cached);
+    }
+
+    const subscription =
+      await this.db.subscriptions.findBySubscriber(subscriberId);
+    if (!subscription) {
+      return null;
+    }
+
+    const normalized = await this.finalizeEndedSubscriptionIfNeeded(
+      subscriberId,
+      subscription,
+    );
+
+    // Cache the result
+    await this.cache.set(cacheKey, normalized, this.cacheTtl);
+
+    return normalized;
+  }
+
+  /**
+   * Create a new subscription
+   */
+  async create(
+    subscriberId: string,
+    planId: string,
+    options?: {
+      trialDays?: number;
+      gatewayCustomerId?: string;
+      metadata?: Record<string, unknown>;
+    },
+  ): Promise<Subscription> {
+    // Pre-emptively invalidate cache before checking for existing subscription
+    // This ensures we always get fresh data from DB for the duplicate check
+    await this.cache.delete(CacheKeys.subscription(subscriberId));
+    await this.cache.delete(CacheKeys.features(subscriberId));
+
+    // Check for existing subscription (now from fresh DB query)
+    const existing = await this.get(subscriberId);
+    if (existing && this.isActiveStatus(existing.status)) {
+      throw new DuplicateSubscriptionError(subscriberId);
+    }
+
+    // Verify plan exists
+    const plan = await this.db.plans.findById(planId);
+    if (!plan) {
+      throw new PlanNotFoundError(planId);
+    }
+
+    const now = new Date();
+    // If re-subscribing after cancellation, don't grant another trial.
+    // Trials are one-time only — returning subscribers must pay.
+    const trialDays = existing ? 0 : (options?.trialDays ?? this.trialDays);
+    const hasTrialDays = trialDays > 0;
+
+    // Calculate period dates
+    let currentPeriodStart = now;
+    let currentPeriodEnd = this.calculatePeriodEnd(
+      now,
+      plan.interval,
+      plan.intervalCount,
+    );
+    let trialStart: Date | null = null;
+    let trialEnd: Date | null = null;
+    let status: SubscriptionStatus = "active";
+
+    if (hasTrialDays) {
+      trialStart = now;
+      trialEnd = new Date(now.getTime() + trialDays * 24 * 60 * 60 * 1000);
+      currentPeriodEnd = trialEnd;
+      status = "trialing";
+    }
+
+    // If there's an existing inactive subscription, update it instead of
+    // creating a new row (tenantId is unique, so INSERT would fail).
+    let subscription: Subscription;
+    if (existing && !this.isActiveStatus(existing.status)) {
+      subscription = await this.db.subscriptions.update(existing.id, {
+        planId,
+        status,
+        currentPeriodStart,
+        currentPeriodEnd,
+        trialStart,
+        trialEnd,
+        cancelAt: null,
+        canceledAt: null,
+        ...(options?.gatewayCustomerId && { gatewayCustomerId: options.gatewayCustomerId }),
+        ...(options?.metadata && { metadata: options.metadata }),
+      });
+    } else {
+      subscription = await this.db.subscriptions.create({
+        subscriberId,
+        subscriberType: this.subscriberType,
+        planId,
+        status,
+        currentPeriodStart,
+        currentPeriodEnd,
+        trialStart,
+        trialEnd,
+        gatewayCustomerId: options?.gatewayCustomerId,
+        metadata: options?.metadata,
+      });
+    }
+
+    // Invalidate cache
+    await this.cache.delete(CacheKeys.subscription(subscriberId));
+    await this.cache.delete(CacheKeys.features(subscriberId));
+
+    return subscription;
+  }
+
+  /**
+   * Change subscription plan
+   *
+   * For upgrades (new plan is more expensive):
+   * - If payment adapter supports chargePayment and there's a saved token, charges immediately
+   * - Proration can be enabled to charge only the difference for remaining period
+   * - Plan changes immediately on successful payment
+   *
+   * For downgrades (new plan is cheaper):
+   * - Plan change is scheduled for end of current period
+   * - No immediate payment required
+   *
+   * @param subscriberId - The subscriber ID
+   * @param newPlanId - The new plan to switch to
+   * @param options - Change options
+   * @returns Updated subscription
+   */
+  async changePlan(
+    subscriberId: string,
+    newPlanId: string,
+    options?: {
+      /** Apply change immediately (default: true for upgrades, false for downgrades) */
+      immediately?: boolean;
+      /** Prorate the charge based on remaining period (default: true) */
+      prorate?: boolean;
+      /** Custom token ID to charge (overrides saved token) */
+      tokenId?: string;
+      /** Callback URL for 3DS verification */
+      callbackUrl?: string;
+      /** Skip payment even for upgrades (use with caution) */
+      skipPayment?: boolean;
+      /** Verified token ID from frontend 3DS - save for future renewals */
+      verifiedTokenId?: string;
+    },
+  ): Promise<ChangePlanResult> {
+    const subscription = await this.getOrThrow(subscriberId);
+    const currentPlan = subscription.plan;
+
+    if (subscription.planId === newPlanId) {
+      return { subscription, charged: false };
+    }
+
+    // Verify new plan exists
+    const newPlan = await this.db.plans.findById(newPlanId);
+    if (!newPlan) {
+      throw new PlanNotFoundError(newPlanId);
+    }
+
+    const now = new Date();
+
+    // CRITICAL: Check if user is in trial period
+    // If trialing, they haven't paid anything, so:
+    // 1. No proration credit (they didn't pay for the time)
+    // 2. Treat current plan price as $0 for upgrade calculation
+    const isTrialing = subscription.status === "trialing";
+
+    // For upgrade detection: trial users upgrading to ANY paid plan should be charged
+    // For proration: trial users get no credit (effective price = 0)
+    const effectiveCurrentPrice = isTrialing ? 0 : currentPlan.price;
+    const isUpgrade = newPlan.price > effectiveCurrentPrice;
+
+    const shouldApplyImmediately = options?.immediately ?? isUpgrade;
+    const shouldProrate = options?.prorate ?? true;
+
+    let paymentResult: ChargePaymentResult | undefined;
+
+    // Handle payment for upgrades
+    if (isUpgrade && !options?.skipPayment && this.payment.chargePayment) {
+      const tokenId = options?.tokenId ?? subscription.gatewayCustomerId;
+
+      if (!tokenId) {
+        throw new PaymentFailedError("No payment token available for upgrade");
+      }
+
+      // Calculate charge amount
+      let chargeAmount: number;
+
+      if (isTrialing || effectiveCurrentPrice === 0) {
+        // TRIAL or FREE PLAN USER: Charge full price of new plan
+        // No credit to subtract from a $0 plan
+        chargeAmount = Math.round(newPlan.price * 100);
+      } else if (shouldProrate && subscription.currentPeriodEnd > now) {
+        // ACTIVE PAID USER: Prorate - charge difference for remaining period
+        const totalPeriodMs =
+          subscription.currentPeriodEnd.getTime() -
+          subscription.currentPeriodStart.getTime();
+        const remainingMs =
+          subscription.currentPeriodEnd.getTime() - now.getTime();
+        const remainingRatio = remainingMs / totalPeriodMs;
+
+        const priceDifference = newPlan.price - currentPlan.price;
+        chargeAmount = Math.round(priceDifference * remainingRatio * 100); // Convert to smallest unit
+      } else {
+        // Full price charge
+        chargeAmount = Math.round(newPlan.price * 100);
+      }
+
+      // Charge the payment
+      paymentResult = await this.payment.chargePayment({
+        customerId: tokenId,
+        amount: chargeAmount,
+        currency: newPlan.currency,
+        description: `Upgrade from ${currentPlan.name} to ${newPlan.name}`,
+        ...(options?.callbackUrl && { callbackUrl: options.callbackUrl }),
+        metadata: {
+          subscriberId,
+          oldPlanId: currentPlan.id,
+          newPlanId: newPlan.id,
+          type: "plan_upgrade",
+        },
+      });
+
+      if (paymentResult.status === "failed") {
+        throw new PaymentFailedError(
+          paymentResult.errorMessage ?? "Payment failed for plan upgrade",
+          paymentResult.id || undefined,
+          paymentResult.errorCode,
+          paymentResult.isRetryable,
+          paymentResult.userAction,
+        );
+      }
+
+      if (paymentResult.status === "pending") {
+        // 3DS verification required - return pending status
+        const updateData: UpdateSubscriptionInput = {
+          metadata: {
+            ...(subscription.metadata ?? {}),
+            pendingPlanChange: newPlanId,
+            pendingPaymentId: paymentResult.id,
+            pendingVerificationUrl: paymentResult.verificationUrl,
+          },
+        };
+
+        const updated = await this.db.subscriptions.update(
+          subscription.id,
+          updateData,
+        );
+        await this.cache.delete(CacheKeys.subscription(subscriberId));
+
+        return {
+          subscription: { ...updated, plan: currentPlan },
+          charged: false,
+          paymentPending: true,
+          ...(paymentResult.verificationUrl && {
+            verificationUrl: paymentResult.verificationUrl,
+          }),
+        };
+      }
+    }
+
+    // Apply plan change
+    const updateData: UpdateSubscriptionInput = { planId: newPlanId };
+
+    if (shouldApplyImmediately) {
+      updateData.currentPeriodStart = now;
+      updateData.currentPeriodEnd = this.calculatePeriodEnd(
+        now,
+        newPlan.interval,
+        newPlan.intervalCount,
+      );
+    }
+
+    // If user was trialing and they're upgrading (paid or have verified token), end the trial
+    // This covers both:
+    // 1. Direct payment success (paymentResult.status === 'paid')
+    // 2. 3DS flow completion (verifiedTokenId provided from frontend)
+    const paymentCompleted =
+      paymentResult?.status === "paid" || options?.verifiedTokenId;
+    if (isTrialing && isUpgrade && paymentCompleted) {
+      updateData.status = "active";
+      updateData.trialStart = null;
+      updateData.trialEnd = null;
+      console.log(
+        `[Subscriptions] Trial ended for ${subscriberId} - upgraded to ${newPlan.name}`,
+      );
+    }
+
+    // Clear pending plan change metadata if exists
+    if (subscription.metadata?.pendingPlanChange) {
+      const {
+        pendingPlanChange,
+        pendingPaymentId,
+        pendingVerificationUrl,
+        ...restMeta
+      } = subscription.metadata as Record<string, unknown>;
+      updateData.metadata = restMeta;
+    }
+
+    // If a verified token ID was provided, save it for future renewals
+    // Token is already verified from frontend 3DS flow
+    if (options?.verifiedTokenId) {
+      updateData.gatewayCustomerId = options.verifiedTokenId;
+      console.log(
+        `[Subscriptions] Saved verified token ${options.verifiedTokenId} for subscriber ${subscriberId}`,
+      );
+    }
+
+    const updated = await this.db.subscriptions.update(
+      subscription.id,
+      updateData,
+    );
+
+    // Invalidate cache
+    await this.cache.delete(CacheKeys.subscription(subscriberId));
+    await this.cache.delete(CacheKeys.features(subscriberId));
+
+    return {
+      subscription: { ...updated, plan: newPlan },
+      charged: !!paymentResult && paymentResult.status === "paid",
+      ...(paymentResult?.id && { paymentId: paymentResult.id }),
+    };
+  }
+
+  /**
+   * Preview a plan change - calculates what user will pay without making any changes.
+   * Use this to show the user the cost before they confirm the plan change.
+   *
+   * @param subscriberId - The subscriber ID
+   * @param newPlanId - The new plan to preview
+   * @returns Preview with proration details
+   */
+  async previewChangePlan(
+    subscriberId: string,
+    newPlanId: string,
+  ): Promise<PlanChangePreview> {
+    const subscription = await this.getOrThrow(subscriberId);
+    const currentPlan = subscription.plan;
+
+    // Verify new plan exists
+    const newPlan = await this.db.plans.findById(newPlanId);
+    if (!newPlan) {
+      throw new PlanNotFoundError(newPlanId);
+    }
+
+    const now = new Date();
+
+    // CRITICAL: Check if user is trialing - they haven't paid anything yet
+    const isTrialing = subscription.status === "trialing";
+
+    // For trial users, their effective "paid" price is $0
+    const effectiveCurrentPrice = isTrialing ? 0 : currentPlan.price;
+
+    const isUpgrade = newPlan.price > effectiveCurrentPrice;
+    const isDowngrade = newPlan.price < effectiveCurrentPrice;
+    const priceDifference = newPlan.price - effectiveCurrentPrice;
+
+    // Calculate period details (only relevant for active, not trialing users)
+    const totalPeriodMs =
+      subscription.currentPeriodEnd.getTime() -
+      subscription.currentPeriodStart.getTime();
+    const remainingMs = Math.max(
+      0,
+      subscription.currentPeriodEnd.getTime() - now.getTime(),
+    );
+    const prorationRatio = totalPeriodMs > 0 ? remainingMs / totalPeriodMs : 0;
+
+    const totalDays = Math.ceil(totalPeriodMs / (24 * 60 * 60 * 1000));
+    const daysRemaining = Math.ceil(remainingMs / (24 * 60 * 60 * 1000));
+
+    // Calculate amount due
+    let amountDue = 0;
+    let effectiveDate = now;
+
+    if (isUpgrade) {
+      if (isTrialing || effectiveCurrentPrice === 0) {
+        // TRIAL or FREE PLAN USER: Pay full price of new plan
+        // No credit to subtract from a $0 plan
+        amountDue = Math.round(newPlan.price * 100);
+      } else {
+        // ACTIVE PAID USER: Prorated difference
+        amountDue = Math.round(priceDifference * prorationRatio * 100);
+      }
+      effectiveDate = now; // Takes effect immediately
+    } else if (isDowngrade) {
+      // Downgrades: no charge, applies at period end
+      amountDue = 0;
+      effectiveDate = subscription.currentPeriodEnd;
+    }
+
+    // Generate message
+    let message: string;
+    if (subscription.planId === newPlanId) {
+      message = "You are already on this plan.";
+    } else if (isTrialing && isUpgrade) {
+      // Special message for trial users
+      const formattedAmount = (amountDue / 100).toFixed(2);
+      message = `Upgrade to ${newPlan.name}: Your trial will end and you will be charged ${formattedAmount} ${newPlan.currency} for the full plan price. Your subscription takes effect immediately.`;
+    } else if (isUpgrade) {
+      const formattedAmount = (amountDue / 100).toFixed(2);
+      message = `Upgrade to ${newPlan.name}: You will be charged ${formattedAmount} ${newPlan.currency} now (prorated for ${daysRemaining} remaining days). Your new plan takes effect immediately.`;
+    } else if (isDowngrade) {
+      message = `Downgrade to ${newPlan.name}: Your current plan will remain active until ${subscription.currentPeriodEnd.toLocaleDateString()}. The new plan will take effect at your next billing cycle.`;
+    } else {
+      message = `Switch to ${newPlan.name}: No charge required as the plans are the same price.`;
+    }
+
+    return {
+      currentPlan: {
+        id: currentPlan.id,
+        name: currentPlan.name,
+        price: currentPlan.price,
+        currency: currentPlan.currency,
+      },
+      newPlan: {
+        id: newPlan.id,
+        name: newPlan.name,
+        price: newPlan.price,
+        currency: newPlan.currency,
+      },
+      isUpgrade,
+      isDowngrade,
+      priceDifference,
+      daysRemaining,
+      totalDays,
+      prorationRatio,
+      amountDue,
+      amountDueFormatted: amountDue / 100,
+      currency: newPlan.currency,
+      effectiveDate,
+      message,
+    };
+  }
+
+  /**
+   * Cancel subscription
+   */
+  async cancel(
+    subscriberId: string,
+    options?: CancelOptions,
+  ): Promise<Subscription> {
+    const subscription = await this.getOrThrow(subscriberId);
+
+    // Don't allow canceling an already-canceled subscription
+    if (subscription.status === "canceled") {
+      throw new SubscriptionInactiveError("canceled");
+    }
+
+    const now = new Date();
+    const updateData: UpdateSubscriptionInput = {
+      canceledAt: now,
+    };
+
+    if (options?.immediately) {
+      updateData.status = "canceled";
+      updateData.cancelAt = now;
+    } else {
+      updateData.cancelAt = subscription.currentPeriodEnd;
+    }
+
+    // Cancel in payment gateway if connected
+    if (subscription.gatewaySubscriptionId) {
+      await this.payment.cancelSubscription(
+        subscription.gatewaySubscriptionId,
+        options,
+      );
+    }
+
+    const updated = await this.db.subscriptions.update(
+      subscription.id,
+      updateData,
+    );
+
+    // Invalidate cache
+    await this.cache.delete(CacheKeys.subscription(subscriberId));
+    await this.cache.delete(CacheKeys.features(subscriberId));
+
+    return updated;
+  }
+
+  /**
+   * Pause subscription (if supported by payment gateway)
+   */
+  async pause(subscriberId: string): Promise<Subscription> {
+    const subscription = await this.getOrThrow(subscriberId);
+
+    if (subscription.gatewaySubscriptionId && this.payment.pauseSubscription) {
+      await this.payment.pauseSubscription(subscription.gatewaySubscriptionId);
+    }
+
+    const updated = await this.db.subscriptions.update(subscription.id, {
+      status: "paused",
+    });
+
+    await this.cache.delete(CacheKeys.subscription(subscriberId));
+    await this.cache.delete(CacheKeys.features(subscriberId));
+
+    return updated;
+  }
+
+  /**
+   * Resume paused subscription
+   */
+  async resume(subscriberId: string): Promise<Subscription> {
+    const subscription = await this.getOrThrow(subscriberId);
+
+    if (subscription.status !== "paused") {
+      throw new SubscriptionInactiveError(subscription.status);
+    }
+
+    if (subscription.gatewaySubscriptionId && this.payment.resumeSubscription) {
+      await this.payment.resumeSubscription(subscription.gatewaySubscriptionId);
+    }
+
+    const updated = await this.db.subscriptions.update(subscription.id, {
+      status: "active",
+    });
+
+    await this.cache.delete(CacheKeys.subscription(subscriberId));
+    await this.cache.delete(CacheKeys.features(subscriberId));
+
+    return updated;
+  }
+
+  /**
+   * Reactivate a subscription that was scheduled for cancellation.
+   * This clears cancelAt/canceledAt without changing the subscription period.
+   */
+  async reactivate(subscriberId: string): Promise<Subscription> {
+    const subscription = await this.getOrThrow(subscriberId);
+
+    // Only allow reactivation if subscription is still active/trialing but scheduled to cancel
+    if (!this.isActiveStatus(subscription.status)) {
+      throw new SubscriptionInactiveError(subscription.status);
+    }
+
+    if (!subscription.cancelAt && !subscription.canceledAt) {
+      throw new SubscriptionNotCanceledError();
+    }
+
+    const updated = await this.db.subscriptions.update(subscription.id, {
+      cancelAt: null,
+      canceledAt: null,
+    });
+
+    await this.cache.delete(CacheKeys.subscription(subscriberId));
+    await this.cache.delete(CacheKeys.features(subscriberId));
+
+    return updated;
+  }
+
+  /**
+   * Start a trial subscription
+   */
+  async startTrial(
+    subscriberId: string,
+    planId: string,
+    trialDays: number,
+  ): Promise<Subscription> {
+    return this.create(subscriberId, planId, { trialDays });
+  }
+
+  /**
+   * Extend trial period
+   */
+  async extendTrial(
+    subscriberId: string,
+    additionalDays: number,
+  ): Promise<Subscription> {
+    const subscription = await this.getOrThrow(subscriberId);
+
+    if (subscription.status !== "trialing" || !subscription.trialEnd) {
+      throw new SubscriptionInactiveError(
+        "Cannot extend trial - subscription is not in trial",
+      );
+    }
+
+    const newTrialEnd = new Date(
+      subscription.trialEnd.getTime() + additionalDays * 24 * 60 * 60 * 1000,
+    );
+
+    const updated = await this.db.subscriptions.update(subscription.id, {
+      trialEnd: newTrialEnd,
+      currentPeriodEnd: newTrialEnd,
+    });
+
+    await this.cache.delete(CacheKeys.subscription(subscriberId));
+
+    return updated;
+  }
+
+  /**
+   * Check if subscription is active (including trial and grace period)
+   */
+  async isActive(subscriberId: string): Promise<boolean> {
+    const subscription = await this.get(subscriberId);
+    if (!subscription) return false;
+
+    return this.isSubscriptionActive(subscription);
+  }
+
+  /**
+   * Check if subscription is in trial
+   */
+  async isTrialing(subscriberId: string): Promise<boolean> {
+    const subscription = await this.get(subscriberId);
+    if (!subscription) return false;
+
+    return subscription.status === "trialing";
+  }
+
+  /**
+   * Get days remaining in current period
+   */
+  async daysRemaining(subscriberId: string): Promise<number> {
+    const subscription = await this.get(subscriberId);
+    if (!subscription) return 0;
+
+    const now = new Date();
+    const endDate = subscription.trialEnd ?? subscription.currentPeriodEnd;
+    const diff = endDate.getTime() - now.getTime();
+
+    return Math.max(0, Math.ceil(diff / (24 * 60 * 60 * 1000)));
+  }
+
+  /**
+   * Renew subscription for a new period
+   */
+  async renew(subscriberId: string): Promise<Subscription> {
+    const subscription = await this.getOrThrow(subscriberId);
+    const plan = subscription.plan;
+
+    const now = new Date();
+    const newPeriodEnd = this.calculatePeriodEnd(
+      now,
+      plan.interval,
+      plan.intervalCount,
+    );
+
+    const updated = await this.db.subscriptions.update(subscription.id, {
+      status: "active",
+      currentPeriodStart: now,
+      currentPeriodEnd: newPeriodEnd,
+      trialEnd: null,
+      cancelAt: null,
+      canceledAt: null,
+    });
+
+    await this.cache.delete(CacheKeys.subscription(subscriberId));
+    await this.cache.delete(CacheKeys.features(subscriberId));
+
+    return updated;
+  }
+
+  // ==================== Private Helpers ====================
+
+  private async getOrThrow(
+    subscriberId: string,
+  ): Promise<SubscriptionWithPlan<TFeatures>> {
+    const subscription = await this.get(subscriberId);
+    if (!subscription) {
+      throw new SubscriptionNotFoundError(subscriberId);
+    }
+    return subscription;
+  }
+
+  private isActiveStatus(status: SubscriptionStatus): boolean {
+    return ["active", "trialing", "past_due"].includes(status);
+  }
+
+  private async finalizeEndedSubscriptionIfNeeded(
+    subscriberId: string,
+    subscription: SubscriptionWithPlan<TFeatures>,
+  ): Promise<SubscriptionWithPlan<TFeatures>> {
+    const now = new Date();
+    const endedByScheduledCancel =
+      this.isActiveStatus(subscription.status) &&
+      !!subscription.cancelAt &&
+      now >= subscription.cancelAt;
+
+    const trialBoundary =
+      subscription.trialEnd ?? subscription.currentPeriodEnd;
+    // Only auto-cancel expired trials if the user has NO saved payment method.
+    // If they have a gatewayCustomerId, the scheduler should charge them and
+    // convert to active — premature cancellation here would race with the cron.
+    const endedTrial =
+      subscription.status === "trialing" &&
+      now >= trialBoundary &&
+      !subscription.gatewayCustomerId;
+
+    if (!endedByScheduledCancel && !endedTrial) {
+      return subscription;
+    }
+
+    const canceledAt =
+      subscription.canceledAt ?? subscription.cancelAt ?? trialBoundary;
+
+    await this.db.subscriptions.update(subscription.id, {
+      status: "canceled",
+      canceledAt,
+      cancelAt: subscription.cancelAt,
+    });
+
+    await this.cache.delete(CacheKeys.subscription(subscriberId));
+    await this.cache.delete(CacheKeys.features(subscriberId));
+
+    return {
+      ...subscription,
+      status: "canceled",
+      canceledAt,
+    };
+  }
+
+  private isSubscriptionActive(subscription: Subscription): boolean {
+    if (!this.isActiveStatus(subscription.status)) {
+      return false;
+    }
+
+    const now = new Date();
+    const endDate = subscription.currentPeriodEnd;
+    const graceEnd = new Date(
+      endDate.getTime() + this.gracePeriodDays * 24 * 60 * 60 * 1000,
+    );
+
+    return now <= graceEnd;
+  }
+
+  private calculatePeriodEnd(
+    start: Date,
+    interval: string,
+    intervalCount: number,
+  ): Date {
+    const end = new Date(start);
+
+    switch (interval) {
+      case "monthly":
+        end.setMonth(end.getMonth() + intervalCount);
+        break;
+      case "yearly":
+        end.setFullYear(end.getFullYear() + intervalCount);
+        break;
+      case "one_time":
+        // One-time has no period end (set to far future)
+        end.setFullYear(end.getFullYear() + 100);
+        break;
+      default:
+        // Custom interval in days
+        end.setDate(end.getDate() + intervalCount * 30);
+    }
+
+    return end;
+  }
+}
