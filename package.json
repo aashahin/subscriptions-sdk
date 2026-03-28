@@ -1,6 +1,6 @@
 {
   "name": "@abshahin/subscriptions",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Type-safe subscription plans, feature gates, usage limits, invoices, and Elysia integration for multi-tenant TypeScript applications.",
   "license": "MIT",
   "type": "module",

@@ -1,31 +1,31 @@
 // file: packages/subscriptions/src/services/subscriptions.service.ts
 // Subscriptions service for lifecycle management
 
-import type {
-  Subscription,
-  SubscriptionWithPlan,
-  UpdateSubscriptionInput,
-  SubscriptionStatus,
-  FeatureRegistry,
-  SubscriberType,
-} from "../core/types";
-import type { DatabaseAdapter } from "../adapters/database.adapter";
 import type { CacheAdapter } from "../adapters/cache.adapter";
+import { CacheKeys, noopCacheAdapter } from "../adapters/cache.adapter";
+import type { DatabaseAdapter } from "../adapters/database.adapter";
 import type {
-  PaymentGatewayAdapter,
   CancelOptions,
   ChargePaymentResult,
+  PaymentGatewayAdapter,
 } from "../adapters/payment.adapter";
-import { CacheKeys, noopCacheAdapter } from "../adapters/cache.adapter";
 import { noopPaymentAdapter } from "../adapters/payment.adapter";
 import {
-  SubscriptionNotFoundError,
+  DuplicateSubscriptionError,
+  PaymentFailedError,
+  PlanNotFoundError,
   SubscriptionInactiveError,
   SubscriptionNotCanceledError,
-  DuplicateSubscriptionError,
-  PlanNotFoundError,
-  PaymentFailedError,
+  SubscriptionNotFoundError,
 } from "../core/errors";
+import type {
+  FeatureRegistry,
+  SubscriberType,
+  Subscription,
+  SubscriptionStatus,
+  SubscriptionWithPlan,
+  UpdateSubscriptionInput,
+} from "../core/types";
 
 export interface SubscriptionsServiceOptions {
   /**
@@ -65,6 +65,8 @@ export interface ChangePlanResult<
   charged: boolean;
   /** Payment ID if charged */
   paymentId?: string;
+  /** Amount actually charged in smallest currency unit (e.g. halalas/cents). Only set when charged or skipPayment with a known amount. */
+  chargeAmount?: number;
   /** Whether payment is pending 3DS verification */
   paymentPending?: boolean;
   /** 3DS verification URL if payment is pending */
@@ -233,7 +235,9 @@ export class SubscriptionsService<TFeatures extends FeatureRegistry> {
         trialEnd,
         cancelAt: null,
         canceledAt: null,
-        ...(options?.gatewayCustomerId && { gatewayCustomerId: options.gatewayCustomerId }),
+        ...(options?.gatewayCustomerId && {
+          gatewayCustomerId: options.gatewayCustomerId,
+        }),
         ...(options?.metadata && { metadata: options.metadata }),
       });
     } else {
@@ -323,6 +327,7 @@ export class SubscriptionsService<TFeatures extends FeatureRegistry> {
     const shouldProrate = options?.prorate ?? true;
 
     let paymentResult: ChargePaymentResult | undefined;
+    let chargeAmount: number | undefined;
 
     // Handle payment for upgrades
     if (isUpgrade && !options?.skipPayment && this.payment.chargePayment) {
@@ -333,7 +338,6 @@ export class SubscriptionsService<TFeatures extends FeatureRegistry> {
       }
 
       // Calculate charge amount
-      let chargeAmount: number;
 
       if (isTrialing || effectiveCurrentPrice === 0) {
         // TRIAL or FREE PLAN USER: Charge full price of new plan
@@ -464,10 +468,43 @@ export class SubscriptionsService<TFeatures extends FeatureRegistry> {
     await this.cache.delete(CacheKeys.subscription(subscriberId));
     await this.cache.delete(CacheKeys.features(subscriberId));
 
+    // Determine charge amount:
+    // 1. If payment was charged by this service, chargeAmount is already set
+    // 2. If skipPayment but it's an upgrade, compute what WOULD have been charged
+    //    (the frontend already collected this amount via its own payment flow)
+    let resolvedChargeAmount: number | undefined;
+    if (isUpgrade) {
+      if (paymentResult) {
+        // chargeAmount was computed above
+        resolvedChargeAmount = chargeAmount;
+      } else if (options?.skipPayment) {
+        // Frontend handled payment; recompute the same amount for the invoice
+        if (isTrialing || effectiveCurrentPrice === 0) {
+          resolvedChargeAmount = Math.round(newPlan.price * 100);
+        } else if (shouldProrate && subscription.currentPeriodEnd > now) {
+          const totalPeriodMs =
+            subscription.currentPeriodEnd.getTime() -
+            subscription.currentPeriodStart.getTime();
+          const remainingMs =
+            subscription.currentPeriodEnd.getTime() - now.getTime();
+          const remainingRatio = remainingMs / totalPeriodMs;
+          const priceDifference = newPlan.price - currentPlan.price;
+          resolvedChargeAmount = Math.round(
+            priceDifference * remainingRatio * 100,
+          );
+        } else {
+          resolvedChargeAmount = Math.round(newPlan.price * 100);
+        }
+      }
+    }
+
     return {
       subscription: { ...updated, plan: newPlan },
       charged: !!paymentResult && paymentResult.status === "paid",
       ...(paymentResult?.id && { paymentId: paymentResult.id }),
+      ...(resolvedChargeAmount !== undefined && {
+        chargeAmount: resolvedChargeAmount,
+      }),
     };
   }
 

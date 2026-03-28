@@ -203,9 +203,10 @@ export function elysiaPlugin<
 
     if (verifiedTokenId && paymentId && subscription.status === "active") {
       if (plan.price > 0) {
+        const amount = Math.round(plan.price * 100); // Convert to smallest unit (cents/halalas)
         await subs.invoices.create({
           subscriptionId: subscription.id,
-          amount: plan.price,
+          amount,
           currency: plan.currency,
           status: "paid",
           gatewayInvoiceId: paymentId,
@@ -213,8 +214,8 @@ export function elysiaPlugin<
             {
               description: `${plan.name} - Initial subscription`,
               quantity: 1,
-              unitPrice: plan.price,
-              amount: plan.price,
+              unitPrice: amount,
+              amount: amount,
             },
           ],
           metadata: {
@@ -310,20 +311,32 @@ export function elysiaPlugin<
         if (paymentId && result.subscription) {
           const plan = await subs.plans.get(planId);
           if (plan) {
+            // Use the actual charged amount from the service (handles proration correctly).
+            // Fallback to full plan price in smallest unit if chargeAmount is not available.
+            const invoiceAmount =
+              result.chargeAmount ?? Math.round(plan.price * 100);
             await subs.invoices.create({
               subscriptionId: result.subscription.id,
-              amount: Math.round(plan.price * 100), // For trial->paid, full price
+              amount: invoiceAmount,
               currency: plan.currency,
               status: "paid",
               paidAt: new Date(),
-              gatewayInvoiceId: paymentId, // Store Moyasar payment ID
+              gatewayInvoiceId: paymentId,
+              lineItems: [
+                {
+                  description: `Plan upgrade to ${plan.name}`,
+                  quantity: 1,
+                  unitPrice: invoiceAmount,
+                  amount: invoiceAmount,
+                },
+              ],
               metadata: {
                 description: `Plan upgrade to ${plan.name}`,
                 paymentId,
               },
             });
             console.log(
-              `[Subscriptions] Created invoice for plan upgrade: ${paymentId}`,
+              `[Subscriptions] Created invoice for plan change: ${paymentId} (amount: ${invoiceAmount})`,
             );
           }
         }
