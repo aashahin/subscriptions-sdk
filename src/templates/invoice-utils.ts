@@ -2,8 +2,7 @@
 // Template utilities for subscription invoice rendering
 
 import handlebars from "handlebars";
-import Decimal from "decimal.js";
-import type { Invoice } from "../core/types";
+import type { Invoice } from "../core/types.js";
 
 // Currency configuration map with ISO 4217 codes, symbols, and locale hints
 const CURRENCY_CONFIG: Record<
@@ -91,7 +90,7 @@ export function formatCurrency(
 
     if (!amount && amount !== 0) return `0.00 ${config.symbol}`;
 
-    const value = new Decimal(amount).toNumber();
+    const value = Number(amount);
 
     try {
         return new Intl.NumberFormat(formatLocale, {
@@ -277,7 +276,8 @@ export async function renderSubscriptionInvoice(
     templatePath: string,
     data: SubscriptionInvoiceData
 ): Promise<string> {
-    const templateSource = await Bun.file(templatePath).text();
+    const { readFile } = await import("node:fs/promises");
+    const templateSource = await readFile(templatePath, "utf-8");
     const template = handlebars.compile(templateSource);
     return template(data);
 }
@@ -291,7 +291,7 @@ export async function generateSubscriptionInvoicePdf(
     options?: {
         chromiumPath?: string;
     }
-): Promise<Buffer> {
+): Promise<Uint8Array> {
     // Dynamic import to avoid loading puppeteer unless needed
     const PuppeteerHTMLPDF = (await import("puppeteer-html-pdf")).default;
 
@@ -304,7 +304,10 @@ export async function generateSubscriptionInvoicePdf(
     await htmlPDF.setOptions({
         format: "a4",
         printBackground: true,
-        executablePath: options?.chromiumPath ?? Bun.env.CHROMIUM_PATH ?? "/usr/bin/chromium",
+        executablePath:
+            options?.chromiumPath ??
+            (typeof process !== "undefined" ? process.env.CHROMIUM_PATH : undefined) ??
+            "/usr/bin/chromium",
     });
 
     const pdfBuffer = await htmlPDF.create(html);

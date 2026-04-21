@@ -1,25 +1,25 @@
 // file: packages/subscriptions/src/services/permissions.service.ts
 // Permissions service for feature gates and usage limits
 
-import type { CacheAdapter } from "../adapters/cache.adapter";
-import { CacheKeys, noopCacheAdapter } from "../adapters/cache.adapter";
-import type { DatabaseAdapter } from "../adapters/database.adapter";
+import type { CacheAdapter } from "../adapters/cache.adapter.js";
+import { CacheKeys, noopCacheAdapter } from "../adapters/cache.adapter.js";
+import type { DatabaseAdapter } from "../adapters/database.adapter.js";
 import {
   FeatureNotAllowedError,
   SubscriptionInactiveError,
   UsageLimitExceededError,
-} from "../core/errors";
+} from "../core/errors.js";
 import {
   isBooleanFeature,
   isLimitFeature,
   resolveFeatures,
-} from "../core/features";
+} from "../core/features.js";
 import type {
   FeatureRegistry,
   FeatureValues,
   SubscriptionWithPlan,
   UsageStatus,
-} from "../core/types";
+} from "../core/types.js";
 
 const UNLIMITED = -1;
 
@@ -129,28 +129,58 @@ export class PermissionsService<TFeatures extends FeatureRegistry> {
 
   /**
    * Increment usage counter (throws if limit exceeded)
+   *
+   * Uses increment-then-verify to avoid TOCTOU race conditions:
+   * atomically increment first, then check if we exceeded the limit.
+   * If exceeded, roll back the increment.
    */
   async use<K extends keyof TFeatures>(
     subscriberId: string,
     feature: K,
     count: number = 1,
   ): Promise<UsageStatus> {
-    const canUseMore = await this.canUse(subscriberId, feature, count);
-    if (!canUseMore) {
-      const status = await this.remaining(subscriberId, feature);
-      throw new UsageLimitExceededError(
-        feature as string,
-        status.limit as number,
-        status.used,
-      );
-    }
-
-    await this.db.usage.increment(subscriberId, feature as string, { count });
+    // Increment atomically first
+    const newCount = await this.db.usage.increment(subscriberId, feature as string, {
+      count,
+    });
 
     // Invalidate cached usage
     await this.cache.delete(CacheKeys.usage(subscriberId, feature as string));
 
-    return this.remaining(subscriberId, feature);
+    let rolledBack = false;
+    const rollbackIncrement = async (): Promise<void> => {
+      if (rolledBack) {
+        return;
+      }
+
+      await this.db.usage.decrement(subscriberId, feature as string, { count });
+      await this.cache.delete(CacheKeys.usage(subscriberId, feature as string));
+      rolledBack = true;
+    };
+
+    try {
+      // Now check the limit
+      const featureValues = await this.getFeatures(subscriberId);
+      const limit = featureValues[feature] as number;
+      const unlimited = limit === UNLIMITED;
+
+      if (!unlimited && newCount > limit) {
+        await rollbackIncrement();
+        throw new UsageLimitExceededError(
+          feature as string,
+          limit,
+          newCount - count,
+        );
+      }
+
+      return await this.remaining(subscriberId, feature);
+    } catch (error) {
+      if (!rolledBack) {
+        await rollbackIncrement();
+      }
+
+      throw error;
+    }
   }
 
   /**

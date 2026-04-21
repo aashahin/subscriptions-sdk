@@ -182,6 +182,7 @@ export type InvoiceStatus = 'draft' | 'open' | 'paid' | 'uncollectible' | 'void'
 export interface Invoice {
     id: string;
     subscriptionId: string;
+    subscriberId: string;
     amount: number;
     currency: string;
     status: InvoiceStatus;
@@ -231,6 +232,18 @@ export interface InvoiceWithDetails<TFeatures extends FeatureRegistry = FeatureR
     plan: Plan<TFeatures>;
 }
 
+// ==================== Logger ====================
+
+export interface SubscriptionsLogger {
+    debug?(message: string, ...args: unknown[]): void;
+    info?(message: string, ...args: unknown[]): void;
+    warn?(message: string, ...args: unknown[]): void;
+    error?(message: string, ...args: unknown[]): void;
+}
+
+/** No-op logger that silently discards all messages */
+export const noopLogger: SubscriptionsLogger = {};
+
 // ==================== Config ====================
 
 export interface SubscriptionsOptions {
@@ -263,4 +276,10 @@ export interface SubscriptionsOptions {
      * @default 300 (5 minutes)
      */
     cacheTtlSeconds?: number;
+
+    /**
+     * Optional logger. Defaults to no-op (silent).
+     * Pass `console` for basic logging, or a structured logger.
+     */
+    logger?: SubscriptionsLogger;
 }

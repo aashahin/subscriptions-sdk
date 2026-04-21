@@ -1,6 +1,11 @@
 {
-  "extends": "../../tsconfig.json",
   "compilerOptions": {
+    "target": "ES2023",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "allowImportingTsExtensions": true,
+    "verbatimModuleSyntax": true,
+    "isolatedModules": true,
     "rootDir": "./src",
     "outDir": "./dist",
     "declaration": true,
@@ -8,7 +13,11 @@
     "composite": true,
     "noUncheckedIndexedAccess": true,
     "exactOptionalPropertyTypes": true,
+    "strict": true,
+    "skipLibCheck": true,
+    "noFallthroughCasesInSwitch": true,
     "noEmit": true,
+    "types": ["node"],
     "paths": {
       "@/*": ["./src/*"]
     }

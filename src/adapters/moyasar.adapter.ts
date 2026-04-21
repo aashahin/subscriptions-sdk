@@ -15,7 +15,7 @@ import type {
   PortalSession,
   UpdateGatewaySubscriptionInput,
   WebhookEvent,
-} from "./payment.adapter";
+} from "./payment.adapter.js";
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // Types
@@ -237,13 +237,6 @@ class MoyasarClient {
   ): Promise<T> {
     const url = `${this.baseUrl}${path}`;
 
-    // Debug logging for troubleshooting
-    console.log("[Moyasar] Request:", {
-      method,
-      path,
-      body: body ? JSON.stringify(body) : undefined,
-    });
-
     let response: Response;
     try {
       response = await fetch(url, {
@@ -288,11 +281,6 @@ class MoyasarClient {
     }
 
     if (!response.ok) {
-      // Log error response for debugging
-      console.error("[Moyasar] Error response:", {
-        status: response.status,
-        data: JSON.stringify(data),
-      });
       throw MoyasarAdapterError.fromHttpResponse(
         response.status,
         data as MoyasarErrorResponse,
@@ -1117,26 +1105,38 @@ async function verifySignature(
   webhookSecret: string,
 ): Promise<boolean> {
   // Moyasar uses HMAC-SHA256 for webhook signatures
+  const normalizedSignature = signature.trim().toLowerCase();
+  if (
+    normalizedSignature.length === 0 ||
+    normalizedSignature.length % 2 !== 0 ||
+    !/^[0-9a-f]+$/.test(normalizedSignature)
+  ) {
+    return false;
+  }
+
   const encoder = new TextEncoder();
   const key = await crypto.subtle.importKey(
     "raw",
     encoder.encode(webhookSecret),
     { name: "HMAC", hash: "SHA-256" },
     false,
-    ["sign"],
+    ["verify"],
   );
 
-  const signatureBytes = await crypto.subtle.sign(
+  // Decode the hex signature to bytes for timing-safe comparison
+  const signatureBytes = new Uint8Array(
+    (normalizedSignature.match(/.{1,2}/g) ?? []).map((byte) =>
+      parseInt(byte, 16),
+    ),
+  );
+
+  // crypto.subtle.verify performs a constant-time comparison internally
+  return crypto.subtle.verify(
     "HMAC",
     key,
+    signatureBytes,
     encoder.encode(payload),
   );
-
-  const computedSignature = Array.from(new Uint8Array(signatureBytes))
-    .map((b) => b.toString(16).padStart(2, "0"))
-    .join("");
-
-  return computedSignature === signature;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -1384,11 +1384,11 @@ export function moyasarAdapter(config: MoyasarConfig): PaymentGatewayAdapter {
     // ==================== Webhooks ====================
 
     async constructWebhookEvent(
-      payload: string | Buffer,
+      payload: string | Uint8Array,
       signature: string,
     ): Promise<WebhookEvent> {
       const payloadStr =
-        typeof payload === "string" ? payload : payload.toString("utf-8");
+        typeof payload === "string" ? payload : new TextDecoder().decode(payload);
 
       // Verify signature if webhook secret is configured
       if (config.webhookSecret && signature) {
@@ -1400,6 +1400,11 @@ export function moyasarAdapter(config: MoyasarConfig): PaymentGatewayAdapter {
         if (!isValid) {
           throw new MoyasarAdapterError("Invalid webhook signature");
         }
+      } else if (!config.webhookSecret) {
+        console.warn(
+          "[Moyasar] WARNING: No webhookSecret configured. Webhook payloads are accepted without signature verification. " +
+          "Set webhookSecret in MoyasarConfig to enable verification.",
+        );
       }
 
       const webhookData = JSON.parse(payloadStr) as MoyasarWebhookPayload;
@@ -1512,8 +1517,7 @@ export function moyasarAdapter(config: MoyasarConfig): PaymentGatewayAdapter {
         }
 
         return null;
-      } catch (error) {
-        console.error("[Moyasar] Failed to get payment source:", error);
+      } catch (_error) {
         return null;
       }
     },

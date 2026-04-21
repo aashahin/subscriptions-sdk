@@ -2,26 +2,26 @@
 // Prisma adapter implementation for @abshahin/subscriptions
 
 import type {
-  CreateInvoiceInput,
-  CreatePlanInput,
-  CreateSubscriptionInput,
-  FeatureRegistry,
-  Invoice,
-  InvoiceWithDetails,
-  Plan,
-  Subscription,
-  SubscriptionStatus,
-  SubscriptionWithPlan,
-  UpdateInvoiceInput,
-  UpdatePlanInput,
-  UpdateSubscriptionInput,
-  UsageRecord,
-} from "../core/types";
+    CreateInvoiceInput,
+    CreatePlanInput,
+    CreateSubscriptionInput,
+    FeatureRegistry,
+    Invoice,
+    InvoiceWithDetails,
+    Plan,
+    Subscription,
+    SubscriptionStatus,
+    SubscriptionWithPlan,
+    UpdateInvoiceInput,
+    UpdatePlanInput,
+    UpdateSubscriptionInput,
+    UsageRecord,
+} from "../core/types.js";
 import type {
-  DatabaseAdapter,
-  PlanQueryOptions,
-  SubscriptionQueryOptions,
-} from "./database.adapter";
+    DatabaseAdapter,
+    PlanQueryOptions,
+    SubscriptionQueryOptions,
+} from "./database.adapter.js";
 
 /**
  * Prisma client type (accepts any Prisma client instance)
@@ -55,7 +55,7 @@ export interface PrismaAdapterOptions {
  * @example
  * ```typescript
  * import { prismaAdapter } from '@abshahin/subscriptions/adapters/prisma';
- * import { db } from './lib/db';
+ * import { db } from './lib/db.js';
  *
  * const subs = createSubscriptions({
  *   database: prismaAdapter(db),
@@ -166,6 +166,29 @@ export function prismaAdapter<TFeatures extends FeatureRegistry>(
         await client.subscriptionPlan.delete({
           where: { id },
         });
+      },
+
+      async hasActiveSubscribers(id: string): Promise<boolean> {
+        const count = await client.subscription.count({
+          where: {
+            planId: id,
+            status: { in: ["active", "trialing", "past_due"] },
+          },
+        });
+        return count > 0;
+      },
+
+      async hasPendingDowngrades(id: string): Promise<boolean> {
+        const count = await client.subscription.count({
+          where: {
+            status: { in: ["active", "trialing", "past_due"] },
+            metadata: {
+              path: ["pendingDowngradePlanId"],
+              equals: id,
+            },
+          },
+        });
+        return count > 0;
       },
     },
 
@@ -343,6 +366,14 @@ export function prismaAdapter<TFeatures extends FeatureRegistry>(
       async findBySubscription(subscriptionId: string): Promise<Invoice[]> {
         const invoices = await client.invoice.findMany({
           where: { subscriptionId },
+          orderBy: { createdAt: "desc" },
+        });
+        return invoices.map(mapInvoiceFromPrisma);
+      },
+
+      async findBySubscriber(subscriberId: string): Promise<Invoice[]> {
+        const invoices = await client.invoice.findMany({
+          where: { tenantId: subscriberId },
           orderBy: { createdAt: "desc" },
         });
         return invoices.map(mapInvoiceFromPrisma);
@@ -639,6 +670,7 @@ function mapInvoiceFromPrisma(invoice: any): Invoice {
   return {
     id: invoice.id,
     subscriptionId: invoice.subscriptionId,
+    subscriberId: invoice.tenantId ?? invoice.subscriberId,
     amount: Number(invoice.amount),
     currency: invoice.currency,
     status: invoice.status,

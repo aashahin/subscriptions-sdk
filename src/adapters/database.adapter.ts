@@ -2,21 +2,21 @@
 // Database adapter interface for subscriptions package
 
 import type {
-    Plan,
-    Subscription,
-    SubscriptionWithPlan,
+    CreateInvoiceInput,
+    CreatePlanInput,
+    CreateSubscriptionInput,
+    FeatureRegistry,
     Invoice,
     InvoiceWithDetails,
-    UsageRecord,
-    CreatePlanInput,
-    UpdatePlanInput,
-    CreateSubscriptionInput,
-    UpdateSubscriptionInput,
-    CreateInvoiceInput,
-    UpdateInvoiceInput,
-    FeatureRegistry,
+    Plan,
+    Subscription,
     SubscriptionStatus,
-} from '../core/types';
+    SubscriptionWithPlan,
+    UpdateInvoiceInput,
+    UpdatePlanInput,
+    UpdateSubscriptionInput,
+    UsageRecord,
+} from '../core/types.js';
 
 /**
  * Query options for listing subscriptions
@@ -81,6 +81,16 @@ export interface DatabaseAdapter<TFeatures extends FeatureRegistry = FeatureRegi
          * Delete a plan (soft delete recommended)
          */
         delete(id: string): Promise<void>;
+
+        /**
+         * Check if a plan has active subscribers
+         */
+        hasActiveSubscribers(id: string): Promise<boolean>;
+
+        /**
+         * Check if a plan is referenced by any pending downgrade
+         */
+        hasPendingDowngrades(id: string): Promise<boolean>;
     };
 
     // ==================== Subscriptions ====================
@@ -137,6 +147,11 @@ export interface DatabaseAdapter<TFeatures extends FeatureRegistry = FeatureRegi
          * Find invoices for a subscription
          */
         findBySubscription(subscriptionId: string): Promise<Invoice[]>;
+
+        /**
+         * Find invoices for a subscriber (by subscriber ID)
+         */
+        findBySubscriber(subscriberId: string): Promise<Invoice[]>;
 
         /**
          * Create a new invoice

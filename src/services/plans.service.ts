@@ -1,18 +1,18 @@
 // file: packages/subscriptions/src/services/plans.service.ts
 // Plans service for CRUD operations on subscription plans
 
+import type { CacheAdapter } from '../adapters/cache.adapter.js';
+import { CacheKeys, noopCacheAdapter } from '../adapters/cache.adapter.js';
+import type { DatabaseAdapter, PlanQueryOptions } from '../adapters/database.adapter.js';
+import { InvalidPlanError, PlanNotFoundError } from '../core/errors.js';
+import { getFeatureValue, resolveFeatures, validatePlanFeatures } from '../core/features.js';
 import type {
-    Plan,
     CreatePlanInput,
-    UpdatePlanInput,
     FeatureRegistry,
     FeatureValues,
-} from '../core/types';
-import type { DatabaseAdapter, PlanQueryOptions } from '../adapters/database.adapter';
-import type { CacheAdapter } from '../adapters/cache.adapter';
-import { CacheKeys, noopCacheAdapter } from '../adapters/cache.adapter';
-import { PlanNotFoundError, InvalidPlanError } from '../core/errors';
-import { resolveFeatures, validatePlanFeatures, getFeatureValue } from '../core/features';
+    Plan,
+    UpdatePlanInput,
+} from '../core/types.js';
 
 export interface PlansServiceOptions {
     /**
@@ -148,6 +148,15 @@ export class PlansService<TFeatures extends FeatureRegistry> {
     async delete(id: string): Promise<void> {
         // Ensure plan exists
         await this.get(id);
+
+        // Prevent deletion if plan has active subscribers
+        const hasSubscribers = await this.db.plans.hasActiveSubscribers(id);
+        const hasPendingDowngrades = await this.db.plans.hasPendingDowngrades(id);
+        if (hasSubscribers || hasPendingDowngrades) {
+            throw new InvalidPlanError(
+                'Cannot delete plan with active or pending subscribers. Deactivate it instead.',
+            );
+        }
 
         await this.db.plans.delete(id);
 

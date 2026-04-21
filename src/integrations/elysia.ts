@@ -7,13 +7,13 @@ import {
   PaymentFailedError,
   SubscriptionError,
   UsageLimitExceededError,
-} from "../core/errors";
-import type { FeatureRegistry } from "../core/types";
-import type { Subscriptions } from "../index";
+} from "../core/errors.js";
+import type { FeatureRegistry } from "../core/types.js";
+import type { Subscriptions } from "../index.js";
 import {
   generateSubscriptionInvoicePdf,
   type SubscriptionInvoiceData,
-} from "../templates/invoice-utils";
+} from "../templates/invoice-utils.js";
 
 /**
  * Platform info for invoice rendering
@@ -335,9 +335,6 @@ export function elysiaPlugin<
                 paymentId,
               },
             });
-            console.log(
-              `[Subscriptions] Created invoice for plan change: ${paymentId} (amount: ${invoiceAmount})`,
-            );
           }
         }
 
@@ -484,6 +481,7 @@ export function elysiaPlugin<
         invoice: {
           id: invoice.id,
           subscriptionId: invoice.subscriptionId,
+          subscriberId: invoice.subscriberId,
           // Convert from smallest unit (halalas/cents) to display unit (SAR/USD)
           amount: invoice.amount / 100,
           currency: invoice.currency,
@@ -534,9 +532,11 @@ export function elysiaPlugin<
         templatePath,
         invoiceData,
       );
+      const pdfBytes = new Uint8Array(pdfBuffer.byteLength);
+      pdfBytes.set(pdfBuffer);
 
-      // Return PDF Response (convert Buffer to Uint8Array for Response compatibility)
-      return new Response(new Uint8Array(pdfBuffer), {
+      // Return PDF Response
+      return new Response(pdfBytes.buffer, {
         headers: {
           "Content-Type": "application/pdf",
           "Content-Disposition": `inline; filename="invoice-${invoice.id}.pdf"`,

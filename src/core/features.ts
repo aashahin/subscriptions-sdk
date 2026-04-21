@@ -1,7 +1,7 @@
 // file: packages/subscriptions/src/core/features.ts
 // Type-safe feature definition system
 
-import type { FeatureDefinition, FeatureRegistry, FeatureValues, FeatureValue } from './types';
+import type { FeatureDefinition, FeatureRegistry, FeatureValue, FeatureValues } from './types.js';
 
 /**
  * Define a type-safe feature registry for your application.
@@ -109,9 +109,11 @@ export function validatePlanFeatures<T extends FeatureRegistry>(
             );
         }
 
-        // Validate limits are non-negative (or -1 for unlimited)
+        // Validate limits are non-negative integers (or -1 for unlimited)
         if (definition.type === 'limit' && typeof value === 'number') {
-            if (value < -1) {
+            if (!Number.isFinite(value) || !Number.isInteger(value)) {
+                errors.push(`Feature "${key}" limit must be an integer`);
+            } else if (value < -1) {
                 errors.push(`Feature "${key}" limit must be >= -1 (use -1 for unlimited)`);
             }
         }

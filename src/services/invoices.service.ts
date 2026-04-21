@@ -1,14 +1,14 @@
 // file: packages/subscriptions/src/services/invoices.service.ts
 // Invoices service for invoice management
 
+import type { DatabaseAdapter } from '../adapters/database.adapter.js';
 import type {
+    CreateInvoiceInput,
+    FeatureRegistry,
     Invoice,
     InvoiceWithDetails,
-    CreateInvoiceInput,
     UpdateInvoiceInput,
-    FeatureRegistry,
-} from '../core/types';
-import type { DatabaseAdapter } from '../adapters/database.adapter';
+} from '../core/types.js';
 
 export class InvoicesService<TFeatures extends FeatureRegistry = FeatureRegistry> {
     constructor(private readonly db: DatabaseAdapter<TFeatures>) { }
@@ -32,6 +32,13 @@ export class InvoicesService<TFeatures extends FeatureRegistry = FeatureRegistry
      */
     async listBySubscription(subscriptionId: string): Promise<Invoice[]> {
         return this.db.invoices.findBySubscription(subscriptionId);
+    }
+
+    /**
+     * Get all invoices for a subscriber (by subscriber ID)
+     */
+    async listBySubscriber(subscriberId: string): Promise<Invoice[]> {
+        return this.db.invoices.findBySubscriber(subscriberId);
     }
 
     /**

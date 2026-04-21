@@ -1,19 +1,20 @@
 // file: packages/subscriptions/src/index.ts
 // Main entry point for @abshahin/subscriptions package
 
-import type { CacheAdapter } from "./adapters/cache.adapter";
-import { noopCacheAdapter } from "./adapters/cache.adapter";
-import type { DatabaseAdapter } from "./adapters/database.adapter";
+import type { CacheAdapter } from "./adapters/cache.adapter.js";
+import { noopCacheAdapter } from "./adapters/cache.adapter.js";
+import type { DatabaseAdapter } from "./adapters/database.adapter.js";
 import type {
   PaymentGatewayAdapter,
   WebhookEvent,
-} from "./adapters/payment.adapter";
-import { noopPaymentAdapter } from "./adapters/payment.adapter";
-import type { FeatureRegistry, SubscriptionsOptions } from "./core/types";
-import { InvoicesService } from "./services/invoices.service";
-import { PermissionsService } from "./services/permissions.service";
-import { PlansService } from "./services/plans.service";
-import { SubscriptionsService } from "./services/subscriptions.service";
+} from "./adapters/payment.adapter.js";
+import { noopPaymentAdapter } from "./adapters/payment.adapter.js";
+import type { FeatureRegistry, SubscriptionsLogger, SubscriptionsOptions } from "./core/types.js";
+import { noopLogger } from "./core/types.js";
+import { InvoicesService } from "./services/invoices.service.js";
+import { PermissionsService } from "./services/permissions.service.js";
+import { PlansService } from "./services/plans.service.js";
+import { SubscriptionsService } from "./services/subscriptions.service.js";
 
 /**
  * Configuration for creating a subscriptions instance
@@ -87,7 +88,7 @@ export interface Subscriptions<TFeatures extends FeatureRegistry> {
   remaining<K extends keyof TFeatures>(
     subscriberId: string,
     feature: K,
-  ): Promise<import("./core/types").UsageStatus>;
+  ): Promise<import("./core/types.js").UsageStatus>;
 
   /**
    * Increment usage counter (throws if limit exceeded)
@@ -97,7 +98,7 @@ export interface Subscriptions<TFeatures extends FeatureRegistry> {
     subscriberId: string,
     feature: K,
     count?: number,
-  ): Promise<import("./core/types").UsageStatus>;
+  ): Promise<import("./core/types.js").UsageStatus>;
 
   /**
    * Decrement usage counter
@@ -107,14 +108,14 @@ export interface Subscriptions<TFeatures extends FeatureRegistry> {
     subscriberId: string,
     feature: K,
     count?: number,
-  ): Promise<import("./core/types").UsageStatus>;
+  ): Promise<import("./core/types.js").UsageStatus>;
 
   /**
    * Handle webhook event from payment gateway
    */
   handleWebhook(
     provider: string,
-    payload: string | Buffer,
+    payload: string | Uint8Array,
     signature: string,
   ): Promise<WebhookEvent>;
 }
@@ -150,6 +151,7 @@ export function createSubscriptions<TFeatures extends FeatureRegistry>(
 
   const cacheAdapter = cache ?? noopCacheAdapter;
   const paymentAdapter = payment ?? noopPaymentAdapter;
+  const logger: SubscriptionsLogger = options?.logger ?? noopLogger;
 
   const plans = new PlansService(database, features, cacheAdapter, {
     ...(options?.defaultCurrency && {
@@ -175,6 +177,7 @@ export function createSubscriptions<TFeatures extends FeatureRegistry>(
       ...(options?.cacheTtlSeconds && {
         cacheTtlSeconds: options.cacheTtlSeconds,
       }),
+      logger,
     },
   );
 
@@ -234,9 +237,11 @@ export function createSubscriptions<TFeatures extends FeatureRegistry>(
             // Create invoice if subscription exists
             const subscription = await subscriptions.get(subscriberId);
             if (subscription) {
+              // Moyasar returns amount in smallest currency unit (halalas/cents)
+              // Store as-is — the invoice download endpoint converts to display units
               const amount =
                 typeof paymentData.amount === "number"
-                  ? paymentData.amount / 100
+                  ? paymentData.amount
                   : 0;
               const currency =
                 typeof paymentData.currency === "string"
@@ -316,23 +321,23 @@ export function createSubscriptions<TFeatures extends FeatureRegistry>(
 // ==================== Re-exports ====================
 
 // Core
-export * from "./core/errors";
+export * from "./core/errors.js";
 export {
   defineFeatures,
   resolveFeatures,
-  validatePlanFeatures,
-} from "./core/features";
-export * from "./core/types";
+  validatePlanFeatures
+} from "./core/features.js";
+export * from "./core/types.js";
 
 // Adapters
-export { CacheKeys, noopCacheAdapter } from "./adapters/cache.adapter";
-export type { CacheAdapter } from "./adapters/cache.adapter";
+export { CacheKeys, noopCacheAdapter } from "./adapters/cache.adapter.js";
+export type { CacheAdapter } from "./adapters/cache.adapter.js";
 export type {
   DatabaseAdapter,
   PlanQueryOptions,
-  SubscriptionQueryOptions,
-} from "./adapters/database.adapter";
-export { noopPaymentAdapter } from "./adapters/payment.adapter";
+  SubscriptionQueryOptions
+} from "./adapters/database.adapter.js";
+export { noopPaymentAdapter } from "./adapters/payment.adapter.js";
 export type {
   ChargePaymentInput,
   ChargePaymentResult,
@@ -341,18 +346,18 @@ export type {
   GatewaySubscription,
   PaymentGatewayAdapter,
   PortalSession,
-  WebhookEvent,
-} from "./adapters/payment.adapter";
+  WebhookEvent
+} from "./adapters/payment.adapter.js";
 
 // Services
-export { InvoicesService } from "./services/invoices.service";
-export { PermissionsService } from "./services/permissions.service";
-export { PlansService } from "./services/plans.service";
+export { InvoicesService } from "./services/invoices.service.js";
+export { PermissionsService } from "./services/permissions.service.js";
+export { PlansService } from "./services/plans.service.js";
 export {
   SubscriptionsService,
   type ChangePlanResult,
-  type PlanChangePreview,
-} from "./services/subscriptions.service";
+  type PlanChangePreview
+} from "./services/subscriptions.service.js";
 
 // Invoice Templates
 export {
@@ -361,5 +366,6 @@ export {
   generateSubscriptionInvoicePdf,
   getCurrencyInfo,
   renderSubscriptionInvoice,
-  type SubscriptionInvoiceData,
-} from "./templates/invoice-utils";
+  type SubscriptionInvoiceData
+} from "./templates/invoice-utils.js";
+

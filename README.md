@@ -1,15 +1,15 @@
 # @abshahin/subscriptions
 
-Type-safe subscription plans, feature gates, usage limits, invoices, and Elysia integration for multi-tenant TypeScript applications.
+Type-safe subscription plans, feature gates, usage limits, invoices, and Elysia integration for TypeScript applications.
 
-The package is framework-agnostic at the service layer and currently ships with:
+The package ships with:
 
 - a Prisma database adapter
 - an optional cache adapter interface
 - an optional Moyasar payment adapter
-- an Elysia integration with routes and controller macros
+- an optional Elysia integration with routes and controller macros
 
-The package is designed around a single subscriber ID. In the backend project that currently uses it, that subscriber is a tenant ID.
+The service layer is runtime-neutral and uses web-standard primitives for binary payloads and crypto-friendly flows. The current production integration uses tenant-scoped subscriptions, but the core package still models the subscribed entity as a generic subscriber.
 
 ## What It Solves
 
@@ -17,8 +17,14 @@ The package is designed around a single subscriber ID. In the backend project th
 - Store plan overrides as JSON while keeping feature access type-safe
 - Enforce boolean feature access and numeric usage limits
 - Manage subscription lifecycle: create, change plan, cancel, pause, resume, reactivate, renew
-- Generate invoices and expose billing endpoints through Elysia
-- Add payment support without coupling the core services to one provider
+- Verify payment webhooks without coupling the core services to one provider
+- Generate invoice HTML and, in Node.js environments, invoice PDFs
+
+## Runtime Support
+
+- Core services and payment interfaces are runtime-neutral and accept webhook payloads as `string | Uint8Array`
+- Existing Node.js callers can still pass `Buffer`, because `Buffer` extends `Uint8Array`
+- Invoice PDF generation is Node.js-only because it depends on filesystem template loading and `puppeteer-html-pdf`
 
 ## Installation
 
@@ -31,6 +37,14 @@ Optional peer dependencies used by common integrations:
 ```bash
 bun add elysia @prisma/client
 ```
+
+Optional peer dependency for Node.js invoice PDF generation:
+
+```bash
+bun add puppeteer-html-pdf
+```
+
+If you only use the service layer, Prisma adapter, or webhook handling, you do not need the PDF dependency.
 
 ## Quick Start
 
@@ -123,7 +137,10 @@ console.log(usage.remaining);
 await subscriptions.use(tenantId, "maxProducts");
 await subscriptions.release(tenantId, "maxProducts");
 
-const fee = await subscriptions.permissions.getRate(tenantId, "transactionFee");
+const fee = await subscriptions.permissions.getRate(
+  tenantId,
+  "transactionFee",
+);
 ```
 
 ## Core Model
@@ -136,7 +153,7 @@ const fee = await subscriptions.permissions.getRate(tenantId, "transactionFee");
 - `limit`: numeric usage caps, with `-1` meaning unlimited
 - `rate`: numeric values such as fees or delays
 
-Plan records only need to store overrides. Any omitted feature falls back to the default declared in `defineFeatures`.
+Plan records only store overrides. Any omitted feature falls back to the default declared in `defineFeatures`.
 
 ### Subscriber Model
 
@@ -145,7 +162,7 @@ The package refers to the subscribed entity as a subscriber. That can be either:
 - a tenant, when a whole workspace or organization shares a subscription
 - a user, when each user owns their own subscription
 
-`options.subscriberType` sets the default type for newly created subscriptions. The Prisma adapter currently persists subscriber IDs through the `tenantId` column, so tenant-based usage is the most mature path and the one used in the backend project.
+`options.subscriberType` sets the default type for newly created subscriptions. The current Prisma adapter persists subscriber IDs through the `tenantId` column, so tenant-based usage is the most mature path and the one used in the backend project.
 
 ## Service API
 
@@ -223,6 +240,20 @@ await subscriptions.permissions.setUsage(tenantId, "maxProducts", 42);
 await subscriptions.permissions.resetUsage(tenantId, "maxProducts");
 ```
 
+### Webhooks
+
+Webhook handlers accept raw payloads as `string | Uint8Array`.
+
+```ts
+const event = await subscriptions.handleWebhook(
+  "moyasar",
+  rawBody,
+  signature,
+);
+```
+
+This works in Node.js, Bun, and edge-style runtimes as long as you preserve the raw request body.
+
 ### Invoices
 
 ```ts
@@ -244,6 +275,8 @@ const invoice = await subscriptions.invoices.create({
 
 const detailed = await subscriptions.invoices.getWithDetails(invoice.id);
 ```
+
+Invoice HTML rendering and PDF generation are exported from the package root. PDF generation is intended for Node.js environments.
 
 ## Elysia Integration
 
@@ -310,6 +343,8 @@ app.post("/products", handler, {
 });
 ```
 
+If you enable invoice downloads through the Elysia plugin, run that endpoint on Node.js and install `puppeteer-html-pdf`.
+
 ## Payments
 
 Payments are optional. If no payment adapter is configured, the package still supports manual subscription management.
@@ -351,39 +386,28 @@ The backend project uses this package as the subscription source of truth, but k
 
 That split is intentional. This package owns subscription state and policy. Your application can add faster counters, schedulers, and dashboards around it.
 
-## Documentation
-
-- `docs/README.md`
-- `docs/adapters.md`
-- `docs/error-handling.md`
-- `docs/integration-guide.md`
-- `docs/prisma-schema.md`
-
-## License
-
-MIT
-
-- **UsageRecord** - Feature usage tracking per tenant per period
-
 ## Type Safety
 
 The package provides full type inference for features:
 
-```typescript
+```ts
 const features = defineFeatures({
   analytics: { type: "boolean", default: false },
   maxProducts: { type: "limit", default: 100 },
 });
 
-// Type-safe feature access
-await subs.can(tenantId, "analytics"); // ✅ Valid
-await subs.can(tenantId, "invalidFeature"); // ❌ Type error
-
-// Inferred value types
-const values = await subs.permissions.getFeatures(tenantId);
-values.analytics; // boolean
-values.maxProducts; // number
+await subs.can(tenantId, "analytics");
+await subs.permissions.getFeatures(tenantId);
 ```
+
+## Documentation
+
+- `CHANGELOG.md`
+- `docs/README.md`
+- `docs/adapters.md`
+- `docs/error-handling.md`
+- `docs/integration-guide.md`
+- `docs/prisma-schema.md`
 
 ## License
 

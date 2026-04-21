@@ -164,6 +164,8 @@ CacheKeys.usage(subscriberId, feature);
 
 Payments are optional. Manual subscription management still works without a payment adapter.
 
+Webhook payload handling is runtime-neutral. Public adapter methods accept `string | Uint8Array`, which keeps the interface compatible with Node.js, Bun, and edge-style runtimes.
+
 ### Interface
 
 ```ts
@@ -203,11 +205,13 @@ interface PaymentGatewayAdapter {
   getPaymentSource?(paymentId: string): Promise<string | null>;
 
   constructWebhookEvent(
-    payload: string | Buffer,
+    payload: string | Uint8Array,
     signature: string,
   ): Promise<WebhookEvent>;
 }
 ```
+
+If your runtime exposes `Buffer`, it will continue to work because `Buffer` extends `Uint8Array`.
 
 ## Moyasar Adapter
 
@@ -231,6 +235,8 @@ Typical backend flow:
 3. Charge upgrades or renewals through `chargePayment`.
 4. Create invoices after successful payment.
 
+The included Moyasar adapter verifies webhook signatures using the Web Crypto API and decodes binary payloads through `TextDecoder`, so it does not require `Buffer` in its public surface.
+
 ## Custom Payment Adapters
 
 If you integrate another provider, implement the interface directly and pass it to `createSubscriptions`.
@@ -241,3 +247,17 @@ Prioritize these flows first:
 - webhook verification
 - cancellation and subscription lookup
 - direct payment charging for upgrades and renewals
+
+## Invoice Rendering Helpers
+
+The package also exports invoice rendering helpers from the root entrypoint:
+
+- `renderSubscriptionInvoice(templatePath, data)`
+- `generateSubscriptionInvoicePdf(templatePath, data, options)`
+
+These helpers are intended for Node.js runtimes:
+
+- `renderSubscriptionInvoice` reads the template from the filesystem
+- `generateSubscriptionInvoicePdf` requires the optional `puppeteer-html-pdf` peer dependency
+
+If you need invoice generation in a non-Node runtime, render HTML or PDFs in application code with runtime-specific infrastructure.

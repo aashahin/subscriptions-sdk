@@ -259,7 +259,7 @@ export interface PaymentGatewayAdapter {
      * @param payload - Raw webhook payload
      * @param signature - Webhook signature header
      */
-    constructWebhookEvent(payload: string | Buffer, signature: string): Promise<WebhookEvent>;
+    constructWebhookEvent(payload: string | Uint8Array, signature: string): Promise<WebhookEvent>;
 }
 
 /**

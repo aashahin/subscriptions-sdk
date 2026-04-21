@@ -1,15 +1,15 @@
 // file: packages/subscriptions/src/services/subscriptions.service.ts
 // Subscriptions service for lifecycle management
 
-import type { CacheAdapter } from "../adapters/cache.adapter";
-import { CacheKeys, noopCacheAdapter } from "../adapters/cache.adapter";
-import type { DatabaseAdapter } from "../adapters/database.adapter";
+import type { CacheAdapter } from "../adapters/cache.adapter.js";
+import { CacheKeys, noopCacheAdapter } from "../adapters/cache.adapter.js";
+import type { DatabaseAdapter } from "../adapters/database.adapter.js";
 import type {
   CancelOptions,
   ChargePaymentResult,
   PaymentGatewayAdapter,
-} from "../adapters/payment.adapter";
-import { noopPaymentAdapter } from "../adapters/payment.adapter";
+} from "../adapters/payment.adapter.js";
+import { noopPaymentAdapter } from "../adapters/payment.adapter.js";
 import {
   DuplicateSubscriptionError,
   PaymentFailedError,
@@ -17,15 +17,59 @@ import {
   SubscriptionInactiveError,
   SubscriptionNotCanceledError,
   SubscriptionNotFoundError,
-} from "../core/errors";
+} from "../core/errors.js";
 import type {
   FeatureRegistry,
   SubscriberType,
   Subscription,
+  SubscriptionsLogger,
   SubscriptionStatus,
   SubscriptionWithPlan,
   UpdateSubscriptionInput,
-} from "../core/types";
+} from "../core/types.js";
+import { noopLogger } from "../core/types.js";
+
+/**
+ * Date fields that must be rehydrated after JSON deserialization from cache.
+ * When objects are cached (e.g. in Redis), Date instances become ISO strings.
+ */
+const SUBSCRIPTION_DATE_FIELDS = [
+  "currentPeriodStart",
+  "currentPeriodEnd",
+  "cancelAt",
+  "canceledAt",
+  "trialStart",
+  "trialEnd",
+  "createdAt",
+  "updatedAt",
+] as const;
+
+const PLAN_DATE_FIELDS = ["createdAt", "updatedAt"] as const;
+
+/** Rehydrate Date fields that were serialized to strings by the cache layer */
+function rehydrateDates<T extends Record<string, unknown>>(
+  obj: T,
+  fields: readonly string[],
+): T {
+  for (const field of fields) {
+    const val = obj[field];
+    if (typeof val === "string") {
+      (obj as Record<string, unknown>)[field] = new Date(val);
+    }
+  }
+  return obj;
+}
+
+/** Rehydrate a SubscriptionWithPlan from cache (dates may be ISO strings) */
+function rehydrateSubscription<TFeatures extends FeatureRegistry>(
+  sub: SubscriptionWithPlan<TFeatures>,
+): SubscriptionWithPlan<TFeatures> {
+  rehydrateDates(sub as unknown as Record<string, unknown>, SUBSCRIPTION_DATE_FIELDS);
+  if (sub.plan) {
+    rehydrateDates(sub.plan as unknown as Record<string, unknown>, PLAN_DATE_FIELDS);
+  }
+  return sub;
+}
 
 export interface SubscriptionsServiceOptions {
   /**
@@ -51,6 +95,11 @@ export interface SubscriptionsServiceOptions {
    * @default 300
    */
   cacheTtlSeconds?: number;
+
+  /**
+   * Optional logger
+   */
+  logger?: SubscriptionsLogger;
 }
 
 /**
@@ -71,6 +120,10 @@ export interface ChangePlanResult<
   paymentPending?: boolean;
   /** 3DS verification URL if payment is pending */
   verificationUrl?: string;
+}
+
+interface RenewSubscriptionOptions {
+  skipPayment?: boolean;
 }
 
 /**
@@ -122,6 +175,7 @@ export class SubscriptionsService<TFeatures extends FeatureRegistry> {
   private readonly trialDays: number;
   private readonly gracePeriodDays: number;
   private readonly cacheTtl: number;
+  private readonly logger: SubscriptionsLogger;
 
   constructor(
     private readonly db: DatabaseAdapter<TFeatures>,
@@ -135,6 +189,7 @@ export class SubscriptionsService<TFeatures extends FeatureRegistry> {
     this.trialDays = options?.trialDays ?? 0;
     this.gracePeriodDays = options?.gracePeriodDays ?? 0;
     this.cacheTtl = options?.cacheTtlSeconds ?? 300;
+    this.logger = options?.logger ?? noopLogger;
   }
 
   /**
@@ -149,6 +204,8 @@ export class SubscriptionsService<TFeatures extends FeatureRegistry> {
     const cached =
       await this.cache.get<SubscriptionWithPlan<TFeatures>>(cacheKey);
     if (cached) {
+      // Rehydrate Date fields that were serialized to strings by the cache
+      rehydrateSubscription(cached);
       return this.finalizeEndedSubscriptionIfNeeded(subscriberId, cached);
     }
 
@@ -259,6 +316,28 @@ export class SubscriptionsService<TFeatures extends FeatureRegistry> {
     await this.cache.delete(CacheKeys.subscription(subscriberId));
     await this.cache.delete(CacheKeys.features(subscriberId));
 
+    // Create initial invoice (draft for trial, open for immediate start)
+    if (!hasTrialDays && plan.price > 0) {
+      try {
+        await this.db.invoices.create({
+          subscriptionId: subscription.id,
+          amount: plan.price,
+          currency: plan.currency,
+          status: "open",
+          dueDate: currentPeriodEnd,
+          lineItems: [{
+            description: `${plan.name} subscription`,
+            quantity: 1,
+            unitPrice: plan.price,
+            amount: plan.price,
+          }],
+          metadata: { type: "subscription_start" },
+        });
+      } catch {
+        this.logger.error?.(`Failed to create initial invoice for ${subscriberId}`);
+      }
+    }
+
     return subscription;
   }
 
@@ -296,7 +375,7 @@ export class SubscriptionsService<TFeatures extends FeatureRegistry> {
       /** Verified token ID from frontend 3DS - save for future renewals */
       verifiedTokenId?: string;
     },
-  ): Promise<ChangePlanResult> {
+  ): Promise<ChangePlanResult<TFeatures>> {
     const subscription = await this.getOrThrow(subscriberId);
     const currentPlan = subscription.plan;
 
@@ -388,7 +467,7 @@ export class SubscriptionsService<TFeatures extends FeatureRegistry> {
         // 3DS verification required - return pending status
         const updateData: UpdateSubscriptionInput = {
           metadata: {
-            ...(subscription.metadata ?? {}),
+            ...this.clearPendingSubscriptionMetadata(subscription.metadata),
             pendingPlanChange: newPlanId,
             pendingPaymentId: paymentResult.id,
             pendingVerificationUrl: paymentResult.verificationUrl,
@@ -413,15 +492,26 @@ export class SubscriptionsService<TFeatures extends FeatureRegistry> {
     }
 
     // Apply plan change
-    const updateData: UpdateSubscriptionInput = { planId: newPlanId };
+    const updateData: UpdateSubscriptionInput = {};
+    const baseMetadata = this.clearPendingSubscriptionMetadata(
+      subscription.metadata,
+    );
 
     if (shouldApplyImmediately) {
+      updateData.planId = newPlanId;
       updateData.currentPeriodStart = now;
       updateData.currentPeriodEnd = this.calculatePeriodEnd(
         now,
         newPlan.interval,
         newPlan.intervalCount,
       );
+      updateData.metadata = baseMetadata;
+    } else {
+      // Downgrade: schedule for end of current period via metadata
+      updateData.metadata = {
+        ...baseMetadata,
+        pendingDowngradePlanId: newPlanId,
+      };
     }
 
     // If user was trialing and they're upgrading (paid or have verified token), end the trial
@@ -434,28 +524,17 @@ export class SubscriptionsService<TFeatures extends FeatureRegistry> {
       updateData.status = "active";
       updateData.trialStart = null;
       updateData.trialEnd = null;
-      console.log(
-        `[Subscriptions] Trial ended for ${subscriberId} - upgraded to ${newPlan.name}`,
+      this.logger.info?.(
+        `Trial ended for ${subscriberId} - upgraded to ${newPlan.name}`,
       );
-    }
-
-    // Clear pending plan change metadata if exists
-    if (subscription.metadata?.pendingPlanChange) {
-      const {
-        pendingPlanChange,
-        pendingPaymentId,
-        pendingVerificationUrl,
-        ...restMeta
-      } = subscription.metadata as Record<string, unknown>;
-      updateData.metadata = restMeta;
     }
 
     // If a verified token ID was provided, save it for future renewals
     // Token is already verified from frontend 3DS flow
     if (options?.verifiedTokenId) {
       updateData.gatewayCustomerId = options.verifiedTokenId;
-      console.log(
-        `[Subscriptions] Saved verified token ${options.verifiedTokenId} for subscriber ${subscriberId}`,
+      this.logger.info?.(
+        `Saved verified token ${options.verifiedTokenId} for subscriber ${subscriberId}`,
       );
     }
 
@@ -498,8 +577,36 @@ export class SubscriptionsService<TFeatures extends FeatureRegistry> {
       }
     }
 
+    // Create invoice for upgrades that were charged or paid externally
+    if (isUpgrade && resolvedChargeAmount && resolvedChargeAmount > 0) {
+      try {
+        const isPaid = paymentResult?.status === "paid" || !!options?.verifiedTokenId;
+        await this.db.invoices.create({
+          subscriptionId: subscription.id,
+          amount: resolvedChargeAmount / 100,
+          currency: newPlan.currency,
+          status: isPaid ? "paid" : "open",
+          ...(isPaid && { paidAt: now }),
+          ...(paymentResult?.id && { gatewayInvoiceId: paymentResult.id }),
+          lineItems: [{
+            description: `Upgrade from ${currentPlan.name} to ${newPlan.name}`,
+            quantity: 1,
+            unitPrice: resolvedChargeAmount / 100,
+            amount: resolvedChargeAmount / 100,
+          }],
+          metadata: { type: "plan_upgrade", oldPlanId: currentPlan.id, newPlanId: newPlan.id },
+        });
+      } catch {
+        // Non-critical: log but don't fail the plan change
+        this.logger.error?.(`Failed to create upgrade invoice for ${subscriberId}`);
+      }
+    }
+
     return {
-      subscription: { ...updated, plan: newPlan },
+      subscription: {
+        ...updated,
+        plan: shouldApplyImmediately ? newPlan : currentPlan,
+      },
       charged: !!paymentResult && paymentResult.status === "paid",
       ...(paymentResult?.id && { paymentId: paymentResult.id }),
       ...(resolvedChargeAmount !== undefined && {
@@ -527,6 +634,35 @@ export class SubscriptionsService<TFeatures extends FeatureRegistry> {
     const newPlan = await this.db.plans.findById(newPlanId);
     if (!newPlan) {
       throw new PlanNotFoundError(newPlanId);
+    }
+
+    // Early return if already on the same plan
+    if (subscription.planId === newPlanId) {
+      return {
+        currentPlan: {
+          id: currentPlan.id,
+          name: currentPlan.name,
+          price: currentPlan.price,
+          currency: currentPlan.currency,
+        },
+        newPlan: {
+          id: newPlan.id,
+          name: newPlan.name,
+          price: newPlan.price,
+          currency: newPlan.currency,
+        },
+        isUpgrade: false,
+        isDowngrade: false,
+        priceDifference: 0,
+        daysRemaining: 0,
+        totalDays: 0,
+        prorationRatio: 0,
+        amountDue: 0,
+        amountDueFormatted: 0,
+        currency: currentPlan.currency,
+        effectiveDate: new Date(),
+        message: "You are already on this plan.",
+      };
     }
 
     const now = new Date();
@@ -576,9 +712,7 @@ export class SubscriptionsService<TFeatures extends FeatureRegistry> {
 
     // Generate message
     let message: string;
-    if (subscription.planId === newPlanId) {
-      message = "You are already on this plan.";
-    } else if (isTrialing && isUpgrade) {
+    if (isTrialing && isUpgrade) {
       // Special message for trial users
       const formattedAmount = (amountDue / 100).toFixed(2);
       message = `Upgrade to ${newPlan.name}: Your trial will end and you will be charged ${formattedAmount} ${newPlan.currency} for the full plan price. Your subscription takes effect immediately.`;
@@ -698,9 +832,23 @@ export class SubscriptionsService<TFeatures extends FeatureRegistry> {
       await this.payment.resumeSubscription(subscription.gatewaySubscriptionId);
     }
 
-    const updated = await this.db.subscriptions.update(subscription.id, {
-      status: "active",
-    });
+    const now = new Date();
+    const updateData: UpdateSubscriptionInput = { status: "active" };
+
+    // If the subscription period expired during pause, start a new period
+    if (now > subscription.currentPeriodEnd) {
+      updateData.currentPeriodStart = now;
+      updateData.currentPeriodEnd = this.calculatePeriodEnd(
+        now,
+        subscription.plan.interval,
+        subscription.plan.intervalCount,
+      );
+    }
+
+    const updated = await this.db.subscriptions.update(
+      subscription.id,
+      updateData,
+    );
 
     await this.cache.delete(CacheKeys.subscription(subscriberId));
     await this.cache.delete(CacheKeys.features(subscriberId));
@@ -812,25 +960,112 @@ export class SubscriptionsService<TFeatures extends FeatureRegistry> {
   /**
    * Renew subscription for a new period
    */
-  async renew(subscriberId: string): Promise<Subscription> {
+  async renew(
+    subscriberId: string,
+    options?: RenewSubscriptionOptions,
+  ): Promise<Subscription> {
     const subscription = await this.getOrThrow(subscriberId);
-    const plan = subscription.plan;
+    const pendingDowngradePlanId = (subscription.metadata as Record<string, unknown> | null)?.pendingDowngradePlanId as string | undefined;
+    let activePlan = subscription.plan;
+
+    if (pendingDowngradePlanId) {
+      const downgradePlan = await this.db.plans.findById(pendingDowngradePlanId);
+      if (downgradePlan) {
+        activePlan = downgradePlan;
+      }
+    }
 
     const now = new Date();
+    let paymentResult: ChargePaymentResult | undefined;
+
+    if (activePlan.price > 0 && !options?.skipPayment) {
+      if (!this.payment.chargePayment) {
+        throw new PaymentFailedError(
+          "Payment gateway does not support renewal charges",
+        );
+      }
+
+      if (!subscription.gatewayCustomerId) {
+        throw new PaymentFailedError("No payment token available for renewal");
+      }
+
+      paymentResult = await this.payment.chargePayment({
+        customerId: subscription.gatewayCustomerId,
+        amount: Math.round(activePlan.price * 100),
+        currency: activePlan.currency,
+        description: `${activePlan.name} subscription renewal`,
+        metadata: {
+          subscriberId,
+          planId: activePlan.id,
+          subscriptionId: subscription.id,
+          type: "renewal",
+        },
+      });
+
+      if (paymentResult.status !== "paid") {
+        throw new PaymentFailedError(
+          paymentResult.errorMessage ??
+            (paymentResult.status === "pending"
+              ? "Renewal payment requires additional verification"
+              : "Payment failed for subscription renewal"),
+          paymentResult.id || undefined,
+          paymentResult.errorCode,
+          paymentResult.isRetryable,
+          paymentResult.userAction,
+        );
+      }
+    }
+
     const newPeriodEnd = this.calculatePeriodEnd(
       now,
-      plan.interval,
-      plan.intervalCount,
+      activePlan.interval,
+      activePlan.intervalCount,
     );
 
-    const updated = await this.db.subscriptions.update(subscription.id, {
+    const cleanedMetadata = this.clearPendingSubscriptionMetadata(
+      subscription.metadata,
+    );
+    const updateData: UpdateSubscriptionInput = {
       status: "active",
       currentPeriodStart: now,
       currentPeriodEnd: newPeriodEnd,
+      trialStart: null,
       trialEnd: null,
       cancelAt: null,
       canceledAt: null,
-    });
+      metadata: cleanedMetadata,
+    };
+
+    if (pendingDowngradePlanId && activePlan.id === pendingDowngradePlanId) {
+        updateData.planId = pendingDowngradePlanId;
+    }
+
+    const updated = await this.db.subscriptions.update(subscription.id, updateData);
+
+    // Create renewal invoice
+    if (activePlan.price > 0) {
+      try {
+        const invoicePaid = paymentResult?.status === "paid";
+        await this.db.invoices.create({
+          subscriptionId: subscription.id,
+          amount: activePlan.price,
+          currency: activePlan.currency,
+          status: invoicePaid ? "paid" : "open",
+          ...(invoicePaid && { paidAt: now }),
+          ...(paymentResult?.id && { gatewayInvoiceId: paymentResult.id }),
+          dueDate: newPeriodEnd,
+          lineItems: [{
+            description: `${activePlan.name} subscription renewal`,
+            quantity: 1,
+            unitPrice: activePlan.price,
+            amount: activePlan.price,
+          }],
+          metadata: { type: "renewal" },
+        });
+      } catch {
+        this.logger.error?.(`Failed to create renewal invoice for ${subscriberId}`);
+      }
+    }
 
     await this.cache.delete(CacheKeys.subscription(subscriberId));
     await this.cache.delete(CacheKeys.features(subscriberId));
@@ -839,6 +1074,20 @@ export class SubscriptionsService<TFeatures extends FeatureRegistry> {
   }
 
   // ==================== Private Helpers ====================
+
+  private clearPendingSubscriptionMetadata(
+    metadata: Record<string, unknown> | null | undefined,
+  ): Record<string, unknown> {
+    const {
+      pendingPlanChange,
+      pendingPaymentId,
+      pendingVerificationUrl,
+      pendingDowngradePlanId,
+      ...restMeta
+    } = (metadata ?? {}) as Record<string, unknown>;
+
+    return restMeta;
+  }
 
   private async getOrThrow(
     subscriberId: string,
@@ -926,12 +1175,12 @@ export class SubscriptionsService<TFeatures extends FeatureRegistry> {
         end.setFullYear(end.getFullYear() + intervalCount);
         break;
       case "one_time":
-        // One-time has no period end (set to far future)
-        end.setFullYear(end.getFullYear() + 100);
+        // One-time subscriptions: set period end to 10 years
+        end.setFullYear(end.getFullYear() + 10);
         break;
       default:
-        // Custom interval in days
-        end.setDate(end.getDate() + intervalCount * 30);
+        // Custom interval: use calendar months (consistent with 'monthly')
+        end.setMonth(end.getMonth() + intervalCount);
     }
 
     return end;
