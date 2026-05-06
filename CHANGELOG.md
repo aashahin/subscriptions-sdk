@@ -2,6 +2,14 @@
 
 All notable changes to this package will be documented in this file.
 
+## 0.1.2 - 2026-05-06
+
+### Added
+
+- Rebuilt `src/templates/subscription-invoice.hbs` with a simple black-and-white invoice layout.
+- Added `tests/generate-test-invoices.ts` for generating sample invoice HTML fixtures.
+- Added `test:invoices` script to `package.json` for easy invoice fixture generation.
+
 ## 0.1.1 - 2026-04-04
 
 ### Added
