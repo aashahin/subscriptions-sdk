@@ -1,6 +1,6 @@
 {
   "name": "@abshahin/subscriptions",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "Type-safe subscription plans, feature gates, usage limits, invoices, and Elysia integration for multi-tenant TypeScript applications.",
   "license": "MIT",
   "type": "module",
@@ -81,6 +81,7 @@
   "scripts": {
     "build": "tsc -p tsconfig.build.json && mkdir -p dist/templates && cp src/templates/subscription-invoice.hbs dist/templates/subscription-invoice.hbs",
     "prepare": "bun run build",
+    "test:invoices": "bun tests/generate-test-invoices.ts",
     "typecheck": "tsc --noEmit -p tsconfig.json"
   }
 }

@@ -453,38 +453,35 @@
   <main class="invoice-shell">
     <header class="document-header">
       <div class="brand">
-        {{#if platform.logo}}
-        <img src="{{platform.logo}}" alt="{{platform.name}}" class="brand-logo" />
-        {{/if}}
         <div class="brand-meta">
           <p class="eyebrow">بيان اشتراك</p>
-          <h2 class="brand-name">{{#if platform.name}}{{platform.name}}{{else}}منصة اشتراكات{{/if}}</h2>
+          <h2 class="brand-name">منهالي</h2>
         </div>
       </div>
 
       <div class="document-title">
         <h1>فاتورة اشتراك</h1>
-        <div class="document-id">رقم الفاتورة: {{#if invoice.id}}{{invoice.id}}{{else}}—{{/if}}</div>
-        <div class="status-badge">{{translateInvoiceStatus invoice.status}}</div>
+        <div class="document-id">رقم الفاتورة: inv_open_001</div>
+        <div class="status-badge">مفتوحة</div>
       </div>
     </header>
 
     <section class="summary-grid">
       <div class="summary-card">
         <span class="summary-label">تاريخ الإصدار</span>
-        <span class="summary-value">{{#if invoice.createdAt}}{{formatDate invoice.createdAt locale=locale}}{{else}}—{{/if}}</span>
+        <span class="summary-value">١٩ ذو القعدة ١٤٤٧ هـ</span>
       </div>
       <div class="summary-card">
         <span class="summary-label">تاريخ الاستحقاق</span>
-        <span class="summary-value">{{#if invoice.dueDate}}{{formatDate invoice.dueDate locale=locale}}{{else}}—{{/if}}</span>
+        <span class="summary-value">٢٣ ذو القعدة ١٤٤٧ هـ</span>
       </div>
       <div class="summary-card">
         <span class="summary-label">تاريخ السداد</span>
-        <span class="summary-value">{{#if invoice.paidAt}}{{formatDate invoice.paidAt locale=locale}}{{else}}—{{/if}}</span>
+        <span class="summary-value">—</span>
       </div>
       <div class="summary-card">
         <span class="summary-label">حالة الاشتراك</span>
-        <span class="summary-value">{{translateSubscriptionStatus subscription.status}}</span>
+        <span class="summary-value">متأخر السداد</span>
       </div>
     </section>
 
@@ -492,46 +489,30 @@
       <section class="panel">
         <h3 class="panel-title">بيانات المشترك</h3>
         <div class="key-values">
-          {{#if subscriber.name}}
           <div class="key">الاسم</div>
-          <div class="value">{{subscriber.name}}</div>
-          {{/if}}
-          {{#if subscriber.email}}
+          <div class="value">أكاديمية الاختبار</div>
           <div class="key">البريد الإلكتروني</div>
-          <div class="value">{{subscriber.email}}</div>
-          {{/if}}
-          {{#if subscriber.phone}}
+          <div class="value">finance@example.com</div>
           <div class="key">الهاتف</div>
-          <div class="value">{{subscriber.phone}}</div>
-          {{/if}}
-          {{#if subscriber.address}}
+          <div class="value">+966500000000</div>
           <div class="key">العنوان</div>
-          <div class="value">{{subscriber.address}}</div>
-          {{/if}}
+          <div class="value">حي النرجس، الرياض</div>
           <div class="key">معرّف المشترك</div>
-          <div class="value mono">{{subscription.subscriberId}}</div>
+          <div class="value mono">tenant_demo_001</div>
         </div>
       </section>
 
       <section class="panel">
         <h3 class="panel-title">معلومات المنصة</h3>
         <div class="key-values">
-          {{#if platform.name}}
           <div class="key">الاسم</div>
-          <div class="value">{{platform.name}}</div>
-          {{/if}}
-          {{#if platform.website}}
+          <div class="value">منهالي</div>
           <div class="key">الموقع</div>
-          <div class="value">{{platform.website}}</div>
-          {{/if}}
-          {{#if platform.supportEmail}}
+          <div class="value">https://manhali.com</div>
           <div class="key">الدعم</div>
-          <div class="value">{{platform.supportEmail}}</div>
-          {{/if}}
-          {{#if platform.address}}
+          <div class="value">billing@manhali.com</div>
           <div class="key">العنوان</div>
-          <div class="value">{{platform.address}}</div>
-          {{/if}}
+          <div class="value">الرياض، المملكة العربية السعودية</div>
         </div>
       </section>
     </section>
@@ -540,26 +521,23 @@
       <div class="plan-row">
         <div>
           <div class="plan-label">الخطة</div>
-          <h3 class="plan-name">{{plan.name}}</h3>
-          {{#if plan.description}}
-          <p class="plan-description">{{plan.description}}</p>
-          {{/if}}
+          <h3 class="plan-name">الخطة الاحترافية</h3>
+          <p class="plan-description">وصول كامل إلى الأدوات الأساسية مع دعم قياسي وتقارير شهرية.</p>
         </div>
 
         <div class="plan-price-block">
-          <span class="plan-price">{{formatCurrency plan.price plan.currency locale=locale}}</span>
-          <span class="plan-interval">{{translateBillingInterval plan.interval plan.intervalCount}}</span>
+          <span class="plan-price">‏١٩٩٫٠٠ ر.س.‏</span>
+          <span class="plan-interval">شهري</span>
         </div>
       </div>
 
       <div class="period-banner">
         <strong>فترة الاشتراك:</strong>
-        من {{formatDate subscription.currentPeriodStart locale=locale}}
-        إلى {{formatDate subscription.currentPeriodEnd locale=locale}}
+        من ١٤ ذو القعدة ١٤٤٧ هـ
+        إلى ١٥ ذو الحجة ١٤٤٧ هـ
       </div>
     </section>
 
-    {{#if invoice.lineItems.length}}
     <section>
       <h3 class="section-title">تفاصيل الفاتورة</h3>
       <table class="items">
@@ -572,43 +550,42 @@
           </tr>
         </thead>
         <tbody>
-          {{#each invoice.lineItems}}
           <tr>
             <td>
-              <div class="item-name">{{this.description}}</div>
+              <div class="item-name">خطة الاحتراف الشهرية</div>
             </td>
-            <td class="num">{{this.quantity}}</td>
-            <td class="num">{{formatCurrency this.unitPrice ../invoice.currency locale=../locale}}</td>
-            <td class="num">{{formatCurrency this.amount ../invoice.currency locale=../locale}}</td>
+            <td class="num">1</td>
+            <td class="num">‏١٩٩٫٠٠ ر.س.‏</td>
+            <td class="num">‏١٩٩٫٠٠ ر.س.‏</td>
           </tr>
-          {{/each}}
+          <tr>
+            <td>
+              <div class="item-name">إضافة أعضاء الفريق</div>
+            </td>
+            <td class="num">2</td>
+            <td class="num">‏٢٥٫٠٠ ر.س.‏</td>
+            <td class="num">‏٥٠٫٠٠ ر.س.‏</td>
+          </tr>
         </tbody>
       </table>
     </section>
-    {{/if}}
 
     <section class="bottom-grid">
       <aside class="note-box">
         <h3 class="note-title">ملاحظات</h3>
         <div>
-          {{#if invoice.metadata.notes}}
-          {{invoice.metadata.notes}}
-          {{else}}
-          شكراً لاشتراكك معنا. في حال وجود أي استفسارات، يرجى التواصل مع فريق الدعم.
-          {{/if}}
+          يرجى سداد الفاتورة قبل تاريخ الاستحقاق لتجنب انقطاع الخدمة.
         </div>
       </aside>
 
       <aside class="totals-box">
-        {{#if invoice.lineItems.length}}
         <div class="total-row">
           <div>المجموع الفرعي</div>
-          <div class="num">{{formatCurrency invoice.amount invoice.currency locale=locale}}</div>
+          <div class="num">‏٢٤٩٫٠٠ ر.س.‏</div>
         </div>
-        {{/if}}
         <div class="total-row grand">
           <div>الإجمالي</div>
-          <div class="num">{{formatCurrency invoice.amount invoice.currency locale=locale}}</div>
+          <div class="num">‏٢٤٩٫٠٠ ر.س.‏</div>
         </div>
       </aside>
     </section>
@@ -616,15 +593,13 @@
     <footer class="footer">
       <div>
         <strong>المنصة:</strong>
-        {{#if platform.website}}{{platform.website}}{{else}}www.example.com{{/if}}
+        https://manhali.com
       </div>
 
-      {{#if platform.supportEmail}}
       <div>
         <strong>الدعم الفني:</strong>
-        {{platform.supportEmail}}
+        billing@manhali.com
       </div>
-      {{/if}}
 
       <div>تم إنشاء هذه الفاتورة إلكترونياً ولا تحتاج إلى توقيع</div>
     </footer>
