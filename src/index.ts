@@ -278,20 +278,17 @@ export function createSubscriptions<TFeatures extends FeatureRegistry>(
           const subscriberId = resolveSubscriberId(metadata);
 
           if (subscriberId) {
-            const subscription = await subscriptions.get(subscriberId);
+            const failureMessage =
+              typeof paymentData.message === "string"
+                ? paymentData.message
+                : "Payment failed";
 
-            if (subscription) {
-              const failureMessage =
-                typeof paymentData.message === "string"
-                  ? paymentData.message
-                  : "Payment failed";
-
-              // Route through the service so caches stay consistent.
-              await subscriptions.recordPaymentFailure(
-                subscriberId,
-                failureMessage,
-              );
-            }
+            // Route through the service so caches stay consistent. It no-ops
+            // when the subscriber has no subscription.
+            await subscriptions.recordPaymentFailure(
+              subscriberId,
+              failureMessage,
+            );
           }
           break;
         }

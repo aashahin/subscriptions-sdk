@@ -8,6 +8,7 @@ All notable changes to this package will be documented in this file.
 
 - **Payments: stopped a double-charge on renewal webhooks.** `handleWebhook` previously called `renew()` (which charges the saved token) while handling a `payment.paid` event, charging the customer a second time for a payment that already succeeded. Renewals triggered from a successful-payment webhook now skip the charge and are recorded as paid externally.
 - **Invoices: standardized stored amounts on major/display units everywhere.** The Elysia `/subscribe` and `/change-plan` routes stored amounts in the smallest unit (`× 100`) while the service layer and documented API used major units, and the invoice download endpoint always divided by 100 — so service-created invoices (e.g. cron renewals) rendered as `0.49` instead of `49`. All invoice creation and rendering now use major units consistently.
+- **Invoices: eliminated duplicate invoice creation.** The Elysia `/subscribe` and `/change-plan` routes created their own invoices on top of the ones the service layer already creates, producing two invoices per paid subscribe/upgrade. The service is now the single source of truth: the routes pass the gateway payment ID (and paid status) into `create()`/`changePlan()` instead of creating a second invoice.
 - **Webhooks: idempotent payment processing.** A successful-payment webhook is now skipped when an invoice for the same gateway payment already exists, preventing duplicate renewals/invoices when both a cron job and a webhook observe the same charge. Backed by an optional `invoices.findByGatewayInvoiceId` adapter method.
 - **Webhooks: resolve subscriber from `subscriberId` (falling back to `tenantId`).** Charges issued by the SDK attach `subscriberId`; the handler previously only read `tenantId`, so renewal/cancel branches never fired for SDK-initiated charges.
 - **Security: Moyasar webhook verification now fails closed.** When a `webhookSecret` is configured, a missing or empty signature is rejected instead of being silently accepted.
@@ -22,6 +23,7 @@ All notable changes to this package will be documented in this file.
 - `SubscriptionsService.recordPaymentFailure(subscriberId, message)` to record payment failures through the service (keeping caches consistent) instead of writing to the database directly.
 - Optional `DatabaseAdapter.invoices.findByGatewayInvoiceId` for idempotent webhook handling.
 - `RenewSubscriptionOptions.paidExternally` and `gatewayInvoiceId` so a renewal can be recorded as already paid by an external flow.
+- `create()` now accepts `paidExternally` and `gatewayInvoiceId`, and `changePlan()` accepts `gatewayInvoiceId`, so externally collected payments are recorded on the service-created invoice (no duplicate).
 
 ## 0.1.2 - 2026-05-06
 

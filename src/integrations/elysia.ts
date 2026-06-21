@@ -196,36 +196,17 @@ export function elysiaPlugin<
 
     const effectiveTrialDays = requestTrialDays ?? plan.trialDays;
 
+    // The service is the single source of truth for invoicing. When the
+    // frontend already collected payment (verifiedTokenId + paymentId), tell
+    // the service to record the initial invoice as paid instead of creating a
+    // second invoice here.
+    const paidExternally = !!(verifiedTokenId && paymentId);
     const subscription = await subs.subscriptions.create(subscriberId, planId, {
       ...(effectiveTrialDays > 0 && { trialDays: effectiveTrialDays }),
       ...(verifiedTokenId && { gatewayCustomerId: verifiedTokenId }),
+      ...(paidExternally && { paidExternally: true }),
+      ...(paymentId && { gatewayInvoiceId: paymentId }),
     });
-
-    if (verifiedTokenId && paymentId && subscription.status === "active") {
-      if (plan.price > 0) {
-        // Invoice amounts are stored in major/display units (e.g. 49.00 SAR),
-        // matching the documented public contract and the service layer.
-        await subs.invoices.create({
-          subscriptionId: subscription.id,
-          amount: plan.price,
-          currency: plan.currency,
-          status: "paid",
-          gatewayInvoiceId: paymentId,
-          lineItems: [
-            {
-              description: `${plan.name} - Initial subscription`,
-              quantity: 1,
-              unitPrice: plan.price,
-              amount: plan.price,
-            },
-          ],
-          metadata: {
-            paymentId,
-            type: "initial_subscription",
-          },
-        });
-      }
-    }
 
     return { subscription };
   };
@@ -291,6 +272,10 @@ export function elysiaPlugin<
           verifiedTokenId,
           paymentId,
         } = ctx.body;
+        // The service creates the upgrade invoice itself (single source of
+        // truth). When the frontend already collected payment, pass the
+        // paymentId so the service records it on that invoice — avoiding the
+        // duplicate invoice this route used to create.
         const result = await subs.subscriptions.changePlan(
           subscriberId,
           planId,
@@ -301,46 +286,9 @@ export function elysiaPlugin<
             ...(callbackUrl && { callbackUrl }),
             ...(skipPayment !== undefined && { skipPayment }),
             ...(verifiedTokenId && { verifiedTokenId }),
+            ...(paymentId && { gatewayInvoiceId: paymentId }),
           },
         );
-
-        // Create invoice if payment was made
-        // paymentId is provided from frontend when:
-        // 1. Direct payment success (charged via Moyasar Payments API)
-        // 2. 3DS callback (payment was charged before redirect)
-        // Note: result.charged may be false for 3DS flows (skipPayment: true)
-        if (paymentId && result.subscription) {
-          const plan = await subs.plans.get(planId);
-          if (plan) {
-            // `result.chargeAmount` is in the smallest currency unit and already
-            // accounts for proration. Convert to major/display units so all
-            // invoices are stored consistently (and the download renders right).
-            const invoiceAmount =
-              result.chargeAmount !== undefined
-                ? result.chargeAmount / 100
-                : plan.price;
-            await subs.invoices.create({
-              subscriptionId: result.subscription.id,
-              amount: invoiceAmount,
-              currency: plan.currency,
-              status: "paid",
-              paidAt: new Date(),
-              gatewayInvoiceId: paymentId,
-              lineItems: [
-                {
-                  description: `Plan upgrade to ${plan.name}`,
-                  quantity: 1,
-                  unitPrice: invoiceAmount,
-                  amount: invoiceAmount,
-                },
-              ],
-              metadata: {
-                description: `Plan upgrade to ${plan.name}`,
-                paymentId,
-              },
-            });
-          }
-        }
 
         return result;
       },

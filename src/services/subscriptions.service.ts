@@ -247,6 +247,14 @@ export class SubscriptionsService<TFeatures extends FeatureRegistry> {
       trialDays?: number;
       gatewayCustomerId?: string;
       metadata?: Record<string, unknown>;
+      /**
+       * Mark the initial invoice as already paid (payment was collected by an
+       * external flow, e.g. a verified token charged on the frontend). Defaults
+       * to `false`, in which case the initial invoice is created as `open`.
+       */
+      paidExternally?: boolean;
+      /** Gateway payment/invoice ID to record on the initial invoice. */
+      gatewayInvoiceId?: string;
     },
   ): Promise<Subscription> {
     // Pre-emptively invalidate cache before checking for existing subscription
@@ -327,14 +335,20 @@ export class SubscriptionsService<TFeatures extends FeatureRegistry> {
     await this.cache.delete(CacheKeys.subscription(subscriberId));
     await this.cache.delete(CacheKeys.features(subscriberId));
 
-    // Create initial invoice (draft for trial, open for immediate start)
+    // Create initial invoice. `paid` when payment was already collected
+    // externally, otherwise `open` (amount due) for an immediate paid start.
     if (!hasTrialDays && plan.price > 0) {
       try {
+        const invoicePaid = !!options?.paidExternally;
         await this.db.invoices.create({
           subscriptionId: subscription.id,
           amount: plan.price,
           currency: plan.currency,
-          status: "open",
+          status: invoicePaid ? "paid" : "open",
+          ...(invoicePaid && { paidAt: now }),
+          ...(options?.gatewayInvoiceId && {
+            gatewayInvoiceId: options.gatewayInvoiceId,
+          }),
           dueDate: currentPeriodEnd,
           lineItems: [{
             description: `${plan.name} subscription`,
@@ -385,6 +399,12 @@ export class SubscriptionsService<TFeatures extends FeatureRegistry> {
       skipPayment?: boolean;
       /** Verified token ID from frontend 3DS - save for future renewals */
       verifiedTokenId?: string;
+      /**
+       * Gateway payment/invoice ID for a payment already collected by an
+       * external flow (e.g. frontend 3DS). Recorded on the upgrade invoice so
+       * the service stays the single source of truth for invoicing.
+       */
+      gatewayInvoiceId?: string;
     },
   ): Promise<ChangePlanResult<TFeatures>> {
     const subscription = await this.getOrThrow(subscriberId);
@@ -576,13 +596,14 @@ export class SubscriptionsService<TFeatures extends FeatureRegistry> {
     if (isUpgrade && resolvedChargeAmount && resolvedChargeAmount > 0) {
       try {
         const isPaid = paymentResult?.status === "paid" || !!options?.verifiedTokenId;
+        const gatewayInvoiceId = paymentResult?.id ?? options?.gatewayInvoiceId;
         await this.db.invoices.create({
           subscriptionId: subscription.id,
           amount: resolvedChargeAmount / 100,
           currency: newPlan.currency,
           status: isPaid ? "paid" : "open",
           ...(isPaid && { paidAt: now }),
-          ...(paymentResult?.id && { gatewayInvoiceId: paymentResult.id }),
+          ...(gatewayInvoiceId && { gatewayInvoiceId }),
           lineItems: [{
             description: `Upgrade from ${currentPlan.name} to ${newPlan.name}`,
             quantity: 1,
