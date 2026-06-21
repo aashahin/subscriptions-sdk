@@ -123,7 +123,18 @@ export interface ChangePlanResult<
 }
 
 interface RenewSubscriptionOptions {
+  /** Do not charge the saved payment token (payment handled elsewhere). */
   skipPayment?: boolean;
+  /**
+   * Treat the renewal as already paid by an external flow (e.g. a `payment.paid`
+   * webhook fired after the gateway charged the customer). When set, the renewal
+   * invoice is created with `paid` status instead of `open`. Implies the caller
+   * is responsible for the actual charge, so it is typically used together with
+   * `skipPayment`.
+   */
+  paidExternally?: boolean;
+  /** Gateway payment/invoice ID to record on the renewal invoice. */
+  gatewayInvoiceId?: string;
 }
 
 /**
@@ -416,27 +427,17 @@ export class SubscriptionsService<TFeatures extends FeatureRegistry> {
         throw new PaymentFailedError("No payment token available for upgrade");
       }
 
-      // Calculate charge amount
-
-      if (isTrialing || effectiveCurrentPrice === 0) {
-        // TRIAL or FREE PLAN USER: Charge full price of new plan
-        // No credit to subtract from a $0 plan
-        chargeAmount = Math.round(newPlan.price * 100);
-      } else if (shouldProrate && subscription.currentPeriodEnd > now) {
-        // ACTIVE PAID USER: Prorate - charge difference for remaining period
-        const totalPeriodMs =
-          subscription.currentPeriodEnd.getTime() -
-          subscription.currentPeriodStart.getTime();
-        const remainingMs =
-          subscription.currentPeriodEnd.getTime() - now.getTime();
-        const remainingRatio = remainingMs / totalPeriodMs;
-
-        const priceDifference = newPlan.price - currentPlan.price;
-        chargeAmount = Math.round(priceDifference * remainingRatio * 100); // Convert to smallest unit
-      } else {
-        // Full price charge
-        chargeAmount = Math.round(newPlan.price * 100);
-      }
+      // Calculate charge amount (in smallest currency unit)
+      chargeAmount = this.computeUpgradeChargeMinorUnits({
+        newPrice: newPlan.price,
+        currentPrice: currentPlan.price,
+        effectiveCurrentPrice,
+        isTrialing,
+        shouldProrate,
+        periodStart: subscription.currentPeriodStart,
+        periodEnd: subscription.currentPeriodEnd,
+        now,
+      });
 
       // Charge the payment
       paymentResult = await this.payment.chargePayment({
@@ -558,22 +559,16 @@ export class SubscriptionsService<TFeatures extends FeatureRegistry> {
         resolvedChargeAmount = chargeAmount;
       } else if (options?.skipPayment) {
         // Frontend handled payment; recompute the same amount for the invoice
-        if (isTrialing || effectiveCurrentPrice === 0) {
-          resolvedChargeAmount = Math.round(newPlan.price * 100);
-        } else if (shouldProrate && subscription.currentPeriodEnd > now) {
-          const totalPeriodMs =
-            subscription.currentPeriodEnd.getTime() -
-            subscription.currentPeriodStart.getTime();
-          const remainingMs =
-            subscription.currentPeriodEnd.getTime() - now.getTime();
-          const remainingRatio = remainingMs / totalPeriodMs;
-          const priceDifference = newPlan.price - currentPlan.price;
-          resolvedChargeAmount = Math.round(
-            priceDifference * remainingRatio * 100,
-          );
-        } else {
-          resolvedChargeAmount = Math.round(newPlan.price * 100);
-        }
+        resolvedChargeAmount = this.computeUpgradeChargeMinorUnits({
+          newPrice: newPlan.price,
+          currentPrice: currentPlan.price,
+          effectiveCurrentPrice,
+          isTrialing,
+          shouldProrate,
+          periodStart: subscription.currentPeriodStart,
+          periodEnd: subscription.currentPeriodEnd,
+          now,
+        });
       }
     }
 
@@ -1045,14 +1040,17 @@ export class SubscriptionsService<TFeatures extends FeatureRegistry> {
     // Create renewal invoice
     if (activePlan.price > 0) {
       try {
-        const invoicePaid = paymentResult?.status === "paid";
+        const invoicePaid =
+          paymentResult?.status === "paid" || !!options?.paidExternally;
+        const gatewayInvoiceId =
+          paymentResult?.id ?? options?.gatewayInvoiceId;
         await this.db.invoices.create({
           subscriptionId: subscription.id,
           amount: activePlan.price,
           currency: activePlan.currency,
           status: invoicePaid ? "paid" : "open",
           ...(invoicePaid && { paidAt: now }),
-          ...(paymentResult?.id && { gatewayInvoiceId: paymentResult.id }),
+          ...(gatewayInvoiceId && { gatewayInvoiceId }),
           dueDate: newPeriodEnd,
           lineItems: [{
             description: `${activePlan.name} subscription renewal`,
@@ -1073,7 +1071,83 @@ export class SubscriptionsService<TFeatures extends FeatureRegistry> {
     return updated;
   }
 
+  /**
+   * Record a payment failure against the subscriber's subscription.
+   *
+   * Stores the failure reason/timestamp in metadata and invalidates the cache
+   * so subsequent reads are consistent. Returns the updated subscription, or
+   * `null` when the subscriber has no subscription.
+   */
+  async recordPaymentFailure(
+    subscriberId: string,
+    message: string,
+  ): Promise<Subscription | null> {
+    const subscription = await this.get(subscriberId);
+    if (!subscription) {
+      return null;
+    }
+
+    const updated = await this.db.subscriptions.update(subscription.id, {
+      metadata: {
+        ...(subscription.metadata ?? {}),
+        lastPaymentError: message,
+        lastPaymentFailedAt: new Date().toISOString(),
+      },
+    });
+
+    await this.cache.delete(CacheKeys.subscription(subscriberId));
+    await this.cache.delete(CacheKeys.features(subscriberId));
+
+    return updated;
+  }
+
   // ==================== Private Helpers ====================
+
+  /**
+   * Compute the amount to charge for an upgrade, in the smallest currency unit.
+   *
+   * Centralizes the proration math so the charge, the skip-payment recompute,
+   * and any future caller stay in sync. Guards against a zero-length period
+   * (which would otherwise produce NaN/Infinity from a divide-by-zero).
+   */
+  private computeUpgradeChargeMinorUnits(args: {
+    newPrice: number;
+    currentPrice: number;
+    effectiveCurrentPrice: number;
+    isTrialing: boolean;
+    shouldProrate: boolean;
+    periodStart: Date;
+    periodEnd: Date;
+    now: Date;
+  }): number {
+    const {
+      newPrice,
+      currentPrice,
+      effectiveCurrentPrice,
+      isTrialing,
+      shouldProrate,
+      periodStart,
+      periodEnd,
+      now,
+    } = args;
+
+    const totalPeriodMs = periodEnd.getTime() - periodStart.getTime();
+    const remainingMs = periodEnd.getTime() - now.getTime();
+
+    if (isTrialing || effectiveCurrentPrice === 0) {
+      // Trial or free-plan user: no credit to subtract, charge full new price.
+      return Math.round(newPrice * 100);
+    }
+
+    if (shouldProrate && remainingMs > 0 && totalPeriodMs > 0) {
+      // Active paid user: charge the prorated price difference for the time left.
+      const remainingRatio = remainingMs / totalPeriodMs;
+      const priceDifference = newPrice - currentPrice;
+      return Math.round(priceDifference * remainingRatio * 100);
+    }
+
+    return Math.round(newPrice * 100);
+  }
 
   private clearPendingSubscriptionMetadata(
     metadata: Record<string, unknown> | null | undefined,

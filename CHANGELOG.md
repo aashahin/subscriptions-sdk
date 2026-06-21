@@ -2,6 +2,27 @@
 
 All notable changes to this package will be documented in this file.
 
+## 0.1.4 - 2026-06-21
+
+### Fixed
+
+- **Payments: stopped a double-charge on renewal webhooks.** `handleWebhook` previously called `renew()` (which charges the saved token) while handling a `payment.paid` event, charging the customer a second time for a payment that already succeeded. Renewals triggered from a successful-payment webhook now skip the charge and are recorded as paid externally.
+- **Invoices: standardized stored amounts on major/display units everywhere.** The Elysia `/subscribe` and `/change-plan` routes stored amounts in the smallest unit (`× 100`) while the service layer and documented API used major units, and the invoice download endpoint always divided by 100 — so service-created invoices (e.g. cron renewals) rendered as `0.49` instead of `49`. All invoice creation and rendering now use major units consistently.
+- **Webhooks: idempotent payment processing.** A successful-payment webhook is now skipped when an invoice for the same gateway payment already exists, preventing duplicate renewals/invoices when both a cron job and a webhook observe the same charge. Backed by an optional `invoices.findByGatewayInvoiceId` adapter method.
+- **Webhooks: resolve subscriber from `subscriberId` (falling back to `tenantId`).** Charges issued by the SDK attach `subscriberId`; the handler previously only read `tenantId`, so renewal/cancel branches never fired for SDK-initiated charges.
+- **Security: Moyasar webhook verification now fails closed.** When a `webhookSecret` is configured, a missing or empty signature is rejected instead of being silently accepted.
+- **Security: Elysia webhook route now reads the `x-moyasar-signature` header**, so Moyasar signatures are actually verified (previously only `stripe-signature` / `x-webhook-signature` were checked, silently skipping verification for Moyasar).
+- **Usage: atomic, floor-safe decrement in the Prisma adapter.** Replaced the read-then-write decrement (which lost concurrent updates despite the interface promising atomicity) with a single guarded atomic update that never drops below zero.
+- **Usage: deterministic monthly periods in UTC.** Usage period boundaries were computed in the server's local timezone, shifting the billing window by region/DST; they are now computed in UTC.
+- **Proration: guarded against divide-by-zero** for zero-length billing periods and centralized the proration math used by `changePlan` (removing three divergent copies).
+- **Build: the package now type-checks and builds without the optional `puppeteer-html-pdf` dependency installed**, via an ambient type declaration for the dynamically imported module.
+
+### Added
+
+- `SubscriptionsService.recordPaymentFailure(subscriberId, message)` to record payment failures through the service (keeping caches consistent) instead of writing to the database directly.
+- Optional `DatabaseAdapter.invoices.findByGatewayInvoiceId` for idempotent webhook handling.
+- `RenewSubscriptionOptions.paidExternally` and `gatewayInvoiceId` so a renewal can be recorded as already paid by an external flow.
+
 ## 0.1.2 - 2026-05-06
 
 ### Added

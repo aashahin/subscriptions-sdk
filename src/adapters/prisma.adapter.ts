@@ -363,6 +363,16 @@ export function prismaAdapter<TFeatures extends FeatureRegistry>(
         };
       },
 
+      async findByGatewayInvoiceId(
+        gatewayInvoiceId: string,
+      ): Promise<Invoice | null> {
+        const invoice = await client.invoice.findFirst({
+          where: { gatewayInvoiceId },
+          orderBy: { createdAt: "desc" },
+        });
+        return invoice ? mapInvoiceFromPrisma(invoice) : null;
+      },
+
       async findBySubscription(subscriptionId: string): Promise<Invoice[]> {
         const invoices = await client.invoice.findMany({
           where: { subscriptionId },
@@ -494,25 +504,30 @@ export function prismaAdapter<TFeatures extends FeatureRegistry>(
         const now = new Date();
         const periodStart = getMonthStart(now);
 
-        // Get current count first
-        const current = await this.get(subscriberId, feature, { tenantId });
-        const newCount = Math.max(0, current - count);
+        // Atomic decrement that never drops below zero.
+        //
+        // A read-then-write (`get` then `update`) loses concurrent decrements,
+        // so we issue a single guarded atomic decrement. When the stored count
+        // is large enough we decrement in place; otherwise we floor it to zero.
+        // Both branches are conditional `updateMany` calls, so no row is ever
+        // overwritten with a stale value.
+        const baseWhere = { subscriberId, tenantId, feature, periodStart };
 
-        if (current > 0) {
-          await client.usageRecord.update({
-            where: {
-              subscriberId_tenantId_feature_periodStart: {
-                subscriberId,
-                tenantId: tenantId,
-                feature,
-                periodStart,
-              },
-            },
-            data: { count: newCount },
+        const decremented = await client.usageRecord.updateMany({
+          where: { ...baseWhere, count: { gte: count } },
+          data: { count: { decrement: count } },
+        });
+
+        if (decremented.count === 0) {
+          // Either no record exists, or the stored count is smaller than the
+          // amount to release. Clamp any existing record to zero.
+          await client.usageRecord.updateMany({
+            where: { ...baseWhere, count: { lt: count } },
+            data: { count: 0 },
           });
         }
 
-        return newCount;
+        return this.get(subscriberId, feature, { tenantId });
       },
 
       async set(
@@ -699,10 +714,24 @@ function mapUsageRecordFromPrisma(record: any): UsageRecord {
 
 // ==================== Helpers ====================
 
+// Usage periods are computed in UTC so that period boundaries are deterministic
+// and independent of the server's local timezone or DST transitions. Using
+// local time would shift the billing window per region and could split a single
+// calendar month into two usage buckets across a deploy region change.
 function getMonthStart(date: Date): Date {
-  return new Date(date.getFullYear(), date.getMonth(), 1);
+  return new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), 1));
 }
 
 function getMonthEnd(date: Date): Date {
-  return new Date(date.getFullYear(), date.getMonth() + 1, 0, 23, 59, 59, 999);
+  return new Date(
+    Date.UTC(
+      date.getUTCFullYear(),
+      date.getUTCMonth() + 1,
+      0,
+      23,
+      59,
+      59,
+      999,
+    ),
+  );
 }

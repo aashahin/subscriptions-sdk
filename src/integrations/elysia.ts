@@ -203,10 +203,11 @@ export function elysiaPlugin<
 
     if (verifiedTokenId && paymentId && subscription.status === "active") {
       if (plan.price > 0) {
-        const amount = Math.round(plan.price * 100); // Convert to smallest unit (cents/halalas)
+        // Invoice amounts are stored in major/display units (e.g. 49.00 SAR),
+        // matching the documented public contract and the service layer.
         await subs.invoices.create({
           subscriptionId: subscription.id,
-          amount,
+          amount: plan.price,
           currency: plan.currency,
           status: "paid",
           gatewayInvoiceId: paymentId,
@@ -214,8 +215,8 @@ export function elysiaPlugin<
             {
               description: `${plan.name} - Initial subscription`,
               quantity: 1,
-              unitPrice: amount,
-              amount: amount,
+              unitPrice: plan.price,
+              amount: plan.price,
             },
           ],
           metadata: {
@@ -311,10 +312,13 @@ export function elysiaPlugin<
         if (paymentId && result.subscription) {
           const plan = await subs.plans.get(planId);
           if (plan) {
-            // Use the actual charged amount from the service (handles proration correctly).
-            // Fallback to full plan price in smallest unit if chargeAmount is not available.
+            // `result.chargeAmount` is in the smallest currency unit and already
+            // accounts for proration. Convert to major/display units so all
+            // invoices are stored consistently (and the download renders right).
             const invoiceAmount =
-              result.chargeAmount ?? Math.round(plan.price * 100);
+              result.chargeAmount !== undefined
+                ? result.chargeAmount / 100
+                : plan.price;
             await subs.invoices.create({
               subscriptionId: result.subscription.id,
               amount: invoiceAmount,
@@ -482,18 +486,17 @@ export function elysiaPlugin<
           id: invoice.id,
           subscriptionId: invoice.subscriptionId,
           subscriberId: invoice.subscriberId,
-          // Convert from smallest unit (halalas/cents) to display unit (SAR/USD)
-          amount: invoice.amount / 100,
+          // Invoice amounts are persisted in major/display units (e.g. SAR/USD).
+          amount: invoice.amount,
           currency: invoice.currency,
           status: invoice.status,
           gatewayInvoiceId: invoice.gatewayInvoiceId,
           paidAt: invoice.paidAt,
           dueDate: invoice.dueDate,
-          // Convert lineItem amounts from smallest units to display units
           lineItems: invoice.lineItems.map((item) => ({
             ...item,
-            amount: (item.amount || 0) / 100,
-            unitPrice: (item.unitPrice || item.amount || 0) / 100,
+            amount: item.amount || 0,
+            unitPrice: item.unitPrice || item.amount || 0,
           })),
           metadata: invoice.metadata,
           createdAt: invoice.createdAt,
@@ -549,6 +552,7 @@ export function elysiaPlugin<
     .post("/webhooks/:provider", async (ctx) => {
       const { provider } = ctx.params;
       const signature =
+        ctx.headers["x-moyasar-signature"] ||
         ctx.headers["stripe-signature"] ||
         ctx.headers["x-webhook-signature"] ||
         "";

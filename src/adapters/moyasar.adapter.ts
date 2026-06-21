@@ -1390,17 +1390,33 @@ export function moyasarAdapter(config: MoyasarConfig): PaymentGatewayAdapter {
       const payloadStr =
         typeof payload === "string" ? payload : new TextDecoder().decode(payload);
 
-      // Verify signature if webhook secret is configured
-      if (config.webhookSecret && signature) {
+      // Verify signature if a webhook secret is configured.
+      //
+      // Fail CLOSED: when a secret is configured we require a valid signature.
+      // A missing/empty signature must be rejected rather than silently
+      // accepted, otherwise an attacker could bypass verification by simply
+      // omitting the header.
+      if (config.webhookSecret) {
+        if (!signature) {
+          throw new MoyasarAdapterError(
+            "Missing webhook signature",
+            "authentication_error",
+            "WEBHOOK_SIGNATURE_MISSING",
+          );
+        }
         const isValid = await verifySignature(
           payloadStr,
           signature,
           config.webhookSecret,
         );
         if (!isValid) {
-          throw new MoyasarAdapterError("Invalid webhook signature");
+          throw new MoyasarAdapterError(
+            "Invalid webhook signature",
+            "authentication_error",
+            "WEBHOOK_SIGNATURE_INVALID",
+          );
         }
-      } else if (!config.webhookSecret) {
+      } else {
         console.warn(
           "[Moyasar] WARNING: No webhookSecret configured. Webhook payloads are accepted without signature verification. " +
           "Set webhookSecret in MoyasarConfig to enable verification.",
