@@ -196,35 +196,17 @@ export function elysiaPlugin<
 
     const effectiveTrialDays = requestTrialDays ?? plan.trialDays;
 
+    // The service is the single source of truth for invoicing. When the
+    // frontend already collected payment (verifiedTokenId + paymentId), tell
+    // the service to record the initial invoice as paid instead of creating a
+    // second invoice here.
+    const paidExternally = !!(verifiedTokenId && paymentId);
     const subscription = await subs.subscriptions.create(subscriberId, planId, {
       ...(effectiveTrialDays > 0 && { trialDays: effectiveTrialDays }),
       ...(verifiedTokenId && { gatewayCustomerId: verifiedTokenId }),
+      ...(paidExternally && { paidExternally: true }),
+      ...(paymentId && { gatewayInvoiceId: paymentId }),
     });
-
-    if (verifiedTokenId && paymentId && subscription.status === "active") {
-      if (plan.price > 0) {
-        const amount = Math.round(plan.price * 100); // Convert to smallest unit (cents/halalas)
-        await subs.invoices.create({
-          subscriptionId: subscription.id,
-          amount,
-          currency: plan.currency,
-          status: "paid",
-          gatewayInvoiceId: paymentId,
-          lineItems: [
-            {
-              description: `${plan.name} - Initial subscription`,
-              quantity: 1,
-              unitPrice: amount,
-              amount: amount,
-            },
-          ],
-          metadata: {
-            paymentId,
-            type: "initial_subscription",
-          },
-        });
-      }
-    }
 
     return { subscription };
   };
@@ -290,6 +272,10 @@ export function elysiaPlugin<
           verifiedTokenId,
           paymentId,
         } = ctx.body;
+        // The service creates the upgrade invoice itself (single source of
+        // truth). When the frontend already collected payment, pass the
+        // paymentId so the service records it on that invoice — avoiding the
+        // duplicate invoice this route used to create.
         const result = await subs.subscriptions.changePlan(
           subscriberId,
           planId,
@@ -300,43 +286,9 @@ export function elysiaPlugin<
             ...(callbackUrl && { callbackUrl }),
             ...(skipPayment !== undefined && { skipPayment }),
             ...(verifiedTokenId && { verifiedTokenId }),
+            ...(paymentId && { gatewayInvoiceId: paymentId }),
           },
         );
-
-        // Create invoice if payment was made
-        // paymentId is provided from frontend when:
-        // 1. Direct payment success (charged via Moyasar Payments API)
-        // 2. 3DS callback (payment was charged before redirect)
-        // Note: result.charged may be false for 3DS flows (skipPayment: true)
-        if (paymentId && result.subscription) {
-          const plan = await subs.plans.get(planId);
-          if (plan) {
-            // Use the actual charged amount from the service (handles proration correctly).
-            // Fallback to full plan price in smallest unit if chargeAmount is not available.
-            const invoiceAmount =
-              result.chargeAmount ?? Math.round(plan.price * 100);
-            await subs.invoices.create({
-              subscriptionId: result.subscription.id,
-              amount: invoiceAmount,
-              currency: plan.currency,
-              status: "paid",
-              paidAt: new Date(),
-              gatewayInvoiceId: paymentId,
-              lineItems: [
-                {
-                  description: `Plan upgrade to ${plan.name}`,
-                  quantity: 1,
-                  unitPrice: invoiceAmount,
-                  amount: invoiceAmount,
-                },
-              ],
-              metadata: {
-                description: `Plan upgrade to ${plan.name}`,
-                paymentId,
-              },
-            });
-          }
-        }
 
         return result;
       },
@@ -482,18 +434,17 @@ export function elysiaPlugin<
           id: invoice.id,
           subscriptionId: invoice.subscriptionId,
           subscriberId: invoice.subscriberId,
-          // Convert from smallest unit (halalas/cents) to display unit (SAR/USD)
-          amount: invoice.amount / 100,
+          // Invoice amounts are persisted in major/display units (e.g. SAR/USD).
+          amount: invoice.amount,
           currency: invoice.currency,
           status: invoice.status,
           gatewayInvoiceId: invoice.gatewayInvoiceId,
           paidAt: invoice.paidAt,
           dueDate: invoice.dueDate,
-          // Convert lineItem amounts from smallest units to display units
           lineItems: invoice.lineItems.map((item) => ({
             ...item,
-            amount: (item.amount || 0) / 100,
-            unitPrice: (item.unitPrice || item.amount || 0) / 100,
+            amount: item.amount || 0,
+            unitPrice: item.unitPrice || item.amount || 0,
           })),
           metadata: invoice.metadata,
           createdAt: invoice.createdAt,
@@ -549,6 +500,7 @@ export function elysiaPlugin<
     .post("/webhooks/:provider", async (ctx) => {
       const { provider } = ctx.params;
       const signature =
+        ctx.headers["x-moyasar-signature"] ||
         ctx.headers["stripe-signature"] ||
         ctx.headers["x-webhook-signature"] ||
         "";

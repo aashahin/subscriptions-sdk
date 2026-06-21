@@ -144,6 +144,16 @@ export interface DatabaseAdapter<TFeatures extends FeatureRegistry = FeatureRegi
         findByIdWithDetails(id: string): Promise<InvoiceWithDetails<TFeatures> | null>;
 
         /**
+         * Find an invoice by its gateway payment/invoice ID.
+         *
+         * Optional. When implemented, it enables idempotent webhook handling so
+         * that a single gateway payment never produces duplicate invoices or
+         * duplicate subscription renewals. Adapters that cannot support this can
+         * omit it; the package degrades gracefully (without idempotency).
+         */
+        findByGatewayInvoiceId?(gatewayInvoiceId: string): Promise<Invoice | null>;
+
+        /**
          * Find invoices for a subscription
          */
         findBySubscription(subscriptionId: string): Promise<Invoice[]>;

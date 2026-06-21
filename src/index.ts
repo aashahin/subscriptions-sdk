@@ -218,81 +218,77 @@ export function createSubscriptions<TFeatures extends FeatureRegistry>(
         signature,
       );
 
+      // Resolve the subscriber from event metadata. Charges issued by this SDK
+      // attach `subscriberId`; some external/legacy flows attach `tenantId`.
+      const resolveSubscriberId = (
+        metadata: Record<string, string> | undefined,
+      ): string | undefined => metadata?.subscriberId ?? metadata?.tenantId;
+
+      // Renewal-style payment types whose success should extend the period.
+      const RENEWAL_TYPES = new Set([
+        "subscription_renewal",
+        "renewal",
+        "subscription_payment",
+      ]);
+
       // Handle payment events
       switch (event.type) {
         case "payment.paid":
         case "customer.subscription.updated": {
-          // Payment successful - process subscription renewal
+          // Payment already succeeded at the gateway — do NOT charge again.
           const paymentData = event.data as Record<string, unknown>;
           const metadata = paymentData.metadata as
             | Record<string, string>
             | undefined;
+          const subscriberId = resolveSubscriberId(metadata);
 
-          if (metadata?.type === "subscription_renewal" && metadata?.tenantId) {
-            const subscriberId = metadata.tenantId;
+          if (subscriberId && metadata?.type && RENEWAL_TYPES.has(metadata.type)) {
+            const gatewayInvoiceId =
+              typeof paymentData.id === "string" ? paymentData.id : undefined;
 
-            // Renew the subscription
-            await subscriptions.renew(subscriberId);
-
-            // Create invoice if subscription exists
-            const subscription = await subscriptions.get(subscriberId);
-            if (subscription) {
-              // Moyasar returns amount in smallest currency unit (halalas/cents)
-              // Store as-is — the invoice download endpoint converts to display units
-              const amount =
-                typeof paymentData.amount === "number"
-                  ? paymentData.amount
-                  : 0;
-              const currency =
-                typeof paymentData.currency === "string"
-                  ? paymentData.currency
-                  : "SAR";
-
-              const gatewayInvoiceId =
-                typeof paymentData.id === "string" ? paymentData.id : null;
-
-              await invoices.create({
-                subscriptionId: subscription.id,
-                amount,
-                currency,
-                status: "paid",
-                ...(gatewayInvoiceId && { gatewayInvoiceId }),
-                metadata: {
-                  paymentId: paymentData.id,
-                  provider,
-                  webhookEventId: event.id,
-                },
-              });
+            // Idempotency: if we've already recorded an invoice for this gateway
+            // payment (e.g. a cron renewal already processed it), skip entirely
+            // so we never double-renew or double-invoice the same payment.
+            if (gatewayInvoiceId && database.invoices.findByGatewayInvoiceId) {
+              const existing =
+                await database.invoices.findByGatewayInvoiceId(gatewayInvoiceId);
+              if (existing) {
+                break;
+              }
             }
+
+            // Renew without charging (the gateway already collected payment) and
+            // let renew() create the paid invoice so there is exactly one.
+            await subscriptions.renew(subscriberId, {
+              skipPayment: true,
+              paidExternally: true,
+              ...(gatewayInvoiceId && { gatewayInvoiceId }),
+            });
           }
           break;
         }
 
         case "payment.failed":
         case "invoice.payment_failed": {
-          // Payment failed - update subscription status
+          // Payment failed - record failure info on the subscription.
           const paymentData = event.data as Record<string, unknown>;
           const metadata = paymentData.metadata as
             | Record<string, string>
             | undefined;
+          const subscriberId = resolveSubscriberId(metadata);
 
-          if (metadata?.tenantId) {
-            const subscriberId = metadata.tenantId;
-            const subscription = await subscriptions.get(subscriberId);
+          if (subscriberId) {
+            const failureMessage =
+              typeof paymentData.message === "string"
+                ? paymentData.message
+                : "Payment failed";
 
-            if (subscription) {
-              // Update subscription metadata with failure info
-              await database.subscriptions.update(subscription.id, {
-                metadata: {
-                  ...(subscription.metadata ?? {}),
-                  lastPaymentError:
-                    typeof paymentData.message === "string"
-                      ? paymentData.message
-                      : "Payment failed",
-                  lastPaymentFailedAt: new Date().toISOString(),
-                },
-              });
-            }
+            // Route through the service so caches stay consistent. It no-ops
+            // when the subscriber has no subscription.
+            await subscriptions.recordPaymentFailure(
+              subscriberId,
+              failureMessage,
+            );
           }
           break;
         }
@@ -303,9 +299,10 @@ export function createSubscriptions<TFeatures extends FeatureRegistry>(
           const metadata = subscriptionData.metadata as
             | Record<string, string>
             | undefined;
+          const subscriberId = resolveSubscriberId(metadata);
 
-          if (metadata?.tenantId) {
-            await subscriptions.cancel(metadata.tenantId, {
+          if (subscriberId) {
+            await subscriptions.cancel(subscriberId, {
               immediately: true,
             });
           }
