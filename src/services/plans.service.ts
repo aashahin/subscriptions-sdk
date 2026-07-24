@@ -11,6 +11,7 @@ import type {
     FeatureRegistry,
     FeatureValues,
     Plan,
+    PlanPrice,
     UpdatePlanInput,
 } from '../core/types.js';
 
@@ -188,6 +189,31 @@ export class PlansService<TFeatures extends FeatureRegistry> {
         });
 
         return newPlan;
+    }
+
+    /**
+     * Get the price of a plan in a specific currency.
+     *
+     * Returns the plan's canonical `price` when `currency` matches
+     * `plan.currency`; otherwise looks up the additional `prices` price
+     * points. Returns null when the plan has no price in that currency.
+     * Currency matching is case-insensitive.
+     */
+    getPrice(
+        plan: Plan<TFeatures>,
+        currency: string,
+    ): PlanPrice | null {
+        const normalized = currency.toUpperCase();
+
+        if (plan.currency.toUpperCase() === normalized) {
+            return { currency: plan.currency, amount: plan.price };
+        }
+
+        const pricePoint = plan.prices?.find(
+            (p) => p.currency.toUpperCase() === normalized,
+        );
+
+        return pricePoint ?? null;
     }
 
     /**

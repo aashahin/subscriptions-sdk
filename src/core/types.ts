@@ -3,7 +3,7 @@
 
 // ==================== Feature System ====================
 
-export type FeatureType = 'boolean' | 'limit' | 'rate';
+export type FeatureType = 'boolean' | 'limit' | 'rate' | 'metered';
 
 export interface FeatureDefinition<T extends FeatureType = FeatureType> {
     type: T;
@@ -42,12 +42,25 @@ export interface BillingConfig {
 
 // ==================== Plan ====================
 
+/**
+ * An additional price point for a plan in another currency
+ */
+export interface PlanPrice {
+    currency: string;
+    amount: number;
+}
+
 export interface Plan<TFeatures extends FeatureRegistry = FeatureRegistry> {
     id: string;
     name: string;
     description: string | null;
     price: number;
     currency: string;
+    /**
+     * Optional additional price points in other currencies.
+     * The canonical price remains `price`/`currency`.
+     */
+    prices?: PlanPrice[];
     interval: BillingInterval;
     intervalCount: number;
     trialDays: number;
@@ -68,6 +81,7 @@ export interface CreatePlanInput<TFeatures extends FeatureRegistry = FeatureRegi
     intervalCount?: number;
     trialDays?: number;
     features?: PartialFeatureValues<TFeatures>;
+    prices?: PlanPrice[];
     isActive?: boolean;
     sortOrder?: number;
     metadata?: Record<string, unknown>;
@@ -82,6 +96,7 @@ export interface UpdatePlanInput<TFeatures extends FeatureRegistry = FeatureRegi
     intervalCount?: number;
     trialDays?: number;
     features?: PartialFeatureValues<TFeatures>;
+    prices?: PlanPrice[];
     isActive?: boolean;
     sortOrder?: number;
     metadata?: Record<string, unknown>;
@@ -115,6 +130,15 @@ export interface Subscription {
     trialEnd: Date | null;
     gatewaySubscriptionId: string | null;
     gatewayCustomerId: string | null;
+    /**
+     * Seat/unit quantity for per-seat billing.
+     * @default 1
+     */
+    quantity?: number;
+    /**
+     * IDs of add-ons attached to this subscription.
+     */
+    addOns?: string[];
     metadata: Record<string, unknown> | null;
     createdAt: Date;
     updatedAt: Date;
@@ -136,6 +160,8 @@ export interface CreateSubscriptionInput {
     trialEnd?: Date | null | undefined;
     gatewaySubscriptionId?: string | undefined;
     gatewayCustomerId?: string | undefined;
+    quantity?: number | undefined;
+    addOns?: string[] | undefined;
     metadata?: Record<string, unknown> | undefined;
 }
 
@@ -150,6 +176,8 @@ export interface UpdateSubscriptionInput {
     trialEnd?: Date | null;
     gatewaySubscriptionId?: string;
     gatewayCustomerId?: string;
+    quantity?: number;
+    addOns?: string[];
     metadata?: Record<string, unknown>;
 }
 
@@ -186,6 +214,35 @@ export interface Invoice {
     amount: number;
     currency: string;
     status: InvoiceStatus;
+    /**
+     * Sequential human-readable invoice number (e.g. `INV-000123`).
+     * Generated when the database adapter implements `invoices.nextInvoiceNumber`.
+     */
+    invoiceNumber?: string | null;
+    /**
+     * Sum of line item amounts before tax and discounts.
+     */
+    subtotal?: number;
+    /**
+     * Tax rate applied (percentage), when uniform across line items.
+     */
+    taxRate?: number;
+    /**
+     * Total tax amount.
+     */
+    taxAmount?: number;
+    /**
+     * Total discount amount (e.g. from a coupon).
+     */
+    discountAmount?: number;
+    /**
+     * Final amount: `subtotal + taxAmount - discountAmount`.
+     */
+    total?: number;
+    /**
+     * When this invoice is a credit note, the ID of the invoice it credits.
+     */
+    creditNoteOfId?: string | null;
     gatewayInvoiceId: string | null;
     paidAt: Date | null;
     dueDate: Date | null;
@@ -200,6 +257,15 @@ export interface InvoiceLineItem {
     quantity: number;
     unitPrice: number;
     amount: number;
+    /**
+     * Tax rate for this line item (percentage).
+     */
+    taxRate?: number;
+    /**
+     * When true, `amount` already includes tax (tax-inclusive pricing).
+     * Defaults to false (tax-exclusive: tax is added on top of `amount`).
+     */
+    taxInclusive?: boolean;
 }
 
 export interface CreateInvoiceInput {
@@ -207,6 +273,13 @@ export interface CreateInvoiceInput {
     amount: number;
     currency: string;
     status?: InvoiceStatus;
+    invoiceNumber?: string;
+    subtotal?: number;
+    taxRate?: number;
+    taxAmount?: number;
+    discountAmount?: number;
+    total?: number;
+    creditNoteOfId?: string;
     gatewayInvoiceId?: string;
     paidAt?: Date;
     dueDate?: Date;
@@ -217,6 +290,13 @@ export interface CreateInvoiceInput {
 export interface UpdateInvoiceInput {
     amount?: number;
     status?: InvoiceStatus;
+    invoiceNumber?: string;
+    subtotal?: number;
+    taxRate?: number;
+    taxAmount?: number;
+    discountAmount?: number;
+    total?: number;
+    creditNoteOfId?: string;
     gatewayInvoiceId?: string;
     paidAt?: Date | null;
     dueDate?: Date | null;
@@ -283,3 +363,9 @@ export interface SubscriptionsOptions {
      */
     logger?: SubscriptionsLogger;
 }
+
+// ==================== Coupons ====================
+
+// Coupon types live in their own module and are re-exported here so that
+// existing `import { ... } from './types.js'` call sites keep working.
+export * from './coupons.js';

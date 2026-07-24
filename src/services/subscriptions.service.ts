@@ -71,6 +71,28 @@ function rehydrateSubscription<TFeatures extends FeatureRegistry>(
   return sub;
 }
 
+/**
+ * Dunning (failed payment recovery) configuration
+ */
+export interface DunningOptions {
+  /**
+   * Days after the first payment failure at which a retry is attempted.
+   * Each entry represents one retry attempt; when all are exhausted the
+   * configured `action` is applied.
+   * @default [1, 3, 5, 7]
+   */
+  retryScheduleDays?: number[];
+
+  /**
+   * Action to apply to the subscription once the retry schedule is exhausted.
+   * - 'pause': set status to 'paused' (access revoked, can be resumed later)
+   * - 'cancel': cancel the subscription immediately
+   * - 'none': only track attempts, leave the subscription in 'past_due'
+   * @default 'none'
+   */
+  action?: "pause" | "cancel" | "none";
+}
+
 export interface SubscriptionsServiceOptions {
   /**
    * Default subscriber type
@@ -97,6 +119,13 @@ export interface SubscriptionsServiceOptions {
   cacheTtlSeconds?: number;
 
   /**
+   * Dunning (failed payment recovery) configuration.
+   * Used by `processDunning` to retry past-due subscriptions and apply a
+   * terminal action when retries are exhausted.
+   */
+  dunning?: DunningOptions;
+
+  /**
    * Optional logger
    */
   logger?: SubscriptionsLogger;
@@ -120,6 +149,38 @@ export interface ChangePlanResult<
   paymentPending?: boolean;
   /** 3DS verification URL if payment is pending */
   verificationUrl?: string;
+}
+
+/**
+ * Per-subscription outcome of a `processDunning` run
+ */
+export interface DunningProcessResult {
+  /** Subscriber that was processed */
+  subscriberId: string;
+  /** Subscription that was processed */
+  subscriptionId: string;
+  /** Total retry attempts recorded after this run */
+  attempts: number;
+  /** Whether the configured retry schedule has been exhausted */
+  exhausted: boolean;
+  /** Whether the subscription recovered (a retry charge succeeded) */
+  recovered: boolean;
+  /** Terminal action applied when exhausted ('none' when nothing was applied) */
+  actionApplied: "pause" | "cancel" | "none";
+}
+
+/**
+ * Per-subscription outcome of an `executePendingChanges` run
+ */
+export interface PendingChangeResult {
+  /** Subscriber whose plan change was applied */
+  subscriberId: string;
+  /** Subscription that was updated */
+  subscriptionId: string;
+  /** Plan the subscription was on before the change */
+  previousPlanId: string;
+  /** Plan that is now in effect */
+  newPlanId: string;
 }
 
 interface RenewSubscriptionOptions {
@@ -186,6 +247,8 @@ export class SubscriptionsService<TFeatures extends FeatureRegistry> {
   private readonly trialDays: number;
   private readonly gracePeriodDays: number;
   private readonly cacheTtl: number;
+  private readonly dunningRetryScheduleDays: number[];
+  private readonly dunningAction: "pause" | "cancel" | "none";
   private readonly logger: SubscriptionsLogger;
 
   constructor(
@@ -200,6 +263,9 @@ export class SubscriptionsService<TFeatures extends FeatureRegistry> {
     this.trialDays = options?.trialDays ?? 0;
     this.gracePeriodDays = options?.gracePeriodDays ?? 0;
     this.cacheTtl = options?.cacheTtlSeconds ?? 300;
+    this.dunningRetryScheduleDays =
+      options?.dunning?.retryScheduleDays ?? [1, 3, 5, 7];
+    this.dunningAction = options?.dunning?.action ?? "none";
     this.logger = options?.logger ?? noopLogger;
   }
 
@@ -794,6 +860,14 @@ export class SubscriptionsService<TFeatures extends FeatureRegistry> {
       updateData.cancelAt = subscription.currentPeriodEnd;
     }
 
+    // Persist the cancellation reason for reporting/audit
+    if (options?.reason) {
+      updateData.metadata = {
+        ...(subscription.metadata ?? {}),
+        cancelReason: options.reason,
+      };
+    }
+
     // Cancel in payment gateway if connected
     if (subscription.gatewaySubscriptionId) {
       await this.payment.cancelSubscription(
@@ -815,7 +889,10 @@ export class SubscriptionsService<TFeatures extends FeatureRegistry> {
   }
 
   /**
-   * Pause subscription (if supported by payment gateway)
+   * Pause subscription (if supported by payment gateway).
+   *
+   * Records `pausedAt` in metadata so `resume()` can extend the current
+   * period by the time spent paused (paid time is not lost).
    */
   async pause(subscriberId: string): Promise<Subscription> {
     const subscription = await this.getOrThrow(subscriberId);
@@ -826,6 +903,10 @@ export class SubscriptionsService<TFeatures extends FeatureRegistry> {
 
     const updated = await this.db.subscriptions.update(subscription.id, {
       status: "paused",
+      metadata: {
+        ...(subscription.metadata ?? {}),
+        pausedAt: new Date().toISOString(),
+      },
     });
 
     await this.cache.delete(CacheKeys.subscription(subscriberId));
@@ -835,7 +916,13 @@ export class SubscriptionsService<TFeatures extends FeatureRegistry> {
   }
 
   /**
-   * Resume paused subscription
+   * Resume paused subscription.
+   *
+   * Restores the 'active' status and extends `currentPeriodEnd` by the time
+   * the subscription spent paused (recorded as `pausedAt` by `pause()`), so
+   * subscribers keep the paid time they missed. When no pause timestamp is
+   * available (e.g. paused externally) and the period already expired, a
+   * fresh period is started instead.
    */
   async resume(subscriberId: string): Promise<Subscription> {
     const subscription = await this.getOrThrow(subscriberId);
@@ -851,8 +938,22 @@ export class SubscriptionsService<TFeatures extends FeatureRegistry> {
     const now = new Date();
     const updateData: UpdateSubscriptionInput = { status: "active" };
 
-    // If the subscription period expired during pause, start a new period
-    if (now > subscription.currentPeriodEnd) {
+    const metadata = (subscription.metadata ?? {}) as Record<string, unknown>;
+    const pausedAtRaw = metadata.pausedAt;
+    const pausedAt =
+      typeof pausedAtRaw === "string" ? new Date(pausedAtRaw) : null;
+
+    if (pausedAt && !Number.isNaN(pausedAt.getTime())) {
+      // Extend the current period by the paused duration and clear pausedAt
+      const pausedMs = Math.max(0, now.getTime() - pausedAt.getTime());
+      updateData.currentPeriodEnd = new Date(
+        subscription.currentPeriodEnd.getTime() + pausedMs,
+      );
+      const { pausedAt: _pausedAt, ...restMeta } = metadata;
+      updateData.metadata = restMeta;
+    } else if (now > subscription.currentPeriodEnd) {
+      // No pause timestamp recorded: if the subscription period expired
+      // during pause, start a new period
       updateData.currentPeriodStart = now;
       updateData.currentPeriodEnd = this.calculatePeriodEnd(
         now,
@@ -1096,8 +1197,11 @@ export class SubscriptionsService<TFeatures extends FeatureRegistry> {
    * Record a payment failure against the subscriber's subscription.
    *
    * Stores the failure reason/timestamp in metadata and invalidates the cache
-   * so subsequent reads are consistent. Returns the updated subscription, or
-   * `null` when the subscriber has no subscription.
+   * so subsequent reads are consistent. Also initializes the dunning tracking
+   * fields (`dunningStartedAt`, `dunningAttempts`) used by `processDunning` —
+   * existing dunning state is preserved so repeated failures within the same
+   * dunning cycle don't reset the retry clock. Returns the updated
+   * subscription, or `null` when the subscriber has no subscription.
    */
   async recordPaymentFailure(
     subscriberId: string,
@@ -1108,11 +1212,22 @@ export class SubscriptionsService<TFeatures extends FeatureRegistry> {
       return null;
     }
 
+    const metadata = (subscription.metadata ?? {}) as Record<string, unknown>;
+    const nowIso = new Date().toISOString();
+
     const updated = await this.db.subscriptions.update(subscription.id, {
       metadata: {
-        ...(subscription.metadata ?? {}),
+        ...metadata,
         lastPaymentError: message,
-        lastPaymentFailedAt: new Date().toISOString(),
+        lastPaymentFailedAt: nowIso,
+        dunningStartedAt:
+          typeof metadata.dunningStartedAt === "string"
+            ? metadata.dunningStartedAt
+            : nowIso,
+        dunningAttempts:
+          typeof metadata.dunningAttempts === "number"
+            ? metadata.dunningAttempts
+            : 0,
       },
     });
 
@@ -1120,6 +1235,195 @@ export class SubscriptionsService<TFeatures extends FeatureRegistry> {
     await this.cache.delete(CacheKeys.features(subscriberId));
 
     return updated;
+  }
+
+  /**
+   * Process dunning for all past-due subscriptions.
+   *
+   * Intended to be called on a schedule (e.g. daily cron). For each
+   * `past_due` subscription it:
+   * 1. Computes how many retries from `dunning.retryScheduleDays` are due,
+   *    based on when the failure was first recorded (`dunningStartedAt`,
+   *    initialized by `recordPaymentFailure`).
+   * 2. When a retry is due and the gateway supports direct charges, attempts
+   *    to charge the saved payment method; a successful charge renews the
+   *    subscription and clears the dunning state.
+   * 3. Otherwise increments `metadata.dunningAttempts`.
+   * 4. Once the schedule is exhausted, applies the configured
+   *    `dunning.action` ('pause' or 'cancel') via the regular pause()/cancel()
+   *    paths so caches stay consistent.
+   *
+   * @param now - Reference time (defaults to the current time; injectable for testing)
+   * @returns One result per past-due subscription processed
+   */
+  async processDunning(now: Date = new Date()): Promise<DunningProcessResult[]> {
+    const pastDueSubscriptions = await this.db.subscriptions.findAll({
+      status: "past_due",
+    });
+
+    const schedule = this.dunningRetryScheduleDays;
+    const results: DunningProcessResult[] = [];
+
+    for (const subscription of pastDueSubscriptions) {
+      const metadata = (subscription.metadata ?? {}) as Record<string, unknown>;
+      const startedAtRaw =
+        metadata.dunningStartedAt ?? metadata.lastPaymentFailedAt;
+      const startedAt =
+        typeof startedAtRaw === "string" ? new Date(startedAtRaw) : null;
+
+      // No failure timestamp recorded: nothing to base the schedule on
+      if (!startedAt || Number.isNaN(startedAt.getTime())) {
+        continue;
+      }
+
+      const daysSinceFailure = Math.floor(
+        (now.getTime() - startedAt.getTime()) / (24 * 60 * 60 * 1000),
+      );
+      const dueRetries = schedule.filter((d) => daysSinceFailure >= d).length;
+      let attempts =
+        typeof metadata.dunningAttempts === "number"
+          ? metadata.dunningAttempts
+          : 0;
+
+      // Schedule already exhausted: apply the terminal action
+      if (attempts >= schedule.length) {
+        const actionApplied = await this.applyDunningAction(
+          subscription.subscriberId,
+        );
+        results.push({
+          subscriberId: subscription.subscriberId,
+          subscriptionId: subscription.id,
+          attempts,
+          exhausted: true,
+          recovered: false,
+          actionApplied,
+        });
+        continue;
+      }
+
+      // No new retry due yet
+      if (dueRetries <= attempts) {
+        results.push({
+          subscriberId: subscription.subscriberId,
+          subscriptionId: subscription.id,
+          attempts,
+          exhausted: false,
+          recovered: false,
+          actionApplied: "none",
+        });
+        continue;
+      }
+
+      // A retry is due: attempt to charge the saved payment method (at most
+      // one charge per run, even if multiple schedule points are overdue)
+      const recovered = await this.attemptDunningCharge(subscription);
+      if (recovered) {
+        results.push({
+          subscriberId: subscription.subscriberId,
+          subscriptionId: subscription.id,
+          attempts,
+          exhausted: false,
+          recovered: true,
+          actionApplied: "none",
+        });
+        continue;
+      }
+
+      // Retry failed (or no charge capability): record the attempt
+      attempts += 1;
+      const exhausted = attempts >= schedule.length;
+      await this.db.subscriptions.update(subscription.id, {
+        metadata: {
+          ...metadata,
+          dunningAttempts: attempts,
+          lastDunningAttemptAt: now.toISOString(),
+        },
+      });
+      await this.cache.delete(CacheKeys.subscription(subscription.subscriberId));
+
+      const actionApplied = exhausted
+        ? await this.applyDunningAction(subscription.subscriberId)
+        : "none";
+
+      results.push({
+        subscriberId: subscription.subscriberId,
+        subscriptionId: subscription.id,
+        attempts,
+        exhausted,
+        recovered: false,
+        actionApplied,
+      });
+    }
+
+    return results;
+  }
+
+  /**
+   * Apply pending plan changes (scheduled downgrades) that have reached their
+   * effective date.
+   *
+   * Downgrades requested via `changePlan` are stored as
+   * `metadata.pendingDowngradePlanId` and take effect at the end of the
+   * current period. This entry point finds subscriptions whose period has
+   * ended and applies the pending plan change without charging (the next
+   * `renew` call bills the new plan).
+   *
+   * @param now - Reference time (defaults to the current time; injectable for testing)
+   * @returns One result per plan change applied
+   */
+  async executePendingChanges(
+    now: Date = new Date(),
+  ): Promise<PendingChangeResult[]> {
+    const candidates = await this.db.subscriptions.findAll({
+      status: ["active", "trialing"],
+    });
+
+    const applied: PendingChangeResult[] = [];
+
+    for (const subscription of candidates) {
+      const metadata = (subscription.metadata ?? {}) as Record<string, unknown>;
+      const pendingPlanId = metadata.pendingDowngradePlanId as
+        | string
+        | undefined;
+      if (!pendingPlanId) {
+        continue;
+      }
+
+      // Not due yet: the change takes effect at period end
+      if (subscription.currentPeriodEnd > now) {
+        continue;
+      }
+
+      const newPlan = await this.db.plans.findById(pendingPlanId);
+      if (!newPlan) {
+        this.logger.warn?.(
+          `Pending downgrade target plan ${pendingPlanId} not found for subscriber ${subscription.subscriberId} - skipping`,
+        );
+        continue;
+      }
+
+      const updated = await this.db.subscriptions.update(subscription.id, {
+        planId: pendingPlanId,
+        metadata: this.clearPendingSubscriptionMetadata(metadata),
+      });
+
+      // Invalidate both caches: features change together with the plan
+      await this.cache.delete(CacheKeys.subscription(subscription.subscriberId));
+      await this.cache.delete(CacheKeys.features(subscription.subscriberId));
+
+      this.logger.info?.(
+        `Applied pending downgrade for ${subscription.subscriberId}: ${subscription.planId} -> ${pendingPlanId}`,
+      );
+
+      applied.push({
+        subscriberId: subscription.subscriberId,
+        subscriptionId: updated.id,
+        previousPlanId: subscription.planId,
+        newPlanId: pendingPlanId,
+      });
+    }
+
+    return applied;
   }
 
   // ==================== Private Helpers ====================
@@ -1168,6 +1472,113 @@ export class SubscriptionsService<TFeatures extends FeatureRegistry> {
     }
 
     return Math.round(newPrice * 100);
+  }
+
+  /**
+   * Apply the configured terminal dunning action to a subscriber whose retry
+   * schedule is exhausted. Reuses the regular pause()/cancel() paths so
+   * status, metadata, and caches stay consistent. Failures are logged and
+   * reported as 'none' so one bad subscription doesn't abort the whole run.
+   */
+  private async applyDunningAction(
+    subscriberId: string,
+  ): Promise<"pause" | "cancel" | "none"> {
+    if (this.dunningAction === "none") {
+      return "none";
+    }
+
+    try {
+      if (this.dunningAction === "pause") {
+        await this.pause(subscriberId);
+      } else {
+        await this.cancel(subscriberId, {
+          immediately: true,
+          reason: "Dunning: payment retry schedule exhausted",
+        });
+      }
+      this.logger.info?.(
+        `Dunning action '${this.dunningAction}' applied for ${subscriberId}`,
+      );
+      return this.dunningAction;
+    } catch (err) {
+      this.logger.error?.(
+        `Failed to apply dunning action '${this.dunningAction}' for ${subscriberId}: ${err}`,
+      );
+      return "none";
+    }
+  }
+
+  /**
+   * Attempt a single dunning retry charge against the subscriber's saved
+   * payment method. On success the subscription is renewed (payment already
+   * collected) and the dunning metadata is cleared. Returns whether the
+   * subscription recovered. Degrades gracefully to `false` when the gateway
+   * cannot charge directly or no payment method is stored.
+   */
+  private async attemptDunningCharge(
+    subscription: Subscription,
+  ): Promise<boolean> {
+    if (!this.payment.chargePayment || !subscription.gatewayCustomerId) {
+      return false;
+    }
+
+    try {
+      const plan = await this.db.plans.findById(subscription.planId);
+      if (!plan || plan.price <= 0) {
+        return false;
+      }
+
+      const paymentResult = await this.payment.chargePayment({
+        customerId: subscription.gatewayCustomerId,
+        amount: Math.round(plan.price * 100),
+        currency: plan.currency,
+        description: `${plan.name} subscription renewal (dunning retry)`,
+        metadata: {
+          subscriberId: subscription.subscriberId,
+          planId: plan.id,
+          subscriptionId: subscription.id,
+          type: "dunning_retry",
+        },
+      });
+
+      if (paymentResult.status !== "paid") {
+        this.logger.info?.(
+          `Dunning retry for ${subscription.subscriberId} not paid (status: ${paymentResult.status})`,
+        );
+        return false;
+      }
+
+      // Payment recovered: renew for a fresh period without charging again
+      const renewed = await this.renew(subscription.subscriberId, {
+        skipPayment: true,
+        paidExternally: true,
+        ...(paymentResult.id && { gatewayInvoiceId: paymentResult.id }),
+      });
+
+      // Clear the dunning tracking fields left behind by renew()
+      const metadata = (renewed.metadata ?? {}) as Record<string, unknown>;
+      const {
+        dunningStartedAt,
+        dunningAttempts,
+        lastDunningAttemptAt,
+        lastPaymentError,
+        lastPaymentFailedAt,
+        ...restMeta
+      } = metadata;
+      await this.db.subscriptions.update(renewed.id, { metadata: restMeta });
+      await this.cache.delete(CacheKeys.subscription(subscription.subscriberId));
+      await this.cache.delete(CacheKeys.features(subscription.subscriberId));
+
+      this.logger.info?.(
+        `Dunning retry succeeded for ${subscription.subscriberId} - subscription renewed`,
+      );
+      return true;
+    } catch (err) {
+      this.logger.error?.(
+        `Dunning retry charge failed for ${subscription.subscriberId}: ${err}`,
+      );
+      return false;
+    }
   }
 
   private clearPendingSubscriptionMetadata(

@@ -2,6 +2,29 @@
 
 All notable changes to this package will be documented in this file.
 
+## 0.2.0 - 2026-07-24
+
+### Added
+
+- **Runtime-agnostic core**: the service layer now runs on Node.js, Bun, Deno, and Cloudflare Workers using only web-standard primitives. Node-only code paths (filesystem invoice templates, `puppeteer-html-pdf`) are lazy dynamic imports. See `docs/runtime-support.md`.
+- **Drizzle database adapter** (`@abshahin/subscriptions/adapters/drizzle`) with support for D1, Turso, and `bun:sqlite`, alongside the existing Prisma adapter.
+- **Cache adapters**: `redisCacheAdapter`, `upstashCacheAdapter` (HTTP-based, edge-safe), `kvCacheAdapter` (Cloudflare KV), and `memoryCacheAdapter`. Caching remains optional with a noop fallback.
+- **Payment gateway adapters**: `stripeAdapter` (`@abshahin/subscriptions/adapters/stripe`), `paddleAdapter` (`@abshahin/subscriptions/adapters/paddle`), and `lemonSqueezyAdapter` (`@abshahin/subscriptions/adapters/lemonsqueezy`) alongside the existing Moyasar adapter — all built on `fetch` + Web Crypto with no npm dependencies.
+- **Framework integrations**: Hono (`@abshahin/subscriptions/integrations/hono`), Next.js (`@abshahin/subscriptions/integrations/next`), and a framework-neutral web-standard handler (`createSubscriptionsHttpHandler`, `@abshahin/subscriptions/integrations/http`) alongside the existing Elysia plugin.
+- **Invoice rendering everywhere**: `renderSubscriptionInvoice` accepts a `templateSource` string so invoice HTML renders on any runtime; on Cloudflare Workers, PDFs can be produced with `cloudflarePdfRenderer` (`@abshahin/subscriptions/pdf/cloudflare`) and a Browser Rendering binding.
+- **Dual invoice print modes**: invoice endpoints now serve server-generated PDF (`?format=pdf`, via the configured `invoice.pdfRenderer`) or printable HTML for zero-cost client-side printing (`?print=1` toolbar, `?autoPrint=1` auto-opens the browser print dialog) — no puppeteer required. Applies to the framework-neutral HTTP handler (`GET /invoices/:id`) and the Elysia plugin (`GET /invoices/:id/download`); `wrapInvoiceForPrint(html, { autoPrint })` is exported for programmatic use.
+- **Events**: `SubscriptionEvent`, the `EventsAdapter` contract, the `withEvents(subs, adapter)` wrapper, and a transactional outbox (`createOutboxEventsAdapter` + `relayOutbox`) for guaranteed, at-least-once delivery. See `docs/events.md`.
+- **Dunning**: `options.dunning` with `retryScheduleDays` and a final `action` of `"pause" | "cancel" | "none"`, executed by `subscriptions.processDunning()`. `cancel()` now accepts a `reason`, and `pause()`/`resume()`/`extendTrial()` round out the manual controls. See `docs/dunning.md`.
+- **Coupons**: `CouponsService` (`subs.coupons`) with percent/fixed discounts, once/repeating/forever durations, `maxRedemptions`, and `expiresAt`. Validate with `coupons.validate`, preview with `coupons.computeDiscount`, and redeem with `coupons.apply(code, amount)`. See `docs/coupons.md`.
+- **Billing features**: sequential invoice numbering (adapter-driven, prefixes configurable via `new InvoicesService(db, { invoiceNumberPrefix, creditNotePrefix })`), per-line-item inclusive/exclusive tax (`taxRate`/`taxInclusive` on invoice line items), credit notes (`invoices.createCreditNote`) and voiding (`invoices.voidInvoice`), multi-currency plan price points (`Plan.prices` + `plans.getPrice`), metered usage reporting (`metered` feature type), and `quantity`/`addOns` data fields on subscriptions. See `docs/billing.md`.
+- **Testing utilities** (`@abshahin/subscriptions/testing`): `memoryDatabaseAdapter`, `memoryCacheAdapter`, `fakePaymentGateway`, and `databaseAdapterConformance`/`cacheAdapterConformance` suites for custom adapters. See `docs/testing.md`.
+- **Audit logging** (`@abshahin/subscriptions/audit`): `AuditLogAdapter` contract, `createAuditLogger(adapter, { actorId? })` returning an `EventsAdapter` for `withEvents`, and `memoryAuditLogAdapter`. See `docs/audit.md`.
+
+### Changed
+
+- **Build moved from `tsc` to `tsdown`** (Rolldown): all subpath entries and type declarations are emitted in one pass, the invoice template is inlined as a string (no runtime `cp`/filesystem), and `publint` + `attw` run as `bun run check:package`. New subpath exports: `./integrations/{http,hono,next}`, `./adapters/{redis,upstash,cloudflare-kv,drizzle,stripe,paddle,lemonsqueezy}`, `./pdf/{puppeteer,cloudflare}`, `./templates/invoice-utils`, `./testing`, `./audit`, `./core/events`.
+- **Web-standard webhook entry**: `subscriptions.handleWebhookRequest(request: Request): Promise<Response>` (configurable `webhookSignatureHeader`/`webhookProvider` options) alongside the existing `handleWebhook`.
+
 ## 0.1.4 - 2026-06-21
 
 ### Fixed

@@ -3,6 +3,8 @@
 
 import handlebars from "handlebars";
 import type { Invoice } from "../core/types.js";
+import { subscriptionInvoiceTemplate } from "./invoice-template.js";
+import type { PdfRenderer } from "./pdf-renderer.js";
 
 // Currency configuration map with ISO 4217 codes, symbols, and locale hints
 const CURRENCY_CONFIG: Record<
@@ -270,50 +272,231 @@ export interface SubscriptionInvoiceData {
 }
 
 /**
- * Render the subscription invoice HTML
+ * How to resolve the Handlebars template used for invoice rendering.
+ * Provide either `templatePath` (Node.js filesystem) or an inline
+ * `templateSource` string (works in every runtime). When neither is given,
+ * the built-in {@link subscriptionInvoiceTemplate} is used.
+ */
+export interface RenderSubscriptionInvoiceOptions {
+    /** Path to a `.hbs` template file (requires a filesystem; Node.js only). */
+    templatePath?: string;
+    /** Inline Handlebars template source (universal, no filesystem). */
+    templateSource?: string;
+}
+
+/**
+ * Render the subscription invoice HTML.
+ *
+ * Backward compatible: the first argument may still be a template path
+ * string. Prefer the options form — with `templateSource` or no arguments at
+ * all the built-in template is used and no filesystem is touched.
  */
 export async function renderSubscriptionInvoice(
     templatePath: string,
     data: SubscriptionInvoiceData
+): Promise<string>;
+export async function renderSubscriptionInvoice(
+    options: RenderSubscriptionInvoiceOptions | undefined,
+    data: SubscriptionInvoiceData
+): Promise<string>;
+export async function renderSubscriptionInvoice(
+    data: SubscriptionInvoiceData
+): Promise<string>;
+export async function renderSubscriptionInvoice(
+    source:
+        | string
+        | RenderSubscriptionInvoiceOptions
+        | SubscriptionInvoiceData
+        | undefined,
+    data?: SubscriptionInvoiceData
 ): Promise<string> {
-    const { readFile } = await import("node:fs/promises");
-    const templateSource = await readFile(templatePath, "utf-8");
+    let templatePath: string | undefined;
+    let templateSource: string | undefined;
+
+    if (typeof source === "string") {
+        templatePath = source;
+    } else if (
+        source !== undefined &&
+        ("templatePath" in source || "templateSource" in source)
+    ) {
+        templatePath = source.templatePath;
+        templateSource = source.templateSource;
+    } else if (data === undefined) {
+        // Called as renderSubscriptionInvoice(data) — use the built-in default
+        data = source as SubscriptionInvoiceData;
+    }
+    // else: source is undefined and data is set — use the built-in default
+
+    if (!templateSource) {
+        if (templatePath) {
+            // Lazy import so Workers never execute Node APIs. The specifier is
+            // intentionally non-static so bundlers (wrangler/esbuild) leave it
+            // as a runtime-only import instead of failing at bundle time.
+            const fsSpecifier = "node:fs/promises";
+            const { readFile } = (await import(fsSpecifier)) as typeof import("node:fs/promises");
+            templateSource = await readFile(templatePath, "utf-8");
+        } else {
+            templateSource = subscriptionInvoiceTemplate;
+        }
+    }
+
     const template = handlebars.compile(templateSource);
-    return template(data);
+    return template(data!);
 }
 
 /**
- * Generate a PDF buffer from invoice data
+ * Generate PDF bytes from rendered HTML using the given renderer.
+ */
+export async function generatePdfWith(
+    renderer: PdfRenderer,
+    html: string
+): Promise<Uint8Array> {
+    return renderer.render(html);
+}
+
+/**
+ * Options for {@link wrapInvoiceForPrint}.
+ */
+export interface PrintWrapOptions {
+    /**
+     * Automatically open the browser print dialog once the page loads.
+     * The user can then print or "Save as PDF" client-side — no server-side
+     * Chromium needed.
+     * @default false
+     */
+    autoPrint?: boolean;
+
+    /**
+     * Show a small floating "Print / Save as PDF" toolbar on screen.
+     * The toolbar is hidden when printing (`@media print`).
+     * @default true
+     */
+    toolbar?: boolean;
+}
+
+/**
+ * Wrap a rendered invoice HTML document for client-side printing.
+ *
+ * Injects print-friendly CSS (`@page` margins, screen-only toolbar hiding)
+ * and, optionally, an auto-print script so the browser's print dialog opens
+ * on load. This is the zero-cost alternative to server-side PDF generation:
+ * return the HTML and let the client print or "Save as PDF".
+ *
+ * Pure string manipulation — works in every runtime (Node, Bun, Deno,
+ * Cloudflare Workers).
+ */
+export function wrapInvoiceForPrint(
+    html: string,
+    options?: PrintWrapOptions
+): string {
+    const toolbar = options?.toolbar ?? true;
+
+    const pageStyles = `<style>
+@page { margin: 12mm; }
+</style>`;
+
+    const toolbarAssets = toolbar
+        ? `<style>
+@media print {
+  .subs-print-toolbar { display: none !important; }
+}
+.subs-print-toolbar {
+  position: fixed; top: 16px; right: 16px; z-index: 9999;
+  font-family: system-ui, -apple-system, sans-serif;
+}
+.subs-print-toolbar button {
+  padding: 10px 18px; font-size: 14px; font-weight: 600; cursor: pointer;
+  color: #fff; background: #111827; border: none; border-radius: 8px;
+  box-shadow: 0 2px 8px rgba(0,0,0,.25);
+}
+.subs-print-toolbar button:hover { background: #1f2937; }
+</style>
+<div class="subs-print-toolbar"><button type="button" onclick="window.print()">Print / Save as PDF</button></div>`
+        : "";
+
+    const script = options?.autoPrint
+        ? `<script>window.addEventListener("load",function(){setTimeout(function(){window.print();},0);});</script>`
+        : "";
+
+    const injection = `${pageStyles}${toolbarAssets}${script}`;
+
+    // Inject before </body> when present so the document stays valid;
+    // otherwise append to the end of the fragment.
+    const bodyClose = /<\/body\s*>/i;
+    if (bodyClose.test(html)) {
+        return html.replace(bodyClose, `${injection}</body>`);
+    }
+    return `${html}${injection}`;
+}
+
+/**
+ * Generate a PDF buffer from invoice data.
+ *
+ * Backward compatible: still accepts a template path and renders with
+ * puppeteer under Node.js by default. Pass `options.renderer` to use any
+ * {@link PdfRenderer} (e.g. Cloudflare Browser Rendering in Workers), and/or
+ * the options form of the first argument to render without a filesystem.
  */
 export async function generateSubscriptionInvoicePdf(
     templatePath: string,
     data: SubscriptionInvoiceData,
-    options?: {
-        chromiumPath?: string;
-    }
+    options?: GenerateSubscriptionInvoicePdfOptions
+): Promise<Uint8Array>;
+export async function generateSubscriptionInvoicePdf(
+    templateOptions: RenderSubscriptionInvoiceOptions | undefined,
+    data: SubscriptionInvoiceData,
+    options?: GenerateSubscriptionInvoicePdfOptions
+): Promise<Uint8Array>;
+export async function generateSubscriptionInvoicePdf(
+    source: string | RenderSubscriptionInvoiceOptions | undefined,
+    data: SubscriptionInvoiceData,
+    options?: GenerateSubscriptionInvoicePdfOptions
 ): Promise<Uint8Array> {
-    // Dynamic import to avoid loading puppeteer unless needed
-    const PuppeteerHTMLPDF = (await import("puppeteer-html-pdf")).default;
+    // Render HTML first (delegates template resolution)
+    const html =
+        typeof source === "string"
+            ? await renderSubscriptionInvoice(source, data)
+            : await renderSubscriptionInvoice(
+                  source as RenderSubscriptionInvoiceOptions | undefined,
+                  data
+              );
 
-    // Render HTML first
-    const html = await renderSubscriptionInvoice(templatePath, data);
+    // Delegate PDF rendering — default keeps the legacy Node.js behavior
+    const renderer =
+        options?.renderer ??
+        (await defaultNodePdfRenderer(options?.chromiumPath));
 
-    // Generate PDF using PuppeteerHTMLPDF
-    const htmlPDF = new PuppeteerHTMLPDF();
-    await htmlPDF.initializeBrowser();
-    await htmlPDF.setOptions({
-        format: "a4",
-        printBackground: true,
-        executablePath:
-            options?.chromiumPath ??
-            (typeof process !== "undefined" ? process.env.CHROMIUM_PATH : undefined) ??
-            "/usr/bin/chromium",
-    });
+    return generatePdfWith(renderer, html);
+}
 
-    const pdfBuffer = await htmlPDF.create(html);
-    await htmlPDF.closeBrowser();
+/**
+ * Options for {@link generateSubscriptionInvoicePdf}.
+ */
+export interface GenerateSubscriptionInvoicePdfOptions {
+    /**
+     * Path to the Chromium/Chrome executable (Node.js default renderer only).
+     */
+    chromiumPath?: string;
+    /**
+     * PDF renderer to use. Defaults to the Node.js puppeteer renderer.
+     */
+    renderer?: PdfRenderer;
+}
 
-    return pdfBuffer;
+/**
+ * Lazily build the default Node.js puppeteer renderer so Workers bundles
+ * never reach the puppeteer code path.
+ */
+async function defaultNodePdfRenderer(
+    chromiumPath?: string
+): Promise<PdfRenderer> {
+    const { puppeteerPdfRenderer } = await import("../pdf/puppeteer.js");
+    return puppeteerPdfRenderer(
+        chromiumPath !== undefined ? { chromiumPath } : undefined
+    );
 }
 
 export { handlebars };
+export { subscriptionInvoiceTemplate } from "./invoice-template.js";
+export { noopPdfRenderer } from "./pdf-renderer.js";
+export type { PdfRenderer } from "./pdf-renderer.js";

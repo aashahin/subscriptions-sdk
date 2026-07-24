@@ -2,6 +2,11 @@
 // Database adapter interface for subscriptions package
 
 import type {
+    Coupon,
+    CreateCouponInput,
+    UpdateCouponInput,
+} from '../core/coupons.js';
+import type {
     CreateInvoiceInput,
     CreatePlanInput,
     CreateSubscriptionInput,
@@ -172,6 +177,55 @@ export interface DatabaseAdapter<TFeatures extends FeatureRegistry = FeatureRegi
          * Update an invoice
          */
         update(id: string, data: UpdateInvoiceInput): Promise<Invoice>;
+
+        /**
+         * Atomically generate the next sequential invoice number.
+         *
+         * Optional. When implemented, `InvoicesService.create()` assigns a
+         * human-readable `invoiceNumber` (e.g. `INV-000123`) to new invoices.
+         * Adapters that cannot guarantee atomic sequencing can omit it; the
+         * package degrades gracefully by leaving `invoiceNumber` null.
+         *
+         * @param prefix - Number prefix (e.g. 'INV-'), provided by the service
+         */
+        nextInvoiceNumber?(prefix: string): Promise<string>;
+    };
+
+    // ==================== Coupons ====================
+    /**
+     * Coupon persistence.
+     *
+     * Optional. When omitted, `CouponsService` degrades gracefully by throwing
+     * a helpful setup error telling the integrator to implement this section
+     * (or to add the `Coupon` model when using the Prisma adapter — see
+     * docs/prisma-schema.md).
+     */
+    coupons?: {
+        /**
+         * Find a coupon by its (uppercase) redemption code
+         */
+        findByCode(code: string): Promise<Coupon | null>;
+
+        /**
+         * Find a coupon by ID
+         */
+        findById(id: string): Promise<Coupon | null>;
+
+        /**
+         * Create a new coupon
+         */
+        create(data: CreateCouponInput): Promise<Coupon>;
+
+        /**
+         * Update an existing coupon
+         */
+        update(id: string, data: UpdateCouponInput): Promise<Coupon>;
+
+        /**
+         * Atomically increment the redemption counter
+         * @returns The updated coupon
+         */
+        incrementRedemptions(id: string): Promise<Coupon>;
     };
 
     // ==================== Usage Tracking ====================

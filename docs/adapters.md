@@ -4,9 +4,9 @@
 
 The package currently ships with:
 
-- `prismaAdapter` for storage
-- `moyasarAdapter` for payments
-- a `CacheAdapter` interface for optional caching
+- `prismaAdapter` and `drizzleAdapter` for storage
+- `moyasarAdapter`, `stripeAdapter`, `paddleAdapter`, and `lemonSqueezyAdapter` for payments
+- `redisCacheAdapter`, `upstashCacheAdapter`, and `kvCacheAdapter` (Cloudflare KV) behind the `CacheAdapter` interface for optional caching
 
 ## Database Adapter
 
@@ -28,6 +28,21 @@ The current Prisma adapter expects these model delegates on the Prisma client:
 - `usageRecord`
 
 See `prisma-schema.md` for the schema shape used in the backend project.
+
+### Drizzle Adapter
+
+```ts
+import { drizzle } from "drizzle-orm/d1";
+import {
+  drizzleAdapter,
+  subscriptionsSchema,
+} from "@abshahin/subscriptions/adapters/drizzle";
+
+const db = drizzle(env.DB, { schema: subscriptionsSchema });
+const database = drizzleAdapter(db);
+```
+
+The Drizzle adapter works with any Drizzle driver — D1, Turso, `bun:sqlite`, Postgres, and more — making it the portable alternative to Prisma (and the required choice on Cloudflare Workers without a Prisma driver adapter). It accepts an optional second argument (`drizzleAdapter(db, { schema })`) to override the bundled table definitions, and the `./adapters/drizzle` subpath re-exports the schema (`subscriptionsSchema` and the individual tables) so you can merge it into your own Drizzle schema. See `drizzle-schema.md` for the table shapes and `runtime-support.md` for per-runtime setup.
 
 ### Responsibilities
 
@@ -160,6 +175,30 @@ CacheKeys.features(subscriberId);
 CacheKeys.usage(subscriberId, feature);
 ```
 
+### Shipped Implementations
+
+Three ready-made cache adapters cover the common backends; `memoryCacheAdapter` from `./testing` covers local dev and tests:
+
+```ts
+// Redis (ioredis) — pass an existing client, or connection options
+// ({ url, options }) and ioredis is lazy-loaded.
+import { redisCacheAdapter } from "@abshahin/subscriptions/adapters/redis";
+const cache = redisCacheAdapter(new Redis(process.env.REDIS_URL!));
+
+// Upstash Redis — HTTP-based, edge-safe (no TCP), works on every runtime.
+import { upstashCacheAdapter } from "@abshahin/subscriptions/adapters/upstash";
+const cache = upstashCacheAdapter({
+  url: process.env.UPSTASH_REDIS_REST_URL!,
+  token: process.env.UPSTASH_REDIS_REST_TOKEN!,
+});
+
+// Cloudflare KV — pass a KV namespace binding.
+import { kvCacheAdapter } from "@abshahin/subscriptions/adapters/cloudflare-kv";
+const cache = kvCacheAdapter(env.CACHE);
+```
+
+See `runtime-support.md` for the per-runtime support matrix (e.g. `redisCacheAdapter` needs TCP sockets, so it does not run on Cloudflare Workers).
+
 ## Payment Adapter
 
 Payments are optional. Manual subscription management still works without a payment adapter.
@@ -237,6 +276,41 @@ Typical backend flow:
 
 The included Moyasar adapter verifies webhook signatures using the Web Crypto API and decodes binary payloads through `TextDecoder`, so it does not require `Buffer` in its public surface.
 
+## Stripe, Paddle, and Lemon Squeezy Adapters
+
+Three more payment gateways ship alongside Moyasar. All are dependency-free — API calls go through `fetch` and webhook signature verification uses Web Crypto — so they run on Node.js, Bun, Deno, and Cloudflare Workers alike.
+
+```ts
+import { stripeAdapter } from "@abshahin/subscriptions/adapters/stripe";
+
+const payment = stripeAdapter({
+  secretKey: process.env.STRIPE_SECRET_KEY!,       // sk_live_xxx / sk_test_xxx
+  webhookSecret: process.env.STRIPE_WEBHOOK_SECRET, // whsec_xxx
+});
+```
+
+```ts
+import { paddleAdapter } from "@abshahin/subscriptions/adapters/paddle";
+
+const payment = paddleAdapter({
+  apiKey: process.env.PADDLE_API_KEY!,
+  webhookSecret: process.env.PADDLE_WEBHOOK_SECRET, // pdl_ntfset_xxx
+  environment: "sandbox",                           // optional; defaults to production
+});
+```
+
+```ts
+import { lemonSqueezyAdapter } from "@abshahin/subscriptions/adapters/lemonsqueezy";
+
+const payment = lemonSqueezyAdapter({
+  apiKey: process.env.LEMONSQUEEZY_API_KEY!,
+  storeId: process.env.LEMONSQUEEZY_STORE_ID!,
+  webhookSecret: process.env.LEMONSQUEEZY_WEBHOOK_SECRET,
+});
+```
+
+Webhook delivery reaches them through `subscriptions.handleWebhook(provider, payload, signature)` or the web-standard `subscriptions.handleWebhookRequest(request)` — set `options.webhookProvider`/`options.webhookSignatureHeader` when the defaults do not match your setup. See `runtime-support.md` for the full matrix.
+
 ## Custom Payment Adapters
 
 If you integrate another provider, implement the interface directly and pass it to `createSubscriptions`.
@@ -252,12 +326,12 @@ Prioritize these flows first:
 
 The package also exports invoice rendering helpers from the root entrypoint:
 
-- `renderSubscriptionInvoice(templatePath, data)`
-- `generateSubscriptionInvoicePdf(templatePath, data, options)`
+- `renderSubscriptionInvoice(...)` — accepts `(templatePath, data)`, an options object `({ templatePath? | templateSource? }, data)`, or just `(data)` to use the built-in inlined template
+- `generateSubscriptionInvoicePdf(templatePathOrOptions, data, options?)`
 
-These helpers are intended for Node.js runtimes:
+With `templateSource` or the built-in template, HTML rendering works on any runtime — no filesystem is touched. PDF generation delegates to a `PdfRenderer`:
 
-- `renderSubscriptionInvoice` reads the template from the filesystem
-- `generateSubscriptionInvoicePdf` requires the optional `puppeteer-html-pdf` peer dependency
+- `puppeteerPdfRenderer` from `@abshahin/subscriptions/pdf/puppeteer` (Node.js, uses the optional `puppeteer-html-pdf` peer dependency)
+- `cloudflarePdfRenderer(browserBinding)` from `@abshahin/subscriptions/pdf/cloudflare` (Cloudflare Workers Browser Rendering)
 
-If you need invoice generation in a non-Node runtime, render HTML or PDFs in application code with runtime-specific infrastructure.
+If you need invoice generation in another runtime, render HTML with `templateSource` and print it with your platform's tooling.

@@ -6,7 +6,7 @@ The package ships with:
 
 - a Prisma database adapter
 - an optional cache adapter interface
-- an optional Moyasar payment adapter
+- optional Moyasar, Stripe, Paddle, and Lemon Squeezy payment adapters
 - an optional Elysia integration with routes and controller macros
 
 The service layer is runtime-neutral and uses web-standard primitives for binary payloads and crypto-friendly flows. The current production integration uses tenant-scoped subscriptions, but the core package still models the subscribed entity as a generic subscriber.
@@ -20,11 +20,26 @@ The service layer is runtime-neutral and uses web-standard primitives for binary
 - Verify payment webhooks without coupling the core services to one provider
 - Generate invoice HTML and, in Node.js environments, invoice PDFs
 
+## Features
+
+- **Runtime-agnostic core**: runs on Node.js, Bun, Deno, and Cloudflare Workers using web-standard primitives
+- **Database adapters**: Prisma and Drizzle (including D1, Turso, and `bun:sqlite`)
+- **Cache adapters**: Redis, Upstash, Cloudflare KV, and in-memory — all optional, with a noop fallback
+- **Framework integrations**: Elysia, Hono, Next.js, and a framework-neutral fetch handler
+- **Billing**: sequential invoice numbering, per-line-item inclusive/exclusive tax, credit notes, multi-currency price points, metered usage, and per-seat/add-on data fields — see `docs/billing.md`
+- **Coupons**: percent/fixed discounts with once/repeating/forever durations, redemption caps, and expiry — see `docs/coupons.md`
+- **Dunning**: configurable retry schedules with pause/cancel final actions — see `docs/dunning.md`
+- **Events**: typed lifecycle events via `withEvents`, with an outbox adapter for guaranteed delivery — see `docs/events.md`
+- **Audit logging**: pluggable audit trail via `createAuditLogger` — see `docs/audit.md`
+- **Testing utilities**: in-memory adapters, a fake payment gateway, and adapter conformance suites from the `./testing` export — see `docs/testing.md`
+
 ## Runtime Support
 
 - Core services and payment interfaces are runtime-neutral and accept webhook payloads as `string | Uint8Array`
 - Existing Node.js callers can still pass `Buffer`, because `Buffer` extends `Uint8Array`
-- Invoice PDF generation is Node.js-only because it depends on filesystem template loading and `puppeteer-html-pdf`
+- Invoice HTML can be rendered anywhere by passing a template string (`templateSource`); filesystem template paths remain available on Node.js/Bun/Deno
+- Invoice PDF generation via `puppeteer-html-pdf` is Node.js-only; on Cloudflare Workers use `@cloudflare/puppeteer` with a Browser Rendering binding
+- See `docs/runtime-support.md` for the full support matrix and per-runtime setup recipes
 
 ## Installation
 
@@ -147,11 +162,12 @@ const fee = await subscriptions.permissions.getRate(
 
 ### Feature Types
 
-`defineFeatures` supports three feature kinds:
+`defineFeatures` supports four feature kinds:
 
 - `boolean`: enable or disable a capability
 - `limit`: numeric usage caps, with `-1` meaning unlimited
 - `rate`: numeric values such as fees or delays
+- `metered`: tracked usage that never blocks — `remaining` may go negative so you can bill the overage
 
 Plan records only store overrides. Any omitted feature falls back to the default declared in `defineFeatures`.
 
@@ -362,6 +378,8 @@ const payment = moyasarAdapter({
 });
 ```
 
+Stripe (`@abshahin/subscriptions/adapters/stripe`), Paddle (`@abshahin/subscriptions/adapters/paddle`), and Lemon Squeezy (`@abshahin/subscriptions/adapters/lemonsqueezy`) adapters ship as well — all dependency-free (`fetch` + Web Crypto). See `docs/adapters.md`.
+
 The backend project currently uses direct payment charges plus saved token IDs for renewals and plan upgrades. That pattern is covered in the integration guide.
 
 ## Prisma Schema Requirements
@@ -404,7 +422,14 @@ await subs.permissions.getFeatures(tenantId);
 
 - `CHANGELOG.md`
 - `docs/README.md`
+- `docs/runtime-support.md`
 - `docs/adapters.md`
+- `docs/billing.md`
+- `docs/coupons.md`
+- `docs/dunning.md`
+- `docs/events.md`
+- `docs/audit.md`
+- `docs/testing.md`
 - `docs/error-handling.md`
 - `docs/integration-guide.md`
 - `docs/prisma-schema.md`

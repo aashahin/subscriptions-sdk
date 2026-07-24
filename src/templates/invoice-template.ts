@@ -1,0 +1,641 @@
+// file: packages/subscriptions/src/templates/invoice-template.ts
+// Default subscription invoice template, inlined so the built-in rendering path
+// never touches the filesystem and works in every JavaScript runtime.
+//
+// NOTE: keep this in sync with `subscription-invoice.hbs` (same directory).
+
+export const subscriptionInvoiceTemplate = `<html lang="ar" dir="rtl">
+
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>فاتورة اشتراك</title>
+
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Cairo:wght@400;600;700;800&display=swap" rel="stylesheet" />
+
+  <style>
+    :root {
+      --page: #f4f4f1;
+      --surface: #ffffff;
+      --surface-soft: #fafaf8;
+      --ink: #111111;
+      --muted: #5f5f5a;
+      --line: #d9d9d2;
+      --line-strong: #202020;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    html,
+    body {
+      margin: 0;
+      background: var(--page);
+      color: var(--ink);
+      font:
+        14px/1.7 "Cairo",
+        system-ui,
+        -apple-system,
+        "Segoe UI",
+        "Noto Sans Arabic",
+        "Noto Naskh Arabic",
+        Tahoma,
+        Arial,
+        sans-serif;
+      -webkit-print-color-adjust: exact;
+      print-color-adjust: exact;
+      -webkit-font-smoothing: antialiased;
+      -moz-osx-font-smoothing: grayscale;
+    }
+
+    body {
+      padding: 32px 18px;
+    }
+
+    .invoice-shell {
+      width: 100%;
+      max-width: 920px;
+      margin: 0 auto;
+      background: var(--surface);
+      border: 1px solid var(--line);
+      padding: 34px;
+    }
+
+    .document-header {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 24px;
+      padding-bottom: 26px;
+      border-bottom: 2px solid var(--line-strong);
+    }
+
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 14px;
+      min-width: 0;
+    }
+
+    .brand-logo {
+      width: 52px;
+      height: 52px;
+      object-fit: contain;
+      border: 1px solid var(--line);
+      background: var(--surface-soft);
+      padding: 6px;
+    }
+
+    .brand-meta {
+      min-width: 0;
+    }
+
+    .eyebrow {
+      margin: 0 0 6px;
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: 0.12em;
+      color: var(--muted);
+    }
+
+    .brand-name {
+      margin: 0;
+      font-size: 28px;
+      font-weight: 800;
+      line-height: 1.25;
+      word-break: break-word;
+    }
+
+    .document-title {
+      flex: 0 0 270px;
+      text-align: left;
+    }
+
+    .document-title h1 {
+      margin: 0;
+      font-size: 30px;
+      line-height: 1.2;
+      font-weight: 800;
+    }
+
+    .document-id {
+      margin-top: 8px;
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    .status-badge {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      margin-top: 12px;
+      padding: 6px 14px;
+      border: 1px solid var(--line-strong);
+      background: var(--surface-soft);
+      color: var(--ink);
+      font-size: 12px;
+      font-weight: 700;
+      white-space: nowrap;
+    }
+
+    .summary-grid {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 0;
+      margin-top: 22px;
+      border: 1px solid var(--line);
+      background: var(--surface-soft);
+    }
+
+    .summary-card {
+      padding: 14px 16px;
+      border-left: 1px solid var(--line);
+    }
+
+    .summary-card:last-child {
+      border-left: 0;
+    }
+
+    .summary-label {
+      display: block;
+      color: var(--muted);
+      font-size: 11px;
+      font-weight: 700;
+      margin-bottom: 4px;
+    }
+
+    .summary-value {
+      display: block;
+      font-size: 15px;
+      font-weight: 700;
+      color: var(--ink);
+      word-break: break-word;
+    }
+
+    .content-grid {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+      gap: 18px;
+      margin-top: 22px;
+    }
+
+    .panel {
+      border: 1px solid var(--line);
+      padding: 18px;
+      min-width: 0;
+    }
+
+    .panel-title {
+      margin: 0 0 14px;
+      font-size: 15px;
+      font-weight: 800;
+      padding-bottom: 10px;
+      border-bottom: 1px solid var(--line);
+    }
+
+    .key-values {
+      display: grid;
+      grid-template-columns: 110px minmax(0, 1fr);
+      gap: 8px 12px;
+    }
+
+    .key {
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    .value {
+      font-size: 13px;
+      word-break: break-word;
+    }
+
+    .mono {
+      font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+      font-size: 12px;
+      direction: ltr;
+      text-align: right;
+    }
+
+    .plan-panel {
+      margin-top: 18px;
+      border: 1px solid var(--line-strong);
+      padding: 22px;
+    }
+
+    .plan-row {
+      display: flex;
+      justify-content: space-between;
+      gap: 18px;
+      align-items: flex-start;
+    }
+
+    .plan-label {
+      color: var(--muted);
+      font-size: 11px;
+      font-weight: 700;
+      margin-bottom: 6px;
+      letter-spacing: 0.08em;
+    }
+
+    .plan-name {
+      margin: 0;
+      font-size: 22px;
+      font-weight: 800;
+      line-height: 1.35;
+    }
+
+    .plan-description {
+      margin: 8px 0 0;
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    .plan-price-block {
+      text-align: left;
+      white-space: nowrap;
+    }
+
+    .plan-price {
+      display: block;
+      font-size: 28px;
+      font-weight: 800;
+      line-height: 1.2;
+    }
+
+    .plan-interval {
+      display: block;
+      color: var(--muted);
+      font-size: 12px;
+      margin-top: 4px;
+    }
+
+    .period-banner {
+      margin-top: 14px;
+      padding-top: 14px;
+      border-top: 1px solid var(--line);
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    .period-banner strong {
+      color: var(--ink);
+    }
+
+    .section-title {
+      margin: 28px 0 12px;
+      font-size: 14px;
+      font-weight: 800;
+      color: var(--ink);
+    }
+
+    .items {
+      width: 100%;
+      border-collapse: collapse;
+      border: 1px solid var(--line);
+    }
+
+    .items thead th {
+      padding: 12px 14px;
+      text-align: right;
+      background: var(--surface-soft);
+      color: var(--ink);
+      font-size: 12px;
+      font-weight: 700;
+      border-bottom: 1px solid var(--line-strong);
+    }
+
+    .items tbody td {
+      padding: 13px 14px;
+      border-bottom: 1px solid var(--line);
+      vertical-align: top;
+      font-size: 13px;
+    }
+
+    .items tbody tr:last-child td {
+      border-bottom: 0;
+    }
+
+    .item-name {
+      font-weight: 700;
+      color: var(--ink);
+    }
+
+    .num {
+      text-align: left;
+      white-space: nowrap;
+      direction: ltr;
+    }
+
+    .bottom-grid {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) 300px;
+      gap: 22px;
+      margin-top: 22px;
+      align-items: start;
+    }
+
+    .note-box {
+      border: 1px solid var(--line);
+      padding: 18px;
+      min-height: 100%;
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    .note-title {
+      margin: 0 0 8px;
+      color: var(--ink);
+      font-size: 13px;
+      font-weight: 800;
+    }
+
+    .totals-box {
+      border: 1px solid var(--line-strong);
+      padding: 18px;
+    }
+
+    .total-row {
+      display: grid;
+      grid-template-columns: 1fr auto;
+      gap: 12px;
+      padding: 8px 0;
+      font-size: 13px;
+      align-items: center;
+    }
+
+    .total-row + .total-row {
+      border-top: 1px solid var(--line);
+    }
+
+    .total-row.grand {
+      font-size: 18px;
+      font-weight: 800;
+      color: var(--ink);
+      padding-top: 14px;
+      margin-top: 8px;
+      border-top: 2px solid var(--line-strong);
+    }
+
+    .footer {
+      display: flex;
+      justify-content: space-between;
+      gap: 20px;
+      margin-top: 28px;
+      padding-top: 16px;
+      border-top: 1px solid var(--line-strong);
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    .footer strong {
+      color: var(--ink);
+    }
+
+    @media (max-width: 760px) {
+      body {
+        padding: 12px;
+      }
+
+      .invoice-shell {
+        padding: 20px;
+      }
+
+      .document-header,
+      .plan-row,
+      .footer {
+        flex-direction: column;
+      }
+
+      .document-title,
+      .plan-price-block {
+        text-align: right;
+      }
+
+      .summary-grid,
+      .content-grid,
+      .bottom-grid {
+        grid-template-columns: 1fr;
+      }
+
+      .summary-card {
+        border-left: 0;
+        border-bottom: 1px solid var(--line);
+      }
+
+      .summary-card:last-child {
+        border-bottom: 0;
+      }
+
+      .items {
+        display: block;
+        overflow-x: auto;
+      }
+    }
+
+    @media print {
+      body {
+        padding: 0;
+        background: #ffffff;
+      }
+
+      .invoice-shell {
+        max-width: none;
+        border: 0;
+        padding: 0;
+      }
+
+      @page {
+        size: A4;
+        margin: 14mm;
+      }
+    }
+  </style>
+</head>
+
+<body>
+  <main class="invoice-shell">
+    <header class="document-header">
+      <div class="brand">
+        {{#if platform.logo}}
+        <img src="{{platform.logo}}" alt="{{platform.name}}" class="brand-logo" />
+        {{/if}}
+        <div class="brand-meta">
+          <p class="eyebrow">بيان اشتراك</p>
+          <h2 class="brand-name">{{#if platform.name}}{{platform.name}}{{else}}منصة اشتراكات{{/if}}</h2>
+        </div>
+      </div>
+
+      <div class="document-title">
+        <h1>فاتورة اشتراك</h1>
+        <div class="document-id">رقم الفاتورة: {{#if invoice.id}}{{invoice.id}}{{else}}—{{/if}}</div>
+        <div class="status-badge">{{translateInvoiceStatus invoice.status}}</div>
+      </div>
+    </header>
+
+    <section class="summary-grid">
+      <div class="summary-card">
+        <span class="summary-label">تاريخ الإصدار</span>
+        <span class="summary-value">{{#if invoice.createdAt}}{{formatDate invoice.createdAt locale=locale}}{{else}}—{{/if}}</span>
+      </div>
+      <div class="summary-card">
+        <span class="summary-label">تاريخ الاستحقاق</span>
+        <span class="summary-value">{{#if invoice.dueDate}}{{formatDate invoice.dueDate locale=locale}}{{else}}—{{/if}}</span>
+      </div>
+      <div class="summary-card">
+        <span class="summary-label">تاريخ السداد</span>
+        <span class="summary-value">{{#if invoice.paidAt}}{{formatDate invoice.paidAt locale=locale}}{{else}}—{{/if}}</span>
+      </div>
+      <div class="summary-card">
+        <span class="summary-label">حالة الاشتراك</span>
+        <span class="summary-value">{{translateSubscriptionStatus subscription.status}}</span>
+      </div>
+    </section>
+
+    <section class="content-grid">
+      <section class="panel">
+        <h3 class="panel-title">بيانات المشترك</h3>
+        <div class="key-values">
+          {{#if subscriber.name}}
+          <div class="key">الاسم</div>
+          <div class="value">{{subscriber.name}}</div>
+          {{/if}}
+          {{#if subscriber.email}}
+          <div class="key">البريد الإلكتروني</div>
+          <div class="value">{{subscriber.email}}</div>
+          {{/if}}
+          {{#if subscriber.phone}}
+          <div class="key">الهاتف</div>
+          <div class="value">{{subscriber.phone}}</div>
+          {{/if}}
+          {{#if subscriber.address}}
+          <div class="key">العنوان</div>
+          <div class="value">{{subscriber.address}}</div>
+          {{/if}}
+          <div class="key">معرّف المشترك</div>
+          <div class="value mono">{{subscription.subscriberId}}</div>
+        </div>
+      </section>
+
+      <section class="panel">
+        <h3 class="panel-title">معلومات المنصة</h3>
+        <div class="key-values">
+          {{#if platform.name}}
+          <div class="key">الاسم</div>
+          <div class="value">{{platform.name}}</div>
+          {{/if}}
+          {{#if platform.website}}
+          <div class="key">الموقع</div>
+          <div class="value">{{platform.website}}</div>
+          {{/if}}
+          {{#if platform.supportEmail}}
+          <div class="key">الدعم</div>
+          <div class="value">{{platform.supportEmail}}</div>
+          {{/if}}
+          {{#if platform.address}}
+          <div class="key">العنوان</div>
+          <div class="value">{{platform.address}}</div>
+          {{/if}}
+        </div>
+      </section>
+    </section>
+
+    <section class="plan-panel">
+      <div class="plan-row">
+        <div>
+          <div class="plan-label">الخطة</div>
+          <h3 class="plan-name">{{plan.name}}</h3>
+          {{#if plan.description}}
+          <p class="plan-description">{{plan.description}}</p>
+          {{/if}}
+        </div>
+
+        <div class="plan-price-block">
+          <span class="plan-price">{{formatCurrency plan.price plan.currency locale=locale}}</span>
+          <span class="plan-interval">{{translateBillingInterval plan.interval plan.intervalCount}}</span>
+        </div>
+      </div>
+
+      <div class="period-banner">
+        <strong>فترة الاشتراك:</strong>
+        من {{formatDate subscription.currentPeriodStart locale=locale}}
+        إلى {{formatDate subscription.currentPeriodEnd locale=locale}}
+      </div>
+    </section>
+
+    {{#if invoice.lineItems.length}}
+    <section>
+      <h3 class="section-title">تفاصيل الفاتورة</h3>
+      <table class="items">
+        <thead>
+          <tr>
+            <th>البند</th>
+            <th class="num">الكمية</th>
+            <th class="num">سعر الوحدة</th>
+            <th class="num">الإجمالي</th>
+          </tr>
+        </thead>
+        <tbody>
+          {{#each invoice.lineItems}}
+          <tr>
+            <td>
+              <div class="item-name">{{this.description}}</div>
+            </td>
+            <td class="num">{{this.quantity}}</td>
+            <td class="num">{{formatCurrency this.unitPrice ../invoice.currency locale=../locale}}</td>
+            <td class="num">{{formatCurrency this.amount ../invoice.currency locale=../locale}}</td>
+          </tr>
+          {{/each}}
+        </tbody>
+      </table>
+    </section>
+    {{/if}}
+
+    <section class="bottom-grid">
+      <aside class="note-box">
+        <h3 class="note-title">ملاحظات</h3>
+        <div>
+          {{#if invoice.metadata.notes}}
+          {{invoice.metadata.notes}}
+          {{else}}
+          شكراً لاشتراكك معنا. في حال وجود أي استفسارات، يرجى التواصل مع فريق الدعم.
+          {{/if}}
+        </div>
+      </aside>
+
+      <aside class="totals-box">
+        {{#if invoice.lineItems.length}}
+        <div class="total-row">
+          <div>المجموع الفرعي</div>
+          <div class="num">{{formatCurrency invoice.amount invoice.currency locale=locale}}</div>
+        </div>
+        {{/if}}
+        <div class="total-row grand">
+          <div>الإجمالي</div>
+          <div class="num">{{formatCurrency invoice.amount invoice.currency locale=locale}}</div>
+        </div>
+      </aside>
+    </section>
+
+    <footer class="footer">
+      <div>
+        <strong>المنصة:</strong>
+        {{#if platform.website}}{{platform.website}}{{else}}www.example.com{{/if}}
+      </div>
+
+      {{#if platform.supportEmail}}
+      <div>
+        <strong>الدعم الفني:</strong>
+        {{platform.supportEmail}}
+      </div>
+      {{/if}}
+
+      <div>تم إنشاء هذه الفاتورة إلكترونياً ولا تحتاج إلى توقيع</div>
+    </footer>
+  </main>
+</body>
+
+</html>
+`;

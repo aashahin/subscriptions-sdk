@@ -292,6 +292,15 @@ This is a good pattern whenever you need:
 - response shapes tailored to a frontend dashboard
 - data combined from subscriptions and domain entities
 
+## 10. Other Adapters and Runtimes
+
+The backend pattern above uses Prisma + Moyasar + a custom Redis cache, but the same architecture works with the other shipped adapters:
+
+- **Database**: `drizzleAdapter` (`@abshahin/subscriptions/adapters/drizzle`) for D1, Turso, `bun:sqlite`, and other Drizzle drivers — see `adapters.md` and `drizzle-schema.md`.
+- **Cache**: `redisCacheAdapter`, `upstashCacheAdapter`, or `kvCacheAdapter` instead of a hand-rolled `CacheAdapter` — see `adapters.md`.
+- **Payments**: `stripeAdapter`, `paddleAdapter`, or `lemonSqueezyAdapter` as drop-in `payment` options — see `adapters.md`.
+- **HTTP layer**: `honoPlugin`, `createNextHandlers`, or the framework-neutral `createSubscriptionsHttpHandler` instead of the Elysia plugin — see `runtime-support.md` for per-runtime recipes.
+
 ## Checklist
 
 Before shipping your integration, verify the following:

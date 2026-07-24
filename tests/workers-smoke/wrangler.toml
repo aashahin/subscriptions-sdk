@@ -1,0 +1,10 @@
+# Wrangler config for the @abshahin/subscriptions Workers smoke test.
+# No real bindings are needed — the worker uses the in-memory database
+# adapter and a structurally-typed fake KV namespace, so `wrangler dev`
+# runs it with zero Cloudflare resources.
+name = "subscriptions-workers-smoke"
+main = "index.ts"
+compatibility_date = "2025-01-01"
+
+# Deliberately NO `nodejs_compat` flag: the smoke test proves the core
+# bundle runs on the pure Workers runtime without Node.js polyfills.

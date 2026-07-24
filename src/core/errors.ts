@@ -165,3 +165,42 @@ export class PaymentFailedError extends SubscriptionError {
     }
 }
 
+/**
+ * Coupon not found by code or ID
+ */
+export class CouponNotFoundError extends SubscriptionError {
+    constructor(
+        public readonly couponCode: string,
+    ) {
+        super(`Coupon not found: ${couponCode}`, 'COUPON_NOT_FOUND', 404);
+        this.name = 'CouponNotFoundError';
+    }
+}
+
+/**
+ * Coupon cannot be redeemed (expired, exhausted, or inactive)
+ */
+export class CouponInvalidError extends SubscriptionError {
+    constructor(
+        public readonly couponCode: string,
+        public readonly reason: 'expired' | 'exhausted' | 'inactive',
+    ) {
+        super(
+            `Coupon "${couponCode}" is not redeemable: ${reason}`,
+            'COUPON_INVALID',
+            400,
+        );
+        this.name = 'CouponInvalidError';
+    }
+}
+
+/**
+ * Invoice cannot be voided (or a credit note cannot be created for it)
+ */
+export class InvoiceVoidError extends SubscriptionError {
+    constructor(message: string) {
+        super(message, 'INVOICE_VOID', 400);
+        this.name = 'InvoiceVoidError';
+    }
+}
+

@@ -169,6 +169,92 @@ enum InvoiceStatus {
 - If you do not need tenant or user relations, you can adapt the schema, but you must also update or replace the Prisma adapter accordingly.
 - If you want truly user-scoped subscriptions, do not reuse this schema blindly. The current adapter implementation assumes a `tenantId`-based storage model.
 
+## Optional Billing Extensions
+
+The base schema above works without any changes: the Prisma adapter persists
+newer billing fields (plan price points, subscription `quantity`/`addOns`,
+invoice number/tax breakdown, credit note linkage) inside the existing `metadata`
+JSON columns under a reserved `_billing` key. The models below are **optional**
+upgrades that unlock first-class columns, coupons, and strictly sequential
+invoice numbering.
+
+### Coupon model (enables `CouponsService`)
+
+Without this model, the adapter omits the `coupons` section and
+`CouponsService` fails with a helpful setup error.
+
+```prisma
+model Coupon {
+  id    String @id @default(cuid(2))
+  code  String @unique
+  type  String // "percent" | "fixed"
+  value Decimal
+
+  currency String? // required for "fixed" coupons
+
+  duration         String @default("once") // "once" | "repeating" | "forever"
+  durationInMonths Int?
+
+  maxRedemptions Int?
+  expiresAt      DateTime?
+  isActive       Boolean  @default(true)
+  timesRedeemed  Int      @default(0)
+
+  metadata  Json?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("coupons")
+}
+```
+
+### BillingSequence model (strict invoice numbering)
+
+Enables atomic, gap-free `nextInvoiceNumber(prefix)` sequences. Without it,
+the adapter falls back to a count-based number that is **not**
+concurrency-safe.
+
+```prisma
+model BillingSequence {
+  prefix String @id // e.g. "INV-", "CN-"
+  value  Int    @default(0)
+
+  @@map("billing_sequences")
+}
+```
+
+### Optional dedicated columns
+
+When present, the adapter reads these columns preferentially over the
+`_billing` metadata fallback. Writes always go to metadata, so adding these
+columns is only useful for reporting/querying, not required for correctness.
+
+```prisma
+// On SubscriptionPlan: additional currency price points
+// ({ currency: string; amount: number }[])
+prices Json?
+
+// On Subscription
+quantity Int?
+addOns   Json? // string[]
+
+// On Invoice
+invoiceNumber  String?  @unique
+subtotal       Decimal?
+taxRate        Decimal?
+taxAmount      Decimal?
+discountAmount Decimal?
+total          Decimal?
+creditNoteOfId String?
+```
+
+### Migration Strategy for Existing Projects
+
+1. Add the `Coupon` and `BillingSequence` models (and any optional columns).
+2. Run `prisma migrate dev`.
+3. Regenerate the Prisma client so `prisma.coupon` and
+   `prisma.billingSequence` exist — the adapter detects them at runtime.
+
 ## Migration Strategy
 
 For a new project:

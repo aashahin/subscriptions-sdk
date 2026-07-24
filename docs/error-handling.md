@@ -36,6 +36,9 @@ import {
 | `InvalidPlanError`             | `INVALID_PLAN`              | 400    | Plan feature overrides failed validation                        |
 | `DuplicateSubscriptionError`   | `DUPLICATE_SUBSCRIPTION`    | 409    | Subscriber already has an active subscription                   |
 | `SubscriptionNotCanceledError` | `SUBSCRIPTION_NOT_CANCELED` | 400    | Resume or reactivate was called in the wrong state              |
+| `CouponNotFoundError`          | `COUPON_NOT_FOUND`          | 404    | Coupon code does not exist                                      |
+| `CouponInvalidError`           | `COUPON_INVALID`            | 400    | Coupon is inactive, expired, or exhausted (`reason` field)      |
+| `InvoiceVoidError`             | `INVOICE_VOID`              | 400    | Invoice cannot be voided or credited in its current state       |
 
 ## Recommended Pattern
 

@@ -1,6 +1,6 @@
 {
   "name": "@abshahin/subscriptions",
-  "version": "0.1.4",
+  "version": "0.2.0",
   "description": "Type-safe subscription plans, feature gates, usage limits, invoices, and Elysia integration for multi-tenant TypeScript applications.",
   "license": "MIT",
   "type": "module",
@@ -48,15 +48,83 @@
       "types": "./dist/adapters/moyasar.adapter.d.ts",
       "import": "./dist/adapters/moyasar.adapter.js"
     },
+    "./adapters/stripe": {
+      "types": "./dist/adapters/stripe.adapter.d.ts",
+      "import": "./dist/adapters/stripe.adapter.js"
+    },
+    "./adapters/paddle": {
+      "types": "./dist/adapters/paddle.adapter.d.ts",
+      "import": "./dist/adapters/paddle.adapter.js"
+    },
+    "./adapters/lemonsqueezy": {
+      "types": "./dist/adapters/lemonsqueezy.adapter.d.ts",
+      "import": "./dist/adapters/lemonsqueezy.adapter.js"
+    },
     "./adapters/cache": {
       "types": "./dist/adapters/cache.adapter.d.ts",
       "import": "./dist/adapters/cache.adapter.js"
+    },
+    "./adapters/redis": {
+      "types": "./dist/adapters/redis.adapter.d.ts",
+      "import": "./dist/adapters/redis.adapter.js"
+    },
+    "./adapters/upstash": {
+      "types": "./dist/adapters/upstash.adapter.d.ts",
+      "import": "./dist/adapters/upstash.adapter.js"
+    },
+    "./adapters/cloudflare-kv": {
+      "types": "./dist/adapters/cloudflare-kv.adapter.d.ts",
+      "import": "./dist/adapters/cloudflare-kv.adapter.js"
+    },
+    "./adapters/drizzle": {
+      "types": "./dist/adapters/drizzle.adapter.d.ts",
+      "import": "./dist/adapters/drizzle.adapter.js"
+    },
+    "./integrations/http": {
+      "types": "./dist/integrations/http.d.ts",
+      "import": "./dist/integrations/http.js"
+    },
+    "./integrations/hono": {
+      "types": "./dist/integrations/hono.d.ts",
+      "import": "./dist/integrations/hono.js"
+    },
+    "./integrations/next": {
+      "types": "./dist/integrations/next.d.ts",
+      "import": "./dist/integrations/next.js"
+    },
+    "./pdf/puppeteer": {
+      "types": "./dist/pdf/puppeteer.d.ts",
+      "import": "./dist/pdf/puppeteer.js"
+    },
+    "./pdf/cloudflare": {
+      "types": "./dist/pdf/cloudflare.d.ts",
+      "import": "./dist/pdf/cloudflare.js"
+    },
+    "./templates/invoice-utils": {
+      "types": "./dist/templates/invoice-utils.d.ts",
+      "import": "./dist/templates/invoice-utils.js"
+    },
+    "./testing": {
+      "types": "./dist/testing/index.d.ts",
+      "import": "./dist/testing/index.js"
+    },
+    "./audit": {
+      "types": "./dist/audit/index.d.ts",
+      "import": "./dist/audit/index.js"
+    },
+    "./core/events": {
+      "types": "./dist/core/events.d.ts",
+      "import": "./dist/core/events.js"
     }
   },
   "peerDependencies": {
     "elysia": "^1.4.22",
-    "@prisma/client": "^7.3.0",
-    "puppeteer-html-pdf": "^4.0.8"
+    "@prisma/client": "^7.8.0",
+    "puppeteer-html-pdf": "^4.0.8",
+    "ioredis": "^5",
+    "drizzle-orm": "^0.44.0",
+    "@cloudflare/puppeteer": "^1",
+    "hono": "^4"
   },
   "peerDependenciesMeta": {
     "elysia": {
@@ -67,21 +135,40 @@
     },
     "puppeteer-html-pdf": {
       "optional": true
+    },
+    "ioredis": {
+      "optional": true
+    },
+    "drizzle-orm": {
+      "optional": true
+    },
+    "@cloudflare/puppeteer": {
+      "optional": true
+    },
+    "hono": {
+      "optional": true
     }
   },
   "dependencies": {
-    "@sinclair/typebox": "^0.34.48",
-    "handlebars": "^4.7.8"
+    "@sinclair/typebox": "^0.34.52",
+    "handlebars": "^4.7.9"
   },
   "devDependencies": {
-    "@types/node": "^22.0.0",
-    "elysia": "^1.4.22",
-    "typescript": "^5.7.0"
+    "@arethetypeswrong/cli": "^0.18.5",
+    "@types/node": "^22.20.1",
+    "drizzle-orm": "^0.44.0",
+    "elysia": "^1.4.29",
+    "esbuild": "^0.28.1",
+    "publint": "^0.3.22",
+    "tsdown": "^0.22.14",
+    "typescript": "^5.9.3"
   },
   "scripts": {
-    "build": "tsc -p tsconfig.build.json && mkdir -p dist/templates && cp src/templates/subscription-invoice.hbs dist/templates/subscription-invoice.hbs",
+    "build": "tsdown",
     "prepare": "bun run build",
+    "test": "bun test",
     "test:invoices": "bun tests/generate-test-invoices.ts",
-    "typecheck": "tsc --noEmit -p tsconfig.json"
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "check:package": "publint && attw --pack . --ignore-rules no-resolution --ignore-rules cjs-resolves-to-esm"
   }
 }

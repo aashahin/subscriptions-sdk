@@ -11,7 +11,8 @@ import {
 import type { FeatureRegistry } from "../core/types.js";
 import type { Subscriptions } from "../index.js";
 import {
-  generateSubscriptionInvoicePdf,
+  renderSubscriptionInvoice,
+  wrapInvoiceForPrint,
   type SubscriptionInvoiceData,
 } from "../templates/invoice-utils.js";
 
@@ -67,13 +68,36 @@ export interface ElysiaPluginOptions<
 
   /**
    * Invoice configuration for PDF/HTML generation
+   *
+   * The download route (`GET /invoices/:id/download`) supports two modes via
+   * the `format` query param:
+   * - `format=pdf` (default) — server-generated PDF. Uses `pdfRenderer` when
+   *   configured (any runtime), otherwise falls back to the Node.js puppeteer
+   *   renderer.
+   * - `format=html` — printable invoice HTML; add `print=1` for a print-ready
+   *   page and `autoPrint=1` to open the browser print dialog on load
+   *   (client-side "Save as PDF", zero server cost).
    */
   invoice?: {
     /**
-     * Path to custom Handlebars template
-     * Defaults to built-in subscription-invoice.hbs
+     * Path to custom Handlebars template (Node.js filesystem only).
+     * Prefer `templateSource` on non-Node runtimes. Defaults to the built-in
+     * inlined template, which needs no filesystem at all.
      */
     templatePath?: string;
+
+    /**
+     * Inline Handlebars template source. Runtime-agnostic alternative to
+     * `templatePath`; takes precedence when both are set.
+     */
+    templateSource?: string;
+
+    /**
+     * PDF renderer for `format=pdf` (e.g. `puppeteerPdfRenderer` on Node,
+     * `cloudflarePdfRenderer` on Workers). When omitted, the legacy Node.js
+     * puppeteer path is used.
+     */
+    pdfRenderer?: import("../templates/pdf-renderer.js").PdfRenderer;
 
     /**
      * Platform information for invoice header
@@ -400,7 +424,7 @@ export function elysiaPlugin<
       return { invoices };
     })
 
-    // Download invoice as HTML
+    // Download invoice as PDF (default) or printable HTML (?format=html&print=1)
     .get("/invoices/:id/download", async (ctx) => {
       const subscriberId = await requireSubscriberId(ctx);
       const { id } = ctx.params;
@@ -472,22 +496,45 @@ export function elysiaPlugin<
         locale: options?.invoice?.locale ?? "ar-EG",
       };
 
-      // Resolve template path
-      const templatePath =
-        options?.invoice?.templatePath ??
-        new URL("../templates/subscription-invoice.hbs", import.meta.url)
-          .pathname;
+      // Output modes: server-generated PDF (default) or printable HTML for
+      // client-side printing (zero server cost).
+      const { query } = ctx;
+      const format = query["format"] ?? "pdf";
+      const autoPrint = query["autoPrint"] === "1";
+      const print = autoPrint || query["print"] === "1";
 
-      // Generate PDF
-      const pdfBuffer = await generateSubscriptionInvoicePdf(
-        templatePath,
-        invoiceData,
-      );
-      const pdfBytes = new Uint8Array(pdfBuffer.byteLength);
-      pdfBytes.set(pdfBuffer);
+      // Resolve the template: explicit source > explicit path > built-in
+      // inlined template (no filesystem, edge-safe).
+      const renderSource = options?.invoice?.templateSource
+        ? { templateSource: options.invoice.templateSource }
+        : options?.invoice?.templatePath
+          ? { templatePath: options.invoice.templatePath }
+          : undefined;
 
-      // Return PDF Response
-      return new Response(pdfBytes.buffer, {
+      // Render the invoice HTML once; both modes build on it.
+      const html = await renderSubscriptionInvoice(renderSource, invoiceData);
+
+      if (format === "html") {
+        const body = print
+          ? wrapInvoiceForPrint(html, { autoPrint })
+          : html;
+        return new Response(body, {
+          headers: { "Content-Type": "text/html; charset=utf-8" },
+        });
+      }
+
+      // PDF mode: use the configured renderer (any runtime) or fall back to
+      // the legacy Node.js puppeteer renderer — either way the HTML rendered
+      // above is converted directly (no second render pass).
+      const renderer =
+        options?.invoice?.pdfRenderer ??
+        (await import("../pdf/puppeteer.js")).puppeteerPdfRenderer();
+      const pdfBytes = await renderer.render(html);
+
+      // Copy into a fresh ArrayBuffer-backed view for the Response body
+      const bytes = new Uint8Array(pdfBytes.byteLength);
+      bytes.set(pdfBytes);
+      return new Response(bytes.buffer, {
         headers: {
           "Content-Type": "application/pdf",
           "Content-Disposition": `inline; filename="invoice-${invoice.id}.pdf"`,

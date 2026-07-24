@@ -2,7 +2,7 @@
 //
 // This package is an OPTIONAL peer dependency used only for Node.js invoice PDF
 // generation. It ships no TypeScript types, so without this declaration the
-// dynamic `import("puppeteer-html-pdf")` in `templates/invoice-utils.ts` breaks
+// dynamic `import("puppeteer-html-pdf")` in `pdf/puppeteer.ts` breaks
 // `tsc` for every consumer that hasn't installed the (heavy) puppeteer dep.
 //
 // Declaring it here keeps the build self-contained while still resolving the

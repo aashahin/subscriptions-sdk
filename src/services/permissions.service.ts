@@ -15,6 +15,7 @@ import {
   resolveFeatures,
 } from "../core/features.js";
 import type {
+  FeatureDefinition,
   FeatureRegistry,
   FeatureValues,
   SubscriptionWithPlan,
@@ -22,6 +23,18 @@ import type {
 } from "../core/types.js";
 
 const UNLIMITED = -1;
+
+/**
+ * Check if a feature is a metered feature.
+ *
+ * Metered features behave like `limit` features for usage reporting, but
+ * never block on overage: `canUse()` always returns true and `use()` never
+ * throws. `unlimited` is always false and `remaining` may go negative so
+ * callers can bill for the overage.
+ */
+function isMeteredFeature(definition: FeatureDefinition): boolean {
+  return definition.type === "metered";
+}
 
 export interface PermissionsServiceOptions {
   /**
@@ -66,6 +79,12 @@ export class PermissionsService<TFeatures extends FeatureRegistry> {
     }
 
     if (!isBooleanFeature(definition)) {
+      // Metered features never block — access is always allowed and overage
+      // is reported (and billed) instead of rejected.
+      if (isMeteredFeature(definition)) {
+        return true;
+      }
+
       // For limit/rate features, check if they have any remaining
       const status = await this.remaining(subscriberId, feature);
       return status.remaining > 0 || status.unlimited;
@@ -97,8 +116,15 @@ export class PermissionsService<TFeatures extends FeatureRegistry> {
     const featureValues = await this.getFeatures(subscriberId);
     const limit = featureValues[feature] as number;
     const used = await this.db.usage.get(subscriberId, feature as string);
-    const unlimited = limit === UNLIMITED;
-    const remaining = unlimited ? Infinity : Math.max(0, limit - used);
+    const metered = isMeteredFeature(definition);
+    // Metered features are never unlimited and never clamped: `remaining`
+    // may go negative so callers can measure (and bill) the overage.
+    const unlimited = !metered && limit === UNLIMITED;
+    const remaining = unlimited
+      ? Infinity
+      : metered
+        ? limit - used
+        : Math.max(0, limit - used);
     const percentage = unlimited
       ? 0
       : limit > 0
@@ -117,12 +143,19 @@ export class PermissionsService<TFeatures extends FeatureRegistry> {
 
   /**
    * Check if subscriber can use more of a limited feature
+   *
+   * Always returns true for metered features — they never block on overage.
    */
   async canUse<K extends keyof TFeatures>(
     subscriberId: string,
     feature: K,
     count: number = 1,
   ): Promise<boolean> {
+    const definition = this.features[feature];
+    if (definition && isMeteredFeature(definition)) {
+      return true;
+    }
+
     const status = await this.remaining(subscriberId, feature);
     return status.unlimited || status.remaining >= count;
   }
@@ -163,8 +196,12 @@ export class PermissionsService<TFeatures extends FeatureRegistry> {
       const featureValues = await this.getFeatures(subscriberId);
       const limit = featureValues[feature] as number;
       const unlimited = limit === UNLIMITED;
+      // Metered features never block: usage is recorded and reported (with
+      // possibly negative `remaining`) but the limit is never enforced.
+      const definition = this.features[feature];
+      const metered = definition !== undefined && isMeteredFeature(definition);
 
-      if (!unlimited && newCount > limit) {
+      if (!metered && !unlimited && newCount > limit) {
         await rollbackIncrement();
         throw new UsageLimitExceededError(
           feature as string,
@@ -324,7 +361,7 @@ export class PermissionsService<TFeatures extends FeatureRegistry> {
 
     for (const feature of Object.keys(this.features)) {
       const definition = this.features[feature];
-      if (definition && isLimitFeature(definition)) {
+      if (definition && (isLimitFeature(definition) || isMeteredFeature(definition))) {
         result[feature] = await this.remaining(
           subscriberId,
           feature as keyof TFeatures,
