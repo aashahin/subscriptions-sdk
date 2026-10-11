@@ -8,7 +8,6 @@ import type {
   CheckoutSession,
   CreateCheckoutInput,
   CreateCustomerInput,
-  CreateGatewaySubscriptionInput,
   GatewayCustomer,
   GatewaySubscription,
   PaymentGatewayAdapter,
@@ -343,6 +342,7 @@ class PaddleClient {
     params: {
       priceId?: string;
       customData?: Record<string, string>;
+      clearScheduledChange?: boolean;
     },
   ): Promise<PaddleSubscription> {
     return this.request<PaddleSubscription>("PATCH", `/subscriptions/${id}`, {
@@ -351,6 +351,7 @@ class PaddleClient {
         proration_billing_mode: "prorated_immediately",
       }),
       ...(params.customData && { custom_data: params.customData }),
+      ...(params.clearScheduledChange && { scheduled_change: null }),
     });
   }
 
@@ -387,40 +388,6 @@ class PaddleClient {
     );
   }
 
-  async chargeSubscription(
-    id: string,
-    params: {
-      amount: number;
-      currency: string;
-      description?: string;
-    },
-  ): Promise<PaddleTransaction> {
-    return this.request<PaddleTransaction>(
-      "POST",
-      `/subscriptions/${id}/charge`,
-      {
-        effective_from: "immediately",
-        items: [
-          {
-            quantity: 1,
-            price: {
-              name: params.description ?? "One-off charge",
-              unit_price: {
-                // Paddle amounts are strings in the lowest currency denomination
-                amount: String(params.amount),
-                currency_code: params.currency,
-              },
-              product: {
-                name: params.description ?? "One-off charge",
-                tax_category: "standard",
-              },
-            },
-          },
-        ],
-      },
-    );
-  }
-
   // Transactions
   async createTransaction(params: {
     customerId?: string;
@@ -436,6 +403,7 @@ class PaddleClient {
       : {
           quantity: 1,
           price: {
+            description: params.description ?? "One-off charge",
             name: params.description ?? "One-off charge",
             unit_price: {
               amount: String(params.amount ?? 0),
@@ -512,32 +480,34 @@ function mapSubscription(subscription: PaddleSubscription): GatewaySubscription 
   };
 }
 
+/** Keep only flat scalar custom data in the normalized metadata contract. */
+function flatMetadata(value: unknown): Record<string, string> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+  return Object.fromEntries(Object.entries(value).filter(([, v]) => ["string", "number", "boolean"].includes(typeof v)).map(([k, v]) => [k, String(v)]));
+}
+
 /** Maximum age of a webhook timestamp before it is rejected (5 minutes) */
 const WEBHOOK_TOLERANCE_SECONDS = 5 * 60;
 
 /**
- * Parse the Paddle-Signature header (`ts=...,h1=...`).
+ * Parse the Paddle-Signature header (`ts=...;h1=...`).
  */
 function parseSignatureHeader(header: string): {
-  timestamp: number;
-  signature: string;
+  timestamp: string;
+  signatures: string[];
 } | null {
-  const parts: Record<string, string> = {};
-  for (const pair of header.split(",")) {
-    const [key, ...rest] = pair.split("=");
-    if (key && rest.length > 0) {
-      parts[key.trim()] = rest.join("=").trim();
-    }
+  let timestamp: string | undefined;
+  const signatures: string[] = [];
+  // Paddle uses semicolons and may include multiple h1 signatures during rotation.
+  for (const pair of header.split(/[;,]/)) {
+    const [key, value] = pair.trim().split("=", 2);
+    if (key === "ts") timestamp = value;
+    if (key === "h1" && value) signatures.push(value);
   }
-
-  const timestamp = Number(parts["ts"]);
-  const signature = parts["h1"];
-
-  if (!Number.isFinite(timestamp) || !signature) {
+  if (!timestamp || !/^\d+$/.test(timestamp) || !Number.isSafeInteger(Number(timestamp)) || !signatures.length) {
     return null;
   }
-
-  return { timestamp, signature };
+  return { timestamp, signatures };
 }
 
 /**
@@ -548,7 +518,7 @@ function parseSignatureHeader(header: string): {
  * tolerance guards against replay attacks.
  */
 async function verifySignature(
-  payload: string,
+  payload: string | Uint8Array,
   signatureHeader: string,
   webhookSecret: string,
 ): Promise<{ valid: boolean; error?: string }> {
@@ -560,45 +530,26 @@ async function verifySignature(
   // Reject stale timestamps to prevent replay attacks
   const nowSeconds = Math.floor(Date.now() / 1000);
   if (
-    Math.abs(nowSeconds - parsed.timestamp) > WEBHOOK_TOLERANCE_SECONDS
+    Math.abs(nowSeconds - Number(parsed.timestamp)) > WEBHOOK_TOLERANCE_SECONDS
   ) {
     return { valid: false, error: "Webhook timestamp outside tolerance" };
   }
 
-  const normalizedSignature = parsed.signature.toLowerCase();
-  if (
-    normalizedSignature.length === 0 ||
-    normalizedSignature.length % 2 !== 0 ||
-    !/^[0-9a-f]+$/.test(normalizedSignature)
-  ) {
-    return { valid: false, error: "Malformed signature value" };
-  }
-
   const encoder = new TextEncoder();
   const key = await crypto.subtle.importKey(
-    "raw",
-    encoder.encode(webhookSecret),
-    { name: "HMAC", hash: "SHA-256" },
-    false,
-    ["verify"],
+    "raw", encoder.encode(webhookSecret), { name: "HMAC", hash: "SHA-256" }, false, ["verify"],
   );
-
-  // Decode the hex signature to bytes for timing-safe comparison
-  const signatureBytes = new Uint8Array(
-    (normalizedSignature.match(/.{1,2}/g) ?? []).map((byte) =>
-      parseInt(byte, 16),
-    ),
-  );
-
-  // crypto.subtle.verify performs a constant-time comparison internally
-  const valid = await crypto.subtle.verify(
-    "HMAC",
-    key,
-    signatureBytes,
-    encoder.encode(`${parsed.timestamp}:${payload}`),
-  );
-
-  return valid ? { valid: true } : { valid: false, error: "Invalid webhook signature" };
+  const rawBytes = typeof payload === "string" ? encoder.encode(payload) : payload;
+  const prefix = encoder.encode(`${parsed.timestamp}:`);
+  const signedBytes = new Uint8Array(prefix.length + rawBytes.length);
+  signedBytes.set(prefix);
+  signedBytes.set(rawBytes, prefix.length);
+  for (const signature of parsed.signatures) {
+    if (!/^[a-f0-9]{64}$/i.test(signature)) continue;
+    const signatureBytes = new Uint8Array(signature.match(/.{2}/g)!.map(byte => parseInt(byte, 16)));
+    if (await crypto.subtle.verify("HMAC", key, signatureBytes, signedBytes)) return { valid: true };
+  }
+  return { valid: false, error: "Invalid webhook signature" };
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -634,6 +585,10 @@ export function paddleAdapter(config: PaddleConfig): PaymentGatewayAdapter {
 
   return {
     provider: "paddle",
+    capabilities: {
+      customers: true, nativeSubscriptions: true, checkout: "hosted", portal: true,
+      directPayments: false, paymentLookup: false, idempotentCharges: false,
+    },
 
     // ==================== Customer Management ====================
 
@@ -650,8 +605,9 @@ export function paddleAdapter(config: PaddleConfig): PaymentGatewayAdapter {
       try {
         const customer = await client.getCustomer(customerId);
         return mapCustomer(customer);
-      } catch {
-        return null;
+      } catch (error) {
+        if (error instanceof PaddleAdapterError && error.httpStatus === 404) return null;
+        throw error;
       }
     },
 
@@ -669,28 +625,15 @@ export function paddleAdapter(config: PaddleConfig): PaymentGatewayAdapter {
 
     // ==================== Subscription Management ====================
 
-    async createSubscription(
-      data: CreateGatewaySubscriptionInput,
-    ): Promise<GatewaySubscription> {
-      // Paddle Billing has no server-side "create subscription" endpoint —
-      // subscriptions are created when a customer completes checkout for a
-      // recurring price. Use createCheckoutSession() and handle the
-      // `subscription.created` webhook instead.
-      throw new PaddleAdapterError(
-        "Paddle does not support creating subscriptions server-side. " +
-          "Use createCheckoutSession() and handle the subscription.created webhook.",
-        "UNSUPPORTED_OPERATION",
-      );
-    },
-
     async getSubscription(
       subscriptionId: string,
     ): Promise<GatewaySubscription | null> {
       try {
         const subscription = await client.getSubscription(subscriptionId);
         return mapSubscription(subscription);
-      } catch {
-        return null;
+      } catch (error) {
+        if (error instanceof PaddleAdapterError && error.httpStatus === 404) return null;
+        throw error;
       }
     },
 
@@ -710,6 +653,7 @@ export function paddleAdapter(config: PaddleConfig): PaymentGatewayAdapter {
       const subscription = await client.updateSubscription(subscriptionId, {
         ...(data.priceId && { priceId: data.priceId }),
         ...(data.metadata && { customData: data.metadata }),
+        ...(data.cancelAtPeriodEnd === false && { clearScheduledChange: true }),
       });
       return mapSubscription(subscription);
     },
@@ -744,17 +688,15 @@ export function paddleAdapter(config: PaddleConfig): PaymentGatewayAdapter {
     async createCheckoutSession(
       data: CreateCheckoutInput,
     ): Promise<CheckoutSession> {
+      if (data.trialDays !== undefined) {
+        throw new PaddleAdapterError("Paddle trials must be configured on the recurring price; per-checkout trialDays overrides are unsupported", "UNSUPPORTED_OPERATION");
+      }
       // A transaction created with a price gets a hosted checkout URL
       const transaction = await client.createTransaction({
         ...(data.customerId && { customerId: data.customerId }),
         priceId: data.priceId,
         successUrl: data.successUrl,
-        customData: {
-          ...(data.metadata ?? {}),
-          ...(data.trialDays !== undefined && {
-            trialDays: String(data.trialDays),
-          }),
-        },
+        ...(data.metadata && { customData: data.metadata }),
       });
 
       const checkoutUrl = transaction.checkout?.url;
@@ -765,15 +707,9 @@ export function paddleAdapter(config: PaddleConfig): PaymentGatewayAdapter {
         );
       }
 
-      // Paddle doesn't expose a checkout expiry; hosted checkouts are
-      // effectively valid for 24 hours
-      const expiresAt = new Date();
-      expiresAt.setHours(expiresAt.getHours() + 24);
-
       return {
         id: transaction.id,
         url: checkoutUrl,
-        expiresAt,
       };
     },
 
@@ -795,85 +731,86 @@ export function paddleAdapter(config: PaddleConfig): PaymentGatewayAdapter {
     async constructWebhookEvent(
       payload: string | Uint8Array,
       signature: string,
+      context?: { headers: Record<string, string> },
     ): Promise<WebhookEvent> {
       const payloadStr =
         typeof payload === "string" ? payload : new TextDecoder().decode(payload);
 
-      // Fail CLOSED: when a secret is configured we require a valid signature.
-      // A missing/empty signature must be rejected rather than silently
-      // accepted, otherwise an attacker could bypass verification by simply
-      // omitting the header.
-      if (config.webhookSecret) {
-        if (!signature) {
-          throw new PaddleAdapterError(
-            "Missing webhook signature",
-            "WEBHOOK_SIGNATURE_MISSING",
-          );
-        }
-        const result = await verifySignature(
-          payloadStr,
-          signature,
-          config.webhookSecret,
-        );
-        if (!result.valid) {
-          throw new PaddleAdapterError(
-            result.error ?? "Invalid webhook signature",
-            "WEBHOOK_SIGNATURE_INVALID",
-          );
-        }
-      } else {
-        console.warn(
-          "[Paddle] WARNING: No webhookSecret configured. Webhook payloads are accepted without signature verification. " +
-            "Set webhookSecret in PaddleConfig to enable verification.",
-        );
+      if (!config.webhookSecret) {
+        throw new PaddleAdapterError("webhookSecret is required to verify Paddle webhooks", "WEBHOOK_SECRET_MISSING");
       }
+      const signatureHeader = signature || Object.entries(context?.headers ?? {}).find(([name]) => name.toLowerCase() === "paddle-signature")?.[1];
+      if (!signatureHeader) throw new PaddleAdapterError("Missing webhook signature", "WEBHOOK_SIGNATURE_MISSING");
+      const result = await verifySignature(payload, signatureHeader, config.webhookSecret);
+      if (!result.valid) throw new PaddleAdapterError(result.error ?? "Invalid webhook signature", "WEBHOOK_SIGNATURE_INVALID");
 
-      const webhookData = JSON.parse(payloadStr) as PaddleWebhookPayload;
-
+      let webhook: PaddleWebhookPayload;
+      try {
+        webhook = JSON.parse(payloadStr) as PaddleWebhookPayload;
+      } catch {
+        throw new PaddleAdapterError("Invalid webhook JSON", "WEBHOOK_PAYLOAD_INVALID");
+      }
+      if (!webhook || typeof webhook.event_id !== "string" || !webhook.event_id || typeof webhook.event_type !== "string" ||
+          !webhook.data || typeof webhook.data !== "object" || Array.isArray(webhook.data) ||
+          typeof webhook.occurred_at !== "string" || !Number.isFinite(Date.parse(webhook.occurred_at))) {
+        throw new PaddleAdapterError("Invalid Paddle webhook payload", "WEBHOOK_PAYLOAD_INVALID");
+      }
+      const data = webhook.data;
+      const metadata = flatMetadata(data.custom_data);
+      if (data.origin === "subscription_recurring") metadata.type = "subscription_renewal";
+      const period = (data.billing_period ?? data.current_billing_period) as Record<string, unknown> | null;
+      let type = webhook.event_type;
+      if (type === "transaction.completed" && data.status === "completed") type = "payment.paid";
+      else if (type === "transaction.payment_failed") type = "payment.failed";
+      else if (type === "subscription.canceled") type = "customer.subscription.deleted";
+      else if (type === "subscription.created") type = "customer.subscription.created";
+      else if (type.startsWith("subscription.")) type = "customer.subscription.updated";
+      const settlement = type === "payment.paid" || type === "payment.failed";
+      const total = (data.details as { totals?: { total?: unknown } } | undefined)?.totals?.total;
+      const amount = typeof total === "string" && /^\d+$/.test(total) ? Number(total) : undefined;
+      if (settlement && (typeof data.id !== "string" || !data.id || !Number.isSafeInteger(amount) || typeof data.currency_code !== "string")) {
+        throw new PaddleAdapterError("Invalid Paddle transaction settlement", "WEBHOOK_PAYLOAD_INVALID");
+      }
       return {
-        id: webhookData.event_id,
-        type: webhookData.event_type,
-        data: webhookData.data,
-        createdAt: new Date(webhookData.occurred_at),
+        id: webhook.event_id,
+        type,
+        originalType: webhook.event_type,
+        environment: config.environment === "sandbox" ? "test" : "live",
+        data: {
+          ...data,
+          metadata,
+          ...(settlement && { paymentId: data.id, amount, currency: data.currency_code }),
+          ...(typeof data.subscription_id === "string" && { subscriptionId: data.subscription_id }),
+          ...(type.startsWith("customer.subscription.") && { subscriptionId: data.id }),
+          ...(typeof period?.starts_at === "string" && { currentPeriodStart: period.starts_at }),
+          ...(typeof period?.ends_at === "string" && { currentPeriodEnd: period.ends_at }),
+          environment: config.environment === "sandbox" ? "test" : "live",
+        },
+        createdAt: new Date(webhook.occurred_at),
       };
     },
 
     // ==================== Direct Payment ====================
 
-    /**
-     * Charge a one-off payment.
-     *
-     * **Limitations** (Paddle Billing has no generic off-session charge API):
-     *
-     * - If `customerId` is a Paddle subscription ID (`sub_...`), the saved
-     *   payment method of that subscription is charged immediately via the
-     *   one-off charge endpoint (`POST /subscriptions/{id}/charge`). This is
-     *   the only true off-session charge Paddle supports.
-     * - Otherwise a one-off transaction is created for the customer. Paddle
-     *   does NOT capture it automatically — the customer must complete the
-     *   hosted checkout. The result is returned as `pending` with
-     *   `verificationUrl` set to the checkout URL; a `transaction.completed`
-     *   webhook confirms the payment.
+    /** Create a hosted one-off transaction; settlement arrives via a webhook.
+     * This operation cannot collect a saved customer payment method directly.
      */
     async chargePayment(data: ChargePaymentInput) {
       try {
-        const isSubscriptionId = data.customerId.startsWith("sub_");
-
-        const transaction = isSubscriptionId
-          ? await client.chargeSubscription(data.customerId, {
-              amount: data.amount,
-              currency: data.currency,
-              ...(data.description && { description: data.description }),
-            })
-          : await client.createTransaction({
-              customerId: data.customerId,
-              amount: data.amount,
-              currency: data.currency,
-              ...(data.description && { description: data.description }),
-              ...(data.callbackUrl && { successUrl: data.callbackUrl }),
-              ...(data.metadata && { customData: data.metadata }),
-            });
-
+        if (data.customerId.startsWith("sub_")) {
+          throw new PaddleAdapterError(
+            "Paddle subscription charges cannot provide a correlated payment result. Use provider-managed billing and verified transaction webhooks.",
+            "UNSUPPORTED_OPERATION",
+          );
+        }
+        const transaction = await client.createTransaction({
+          customerId: data.customerId,
+          amount: data.amount,
+          currency: data.currency,
+          ...(data.description && { description: data.description }),
+          ...(data.callbackUrl && { successUrl: data.callbackUrl }),
+          ...(data.metadata && { customData: data.metadata }),
+        });
         // Map Paddle transaction status to our status
         let status: "paid" | "pending" | "failed";
         if (
@@ -888,9 +825,11 @@ export function paddleAdapter(config: PaddleConfig): PaymentGatewayAdapter {
           status = "pending";
         }
 
-        const amount = transaction.details?.totals.total
-          ? Number(transaction.details.totals.total)
-          : data.amount;
+        const total = transaction.details?.totals.total;
+        if (status === "paid" && (typeof total !== "string" || !/^\d+$/.test(total) || !Number.isSafeInteger(Number(total)))) {
+          throw new PaddleAdapterError("Paddle response does not prove the settled amount", "INVALID_RESPONSE");
+        }
+        const amount = total ? Number(total) : data.amount;
 
         if (status === "failed") {
           return {
@@ -919,7 +858,7 @@ export function paddleAdapter(config: PaddleConfig): PaymentGatewayAdapter {
         if (error instanceof PaddleAdapterError) {
           return {
             id: "",
-            status: "failed" as const,
+            status: (error.code === "NETWORK_ERROR" || error.code === "INVALID_RESPONSE" || (error.httpStatus ?? 0) >= 500 ? "unknown" : "failed") as "unknown" | "failed",
             amount: data.amount,
             currency: data.currency,
             errorMessage: error.userMessage ?? error.message,
@@ -935,7 +874,7 @@ export function paddleAdapter(config: PaddleConfig): PaymentGatewayAdapter {
           error instanceof Error ? error.message : "Payment failed";
         return {
           id: "",
-          status: "failed" as const,
+          status: "unknown" as const,
           amount: data.amount,
           currency: data.currency,
           errorMessage,
@@ -948,8 +887,7 @@ export function paddleAdapter(config: PaddleConfig): PaymentGatewayAdapter {
 
     /**
      * Paddle Billing does not expose reusable payment tokens — saved payment
-     * methods are always scoped to a subscription. Always returns null;
-     * use the subscription ID for renewal charges instead (see chargePayment).
+     * methods are always scoped to a subscription. Always returns null.
      */
     async getPaymentSource(_paymentId: string): Promise<string | null> {
       return null;

@@ -2,7 +2,21 @@
 
 This guide covers the invoicing and pricing features: invoice numbering, tax handling, credit notes, multi-currency price points, metered billing, and the per-seat/add-on data fields.
 
-All amounts are stored in major/display units (e.g. `49` = 49 USD), consistently across the service layer, integrations, and invoice rendering.
+Plan and invoice amounts use major/display units (e.g. `49` = 49 USD). Payment adapter charge amounts and preview `amountDue` use integer minor units. Currency precision follows ISO currency data: JPY has zero fractional digits, USD/SAR two, and KWD three. Do not convert a preview by dividing every currency by `100`; `amountDueFormatted` already contains its major-unit value.
+
+## Plan Changes and Billing Anchors
+
+Preview and execution use the same billing policy. For a settled paid subscription inside its current period, an immediate prorated upgrade charges the remaining-period price difference and preserves `currentPeriodStart` and `currentPeriodEnd`. Credit uses the immutable settled price for that period, so editing the plan catalog does not change credit already purchased. A trial, free plan, complimentary entitlement, unsettled manual invoice, or expired paid period supplies no paid credit: moving immediately to a paid plan requires the full target price and starts a new period. Disabling proration also charges a full target period and starts that period when the change becomes effective.
+
+A deferred change (`immediately: false`) costs zero now and takes effect at the next settled renewal once the current period ends. A failed renewal does not grant the target plan. It does not collect unused-period upgrade money. Downgrades default to deferred changes; the SDK does not automatically refund a voluntary immediate downgrade.
+
+Plan changes require matching currency, billing interval, and interval count. Cross-currency or monthly/yearly migrations need an explicit separate migration policy and are rejected by this API. Additional market price points do not imply currency conversion or change the subscription's selected canonical price.
+
+Preview returns a persisted `quoteId`; submit that ID when confirming the purchase. The quote binds the subscriber's subscription state, target price identity, payable amount, currency, and effective periods. Quotes expire after at most five minutes, or sooner at a period boundary. A stale quote or changed subscription/price requires another preview and confirmation. Public payment references and token-verification assertions do not establish settlement.
+
+Settlements persist the current period's `metadata.paidPrice` snapshot. Legacy paid subscriptions need this field backfilled from verified historical settlement and price records before receiving proration credit; the SDK fails closed when the required evidence is absent. Do not substitute today's mutable catalog price or treat an open invoice as proof of payment. Provider ownership and payment method mappings require their own explicit migration, described in the audit remediation record.
+
+SDK calendar periods use UTC. A month-end anchor remains at month end, so January 31 renews on February 28 (February 29 in a leap year). Other days clamp to the destination month's last day; preserve the original calendar anchor across renewals to retain January 30 after a short February. Provider-managed integrations must supply authoritative verified provider periods; the SDK does not extend those periods from local processing time and cannot collect them through local renewal/dunning. Complete provider-managed purchase and renewal synchronization remains unsupported until the owning provider integration is implemented.
 
 ## Invoice Numbering
 
@@ -99,18 +113,18 @@ Invoice rendering uses the locale-aware `formatCurrency` helper for whichever cu
 
 ## Metered Features
 
-The `metered` feature type tracks usage without blocking on overage: `canUse()` always returns true, `use()` never throws, and `remaining` may go negative so you can bill for the overage. (`limit` features, by contrast, throw when the limit is exceeded.)
+The `metered` feature type permits overage for an eligible subscription: `remaining` may go negative so you can bill for the overage. An inactive or expired subscription still fails entitlement checks, and invalid usage quantities are rejected. (`limit` features, by contrast, reject consumption exceeding their cap.)
 
 ```ts
 const features = defineFeatures({
   apiCalls: { type: "metered", default: 100_000 },
 });
 
-await subs.use(subscriberId, "apiCalls", 1);              // never throws
+await subs.use(subscriberId, "apiCalls", 1);              // overage allowed; eligibility still required
 const status = await subs.remaining(subscriberId, "apiCalls");
 ```
 
-Usage is tracked per subscriber per monthly period (UTC boundaries) and is available for billing reports:
+Usage defaults to calendar-month periods (UTC boundaries). Configure `usage: { kind: "periodic", reset: "subscription-cycle" }` for subscription periods, or `usage: { kind: "persistent" }` for resources such as stored products that survive renewal. Usage is available for billing reports:
 
 ```ts
 const usage = await subs.permissions.getAllUsage(subscriberId);

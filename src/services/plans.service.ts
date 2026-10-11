@@ -4,7 +4,7 @@
 import type { CacheAdapter } from '../adapters/cache.adapter.js';
 import { CacheKeys, noopCacheAdapter } from '../adapters/cache.adapter.js';
 import type { DatabaseAdapter, PlanQueryOptions } from '../adapters/database.adapter.js';
-import { InvalidPlanError, PlanNotFoundError } from '../core/errors.js';
+import { InvalidPlanError, PlanNotFoundError, SubscriptionError } from '../core/errors.js';
 import { getFeatureValue, resolveFeatures, validatePlanFeatures } from '../core/features.js';
 import type {
     CreatePlanInput,
@@ -27,12 +27,14 @@ export interface PlansServiceOptions {
      * @default 300
      */
     cacheTtlSeconds?: number;
+    /** Identify the application, database and environment when caching is enabled. */
+    cacheNamespace?: string;
 }
 
 export class PlansService<TFeatures extends FeatureRegistry> {
     private readonly cache: CacheAdapter;
     private readonly defaultCurrency: string;
-    private readonly cacheTtl: number;
+    private readonly cacheNamespace: string;
 
     constructor(
         private readonly db: DatabaseAdapter<TFeatures>,
@@ -40,29 +42,21 @@ export class PlansService<TFeatures extends FeatureRegistry> {
         cache?: CacheAdapter,
         options?: PlansServiceOptions,
     ) {
+        if (cache && cache !== noopCacheAdapter && !options?.cacheNamespace?.trim()) {
+            throw new SubscriptionError('A cacheNamespace is required when caching is enabled', 'CACHE_NAMESPACE_REQUIRED');
+        }
         this.cache = cache ?? noopCacheAdapter;
         this.defaultCurrency = options?.defaultCurrency ?? 'USD';
-        this.cacheTtl = options?.cacheTtlSeconds ?? 300;
+        this.cacheNamespace = options?.cacheNamespace?.trim() ?? 'uncached';
     }
 
     /**
      * List all plans
      */
     async list(options?: { activeOnly?: boolean }): Promise<Plan<TFeatures>[]> {
-        const cacheKey = options?.activeOnly ? CacheKeys.activePlans() : CacheKeys.plans();
-
-        // Try cache first
-        const cached = await this.cache.get<Plan<TFeatures>[]>(cacheKey);
-        if (cached) {
-            return cached;
-        }
-
-        const plans = await this.db.plans.findAll(options);
-
-        // Cache the result
-        await this.cache.set(cacheKey, plans, this.cacheTtl);
-
-        return plans;
+        // Plan activation, pricing and entitlement updates must be authoritative.
+        // Adapter-level revision lookups would be required to safely cache these reads.
+        return this.db.plans.findAll(options);
     }
 
     /**
@@ -77,21 +71,10 @@ export class PlansService<TFeatures extends FeatureRegistry> {
      * Get a plan by ID
      */
     async get(id: string): Promise<Plan<TFeatures>> {
-        const cacheKey = CacheKeys.plan(id);
-
-        // Try cache first
-        const cached = await this.cache.get<Plan<TFeatures>>(cacheKey);
-        if (cached) {
-            return cached;
-        }
-
         const plan = await this.db.plans.findById(id);
         if (!plan) {
             throw new PlanNotFoundError(id);
         }
-
-        // Cache the result
-        await this.cache.set(cacheKey, plan, this.cacheTtl);
 
         return plan;
     }
@@ -108,9 +91,13 @@ export class PlansService<TFeatures extends FeatureRegistry> {
             }
         }
 
-        const plan = await this.db.plans.create({
-            ...data,
-            currency: data.currency ?? this.defaultCurrency,
+        const plan = await this.mutate(async tx => {
+            const created = await tx.plans.create({
+                ...data,
+                currency: data.currency ?? this.defaultCurrency,
+            });
+            await this.recordEvent(tx, `plan.created:${created.id}`, 'plan.created', { planId: created.id, name: created.name });
+            return created;
         });
 
         // Invalidate list caches
@@ -134,10 +121,15 @@ export class PlansService<TFeatures extends FeatureRegistry> {
             }
         }
 
-        const plan = await this.db.plans.update(id, data);
+        const eventId = `plan.updated:${id}:${crypto.randomUUID()}`;
+        const plan = await this.mutate(async tx => {
+            const updated = await tx.plans.update(id, data);
+            await this.recordEvent(tx, eventId, 'plan.updated', { planId: id, name: updated.name });
+            return updated;
+        });
 
         // Invalidate caches
-        await this.cache.delete(CacheKeys.plan(id));
+        await this.invalidateCache(CacheKeys.plan(id));
         await this.invalidateListCaches();
 
         return plan;
@@ -151,18 +143,18 @@ export class PlansService<TFeatures extends FeatureRegistry> {
         await this.get(id);
 
         // Prevent deletion if plan has active subscribers
-        const hasSubscribers = await this.db.plans.hasActiveSubscribers(id);
-        const hasPendingDowngrades = await this.db.plans.hasPendingDowngrades(id);
-        if (hasSubscribers || hasPendingDowngrades) {
-            throw new InvalidPlanError(
-                'Cannot delete plan with active or pending subscribers. Deactivate it instead.',
-            );
-        }
-
-        await this.db.plans.delete(id);
+        await this.mutate(async tx => {
+            const hasSubscribers = await tx.plans.hasActiveSubscribers(id);
+            const hasPendingDowngrades = await tx.plans.hasPendingDowngrades(id);
+            if (hasSubscribers || hasPendingDowngrades) {
+                throw new InvalidPlanError('Cannot delete plan with active or pending subscribers. Deactivate it instead.');
+            }
+            await tx.plans.delete(id);
+            await this.recordEvent(tx, `plan.deleted:${id}`, 'plan.deleted', { planId: id });
+        });
 
         // Invalidate caches
-        await this.cache.delete(CacheKeys.plan(id));
+        await this.invalidateCache(CacheKeys.plan(id));
         await this.invalidateListCaches();
     }
 
@@ -266,7 +258,25 @@ export class PlansService<TFeatures extends FeatureRegistry> {
     }
 
     private async invalidateListCaches(): Promise<void> {
-        await this.cache.delete(CacheKeys.plans());
-        await this.cache.delete(CacheKeys.activePlans());
+        await this.invalidateCache(CacheKeys.plans());
+        await this.invalidateCache(CacheKeys.activePlans());
+    }
+
+    private mutate<T>(operation: (tx: DatabaseAdapter<TFeatures>) => Promise<T>): Promise<T> {
+        return this.db.capabilities?.asyncTransactions ? this.db.transaction(operation) : operation(this.db);
+    }
+
+    private async recordEvent(tx: DatabaseAdapter<TFeatures>, id: string, type: string,
+        data: Record<string, unknown>): Promise<void> {
+        // Never claim durable event guarantees for an adapter without rollback.
+        if (tx.capabilities?.asyncTransactions && tx.outbox) {
+            await tx.outbox.insert({ id, type, data, occurredAt: new Date() });
+        }
+    }
+
+    private async invalidateCache(key: string): Promise<void> {
+        try { await this.cache.delete(`${this.cacheNamespace}:${key}`); } catch {
+            // A cache outage cannot turn a committed plan mutation into a failed operation.
+        }
     }
 }

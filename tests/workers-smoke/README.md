@@ -1,63 +1,49 @@
-# Workers smoke test
+# Workers Smoke Fixture
 
-Minimal Cloudflare Worker proving `@abshahin/subscriptions` runs on the pure
-Workers runtime — no Node.js APIs, no `nodejs_compat` flag.
+This local fixture uses the SDK source, the in-memory database, and the Cloudflare KV adapter backed by a fake KV namespace. It seeds one free plan and the fixed `demo-subscriber` identity. It uses no live payment provider or durable database and requires no Cloudflare resources.
 
-The worker ([`index.ts`](./index.ts)):
-
-- imports `createSubscriptions` straight from the package source
-  (`../../src/index.js`),
-- wires the **memory database adapter** (`../../src/testing/memory-database.js`),
-- wires the **Cloudflare KV cache adapter**
-  (`../../src/adapters/cloudflare-kv.adapter.js`) against a structurally-typed
-  fake KV namespace (a `Map` with TTL support) — no real binding needed,
-- seeds one active plan and one subscriber (`demo-subscriber`) on boot.
+The fixed identity is a non-authenticated demonstration. Do not copy it into a production API. Production integrations must resolve a trusted session and authorize tenant membership and each subscription operation; caller-supplied subscriber headers are not authentication. The cache configuration includes a mandatory application/environment/database namespace, and the product inventory is declared persistent.
 
 ## Routes
 
-| Route | Description |
+| Route | Behavior |
 | --- | --- |
-| `GET /can?feature=analytics` | Feature-gate check for the `x-subscriber-id` request header. Returns `{ subscriberId, feature, allowed }`. |
-| `POST /webhooks/:provider` | Passes the raw `Request` to `subscriptions.handleWebhookRequest(provider, request)` (signature verification included). Returns `{ received, type }`. |
+| `GET /can?feature=analytics` | Checks the fixed demo subscriber and returns `{ subscriberId, feature, allowed }` |
+| `GET /can?feature=unknown` | Returns false for an unknown feature |
+| `POST /webhooks` | Exercises the SDK's raw Request/no-provider error path; returns 400 |
 
-## Run it
+No provider is registered, so this fixture does not test payment authentication, live settlement, or native subscription integration. It does not establish D1 transaction support.
 
-From the package root (`packages/subscriptions-sdk`):
+## Run Locally
+
+From the repository root:
 
 ```sh
-npx wrangler dev tests/workers-smoke/wrangler.toml
+bunx wrangler dev --config tests/workers-smoke/wrangler.toml
 ```
 
-Then, in another terminal:
+In another terminal:
 
 ```sh
-# Feature gate (seeded subscriber has `analytics: true`)
-curl -H 'x-subscriber-id: demo-subscriber' \
-  'http://localhost:8787/can?feature=analytics'
-# -> {"subscriberId":"demo-subscriber","feature":"analytics","allowed":true}
+curl 'http://localhost:8787/can?feature=analytics'
+# {"subscriberId":"demo-subscriber","feature":"analytics","allowed":true}
 
-# Unknown subscriber falls back to feature defaults
-curl -H 'x-subscriber-id: nobody' \
-  'http://localhost:8787/can?feature=analytics'
-# -> {"...","allowed":false}
+curl 'http://localhost:8787/can?feature=unknown'
+# {"subscriberId":"demo-subscriber","feature":"unknown","allowed":false}
 
-# Webhook (no payment adapter is configured in the smoke test, so any
-# provider is rejected with a helpful 400 — which still proves the route,
-# request parsing and error path all work inside Workers)
-curl -X POST http://localhost:8787/webhooks/moyasar \
+curl -X POST http://localhost:8787/webhooks \
   -H 'content-type: application/json' -d '{}'
+# 400: no provider is registered
 ```
 
-## Bundle check
+Wrangler runtime execution is a separate check from bundling. The smoke configuration omits `nodejs_compat`; this example is intended for the native Workers APIs.
 
-[`bundle-check.mjs`](./bundle-check.mjs) bundles `src/index.ts` with esbuild
-using `--platform=neutral --format=esm --target=es2022`, keeping optional peer
-dependencies external. Any top-level `node:*` import anywhere in the reachable
-module graph fails the build, so a green run proves the core is edge-safe:
+## Neutral Bundle Check
 
 ```sh
-node tests/workers-smoke/bundle-check.mjs
+bun tests/workers-smoke/bundle-check.mjs
 ```
 
-Exits non-zero (and prints the esbuild diagnostics) on failure. Run it in CI
-to prevent Node-only imports from creeping back into the core.
+The script invokes esbuild for the package core with `platform=neutral`, `format=esm`, and `target=es2022`, keeping optional dependencies external. It exits nonzero on unresolved Node-only imports. A passing check establishes that the core bundles for the selected platform; it does not prove optional dynamic paths, real Workers runtime execution, live D1/Prisma transactions, Browser Rendering, or real provider behavior.
+
+D1 financial operations requiring interactive awaited transactions fail closed. Durable billing requires a storage backend with verified rollback/commit semantics plus the migrated operation, resource mapping, invoice sequence, and outbox tables. See [runtime-support.md](../../docs/runtime-support.md).

@@ -3,17 +3,11 @@
 // NOTE: Moyasar does NOT support native subscriptions - we use token-based recurring payments
 
 import type {
-  CancelOptions,
   ChargePaymentInput,
-  CheckoutSession,
-  CreateCheckoutInput,
-  CreateCustomerInput,
-  CreateGatewaySubscriptionInput,
-  GatewayCustomer,
-  GatewaySubscription,
+  ChargePaymentResult,
+  GatewayPayment,
+  GatewayPaymentMethod,
   PaymentGatewayAdapter,
-  PortalSession,
-  UpdateGatewaySubscriptionInput,
   WebhookEvent,
 } from "./payment.adapter.js";
 
@@ -26,8 +20,12 @@ export interface MoyasarConfig {
   secretKey: string;
   /** Publishable API key for frontend (pk_live_xxx or pk_test_xxx) */
   publishableKey: string;
-  /** Webhook secret for signature verification */
+  /** Shared secret configured on the Moyasar endpoint, sent as body secret_token. */
   webhookSecret?: string;
+  /** Expected account name, if configured. Each account needs its own webhook endpoint/secret. */
+  accountName?: string;
+  /** Expected mode. Defaults to the mode indicated by sk_test_/sk_live_. */
+  environment?: "test" | "live";
   /** Default callback URL after 3DS verification */
   callbackUrl: string;
   /** API base URL (defaults to production) */
@@ -42,10 +40,11 @@ export type MoyasarPaymentStatus =
   | "authorized"
   | "captured"
   | "refunded"
-  | "voided";
+  | "voided"
+  | "verified";
 
 /** Moyasar token status */
-export type MoyasarTokenStatus = "initiated" | "verified" | "failed";
+export type MoyasarTokenStatus = "initiated" | "active" | "inactive";
 
 /** Response from Moyasar payments API */
 export interface MoyasarPayment {
@@ -97,11 +96,10 @@ export interface MoyasarToken {
 /** Moyasar webhook payload */
 export interface MoyasarWebhookPayload {
   id: string;
-  type:
-    | "payment.created"
-    | "payment.updated"
-    | "payment.paid"
-    | "payment.failed";
+  type: string;
+  secret_token: string;
+  account_name: string;
+  live: boolean;
   data: MoyasarPayment;
   created_at: string;
 }
@@ -300,19 +298,21 @@ class MoyasarClient {
       | { type: "token"; token: string }
       | { type: "creditcard"; [key: string]: unknown };
     metadata?: Record<string, string>;
+    givenId: string;
   }): Promise<MoyasarPayment> {
-    return this.request<MoyasarPayment>("POST", "/payments", {
+    return validatePayment(await this.request<unknown>("POST", "/payments", {
+      given_id: params.givenId,
       amount: params.amount,
       currency: params.currency,
       description: params.description,
       callback_url: params.callbackUrl,
       source: params.source,
       metadata: params.metadata,
-    });
+    }));
   }
 
   async getPayment(id: string): Promise<MoyasarPayment> {
-    return this.request<MoyasarPayment>("GET", `/payments/${id}`);
+    return validatePayment(await this.request<unknown>("GET", `/payments/${encodeURIComponent(id)}`));
   }
 
   async capturePayment(id: string, amount?: number): Promise<MoyasarPayment> {
@@ -327,7 +327,7 @@ class MoyasarClient {
 
   // Tokens
   async getToken(id: string): Promise<MoyasarToken> {
-    return this.request<MoyasarToken>("GET", `/tokens/${id}`);
+    return validateToken(await this.request<unknown>("GET", `/tokens/${encodeURIComponent(id)}`));
   }
 }
 
@@ -920,15 +920,15 @@ export class MoyasarAdapterError extends Error {
   ): MoyasarAdapterError {
     const httpInfo = HTTP_STATUS_MESSAGES[status] ?? {
       message: `HTTP error ${status}`,
-      isRetryable: false,
+      isRetryable: status >= 500,
     };
 
     const type: MoyasarErrorType | "http_error" =
-      errorResponse?.type ?? "http_error";
-    const fieldErrors = errorResponse?.errors;
+      typeof errorResponse?.type === "string" ? errorResponse.type : "http_error";
+    const fieldErrors = errorResponse?.errors && typeof errorResponse.errors === "object" && Object.values(errorResponse.errors).every(messages => Array.isArray(messages) && messages.every(message => typeof message === "string")) ? errorResponse.errors : undefined;
 
     // Build detailed message if field errors exist
-    let detailedMessage = errorResponse?.message ?? httpInfo.message;
+    let detailedMessage = typeof errorResponse?.message === "string" ? errorResponse.message : httpInfo.message;
     if (fieldErrors && Object.keys(fieldErrors).length > 0) {
       const errorDetails = Object.entries(fieldErrors)
         .map(([field, messages]) => `${field}: ${messages.join(", ")}`)
@@ -1086,483 +1086,202 @@ export function getPaymentErrorInfo(
 // Helper Functions
 // ═══════════════════════════════════════════════════════════════════════════════
 
-function mapPaymentStatus(status: MoyasarPaymentStatus): string {
-  const statusMap: Record<MoyasarPaymentStatus, string> = {
-    initiated: "incomplete",
-    paid: "active",
-    failed: "incomplete_expired",
-    authorized: "active",
-    captured: "active",
-    refunded: "canceled",
-    voided: "canceled",
-  };
-  return statusMap[status] ?? "incomplete";
+function invalidResponse(message: string): MoyasarAdapterError {
+  return new MoyasarAdapterError(message, "api_error", "INVALID_RESPONSE", undefined, message, true, "retry_later");
 }
 
-async function verifySignature(
-  payload: string,
-  signature: string,
-  webhookSecret: string,
-): Promise<boolean> {
-  // Moyasar uses HMAC-SHA256 for webhook signatures
-  const normalizedSignature = signature.trim().toLowerCase();
-  if (
-    normalizedSignature.length === 0 ||
-    normalizedSignature.length % 2 !== 0 ||
-    !/^[0-9a-f]+$/.test(normalizedSignature)
-  ) {
-    return false;
+function validatePayment(value: unknown): MoyasarPayment {
+  if (!value || typeof value !== "object") throw invalidResponse("Invalid payment response");
+  const data = value as Record<string, unknown>;
+  if (typeof data.id !== "string" || !data.id ||
+      !["initiated", "paid", "failed", "authorized", "captured", "refunded", "voided", "verified"].includes(String(data.status)) ||
+      !Number.isSafeInteger(data.amount) || Number(data.amount) < 0 ||
+      typeof data.currency !== "string" || !/^[A-Z]{3}$/.test(data.currency) ||
+      !data.source || typeof data.source !== "object" ||
+      typeof data.created_at !== "string" || !Number.isFinite(Date.parse(data.created_at)) ||
+      (data.status === "captured" && (!Number.isSafeInteger(data.captured) || Number(data.captured) <= 0 || Number(data.captured) > Number(data.amount)))) {
+    throw invalidResponse("Invalid payment response");
   }
-
-  const encoder = new TextEncoder();
-  const key = await crypto.subtle.importKey(
-    "raw",
-    encoder.encode(webhookSecret),
-    { name: "HMAC", hash: "SHA-256" },
-    false,
-    ["verify"],
-  );
-
-  // Decode the hex signature to bytes for timing-safe comparison
-  const signatureBytes = new Uint8Array(
-    (normalizedSignature.match(/.{1,2}/g) ?? []).map((byte) =>
-      parseInt(byte, 16),
-    ),
-  );
-
-  // crypto.subtle.verify performs a constant-time comparison internally
-  return crypto.subtle.verify(
-    "HMAC",
-    key,
-    signatureBytes,
-    encoder.encode(payload),
-  );
+  return value as MoyasarPayment;
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// Adapter Implementation
-// ═══════════════════════════════════════════════════════════════════════════════
+function validateToken(value: unknown): MoyasarToken {
+  if (!value || typeof value !== "object") throw invalidResponse("Invalid token response");
+  const data = value as Record<string, unknown>;
+  if (typeof data.id !== "string" || !data.id ||
+      !["initiated", "active", "inactive"].includes(String(data.status)) ||
+      typeof data.brand !== "string" || typeof data.last_four !== "string") {
+    throw invalidResponse("Invalid token response");
+  }
+  return value as MoyasarToken;
+}
 
-/**
- * Create a Moyasar payment adapter for subscriptions.
- *
- * **Important**: Moyasar doesn't have native subscription support.
- * This adapter uses token-based recurring payments:
- *
- * 1. Frontend collects card → creates token via Moyasar.js
- * 2. Token stored as `gatewayCustomerId` in subscription
- * 3. Renewal job charges token using `createSubscription()` method
- * 4. Webhook confirms payment → subscription renewed
- *
- * @example
- * ```typescript
- * import { moyasarAdapter } from '@abshahin/subscriptions/adapters/moyasar';
- *
- * const payment = moyasarAdapter({
- *   secretKey: process.env.MOYASAR_LIVE_SECRET_KEY!,
- *   publishableKey: process.env.MOYASAR_LIVE_PUBLIC_KEY!,
- *   callbackUrl: 'https://platform.example.com/subscriptions/callback',
- * });
- * ```
- */
+function requireIdempotencyKey(key: string | undefined): string {
+  if (!key || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(key)) {
+    throw new MoyasarAdapterError("Moyasar collection requires a persisted UUID idempotencyKey", "invalid_request_error", "IDEMPOTENCY_KEY_REQUIRED");
+  }
+  return key;
+}
+
+function validateAmount(amount: number, currency: string): void {
+  if (!Number.isSafeInteger(amount) || amount <= 0 || !/^[A-Z]{3}$/.test(currency)) {
+    throw new MoyasarAdapterError("Payment amount must be a positive integer in minor units and currency a three-letter uppercase code", "invalid_request_error", "INVALID_AMOUNT");
+  }
+}
+
+/** WebCrypto performs the final comparison without exposing a timing-dependent string comparison. */
+async function equalSecret(received: string, expected: string): Promise<boolean> {
+  const encoder = new TextEncoder();
+  const key = await crypto.subtle.importKey("raw", encoder.encode(expected), { name: "HMAC", hash: "SHA-256" }, false, ["sign", "verify"]);
+  const signature = await crypto.subtle.sign("HMAC", key, encoder.encode(expected));
+  return crypto.subtle.verify("HMAC", key, signature, encoder.encode(received));
+}
+
+function toPayment(payment: MoyasarPayment): GatewayPayment {
+  const status: ChargePaymentResult["status"] =
+    payment.status === "paid" || payment.status === "captured" ? "paid" :
+    payment.status === "authorized" ? "authorized" :
+    payment.status === "initiated" || payment.status === "verified" ? "pending" : "failed";
+  const info = getPaymentErrorInfo(payment);
+  return {
+    id: payment.id,
+    status,
+    amount: payment.status === "captured" ? payment.captured : payment.amount,
+    currency: payment.currency,
+    createdAt: new Date(payment.created_at),
+    ...(payment.metadata && { metadata: payment.metadata }),
+    ...(payment.source.token && { paymentMethodId: payment.source.token }),
+    ...(payment.source.transaction_url && { verificationUrl: payment.source.transaction_url }),
+    ...(status === "failed" && {
+      errorMessage: info?.message ?? payment.source.message ?? "Payment is not settled",
+      errorCode: info?.code ?? payment.status.toUpperCase(),
+      isRetryable: info?.isRetryable ?? false,
+      userAction: info?.userAction ?? "none",
+    }),
+  };
+}
+
+/** Token charges are SDK-managed. Moyasar has no native subscription/customer/portal resource. */
 export function moyasarAdapter(config: MoyasarConfig): PaymentGatewayAdapter {
   const client = new MoyasarClient(config);
-
+  const environment = config.environment ?? (config.secretKey.startsWith("sk_test_") ? "test" : config.secretKey.startsWith("sk_live_") ? "live" : undefined);
+  const unsupported = async (): Promise<never> => {
+    throw new MoyasarAdapterError("Moyasar does not support native customers, subscriptions, hosted checkout sessions, or customer portals. Use SDK-managed subscriptions, token payments, and getEmbeddedCheckoutConfiguration().", "invalid_request_error", "UNSUPPORTED_OPERATION");
+  };
   return {
     provider: "moyasar",
+    capabilities: { customers: false, nativeSubscriptions: false, checkout: "embedded", portal: false, directPayments: true, paymentLookup: true, idempotentCharges: true },
+    createCustomer: unsupported,
+    getCustomer: unsupported,
+    createSubscription: unsupported,
+    getSubscription: unsupported,
+    updateSubscription: unsupported,
+    cancelSubscription: unsupported,
+    createCheckoutSession: unsupported,
+    createPortalSession: unsupported,
 
-    // ==================== Customer Management ====================
-    // Moyasar has no customer concept - we store token ID as customer ID
-
-    async createCustomer(data: CreateCustomerInput): Promise<GatewayCustomer> {
-      // No API call - return local customer object
-      // Token ID will be set later via updateCustomer or stored during checkout
+    getEmbeddedCheckoutConfiguration(data) {
+      validateAmount(data.amount, data.currency);
+      if (!config.publishableKey) throw new MoyasarAdapterError("A publishable key is required for embedded checkout", "invalid_request_error", "PUBLISHABLE_KEY_REQUIRED");
       return {
-        id: `moy_cust_${Date.now()}`, // Local ID
-        email: data.email,
-        ...(data.name && { name: data.name }),
+        provider: "moyasar", amount: data.amount, currency: data.currency,
+        publishable_api_key: config.publishableKey,
+        callback_url: data.callbackUrl ?? config.callbackUrl,
+        ...(data.description && { description: data.description }),
         ...(data.metadata && { metadata: data.metadata }),
       };
     },
 
-    async getCustomer(customerId: string): Promise<GatewayCustomer | null> {
-      // If customerId is a Moyasar token, fetch token details
-      if (customerId.startsWith("token_")) {
-        try {
-          const token = await client.getToken(customerId);
-          return {
-            id: token.id,
-            email: "", // Tokens don't have email
-            name: token.name,
-            metadata: {
-              brand: token.brand,
-              lastFour: token.last_four,
-              expiry: `${token.month}/${token.year}`,
-            },
-          };
-        } catch {
-          return null;
-        }
+    async constructWebhookEvent(payload, _signature, _context): Promise<WebhookEvent> {
+      if (!config.webhookSecret) throw new MoyasarAdapterError("Moyasar webhookSecret is required", "authentication_error", "WEBHOOK_SECRET_REQUIRED");
+      const raw = typeof payload === "string" ? payload : new TextDecoder().decode(payload);
+      const value: unknown = JSON.parse(raw);
+      if (!value || typeof value !== "object") throw invalidResponse("Invalid webhook payload");
+      const event = value as MoyasarWebhookPayload;
+      if (typeof event.secret_token !== "string" || !await equalSecret(event.secret_token, config.webhookSecret)) {
+        throw new MoyasarAdapterError("Invalid webhook secret_token", "authentication_error", "WEBHOOK_SECRET_INVALID");
       }
-      return null;
-    },
-
-    // ==================== Subscription Management ====================
-    // Since Moyasar has no subscriptions, we charge tokens for recurring payments
-
-    async createSubscription(
-      data: CreateGatewaySubscriptionInput,
-    ): Promise<GatewaySubscription> {
-      // priceId is amount in smallest unit (e.g., 9900 = 99.00 SAR)
-      const amount = parseInt(data.priceId, 10);
-
-      if (isNaN(amount) || amount <= 0) {
-        throw new MoyasarAdapterError(
-          "priceId must be a valid amount in smallest currency unit",
-        );
+      if (typeof event.id !== "string" || !event.id || typeof event.type !== "string" ||
+          typeof event.live !== "boolean" || typeof event.account_name !== "string" ||
+          !Number.isFinite(Date.parse(event.created_at))) throw invalidResponse("Invalid webhook envelope");
+      if ((environment && event.live !== (environment === "live")) ||
+          (config.accountName && event.account_name !== config.accountName)) {
+        throw new MoyasarAdapterError("Webhook provider account or environment mismatch", "authentication_error", "WEBHOOK_SCOPE_MISMATCH");
       }
-
-      // Charge the token
-      const payment = await client.createPayment({
-        amount,
-        currency: "SAR",
-        description: `Subscription payment for ${data.customerId}`,
-        callbackUrl: config.callbackUrl,
-        source: {
-          type: "token",
-          token: data.customerId, // Token ID stored as customerId
-        },
-        metadata: {
-          ...data.metadata,
-          subscriberId: data.customerId,
-          type: "subscription_payment",
-        },
-      });
-
-      const now = new Date();
-      const periodEnd = new Date(now);
-      periodEnd.setMonth(periodEnd.getMonth() + 1); // Default monthly
-
+      // Nonpayment authentication events are intentionally not settlement evidence.
+      const isPayment = event.type.startsWith("payment_");
+      const payment = isPayment ? validatePayment(event.data) : undefined;
+      let type = event.type;
+      if (event.type === "payment_paid" || event.type === "payment_captured") {
+        if (!payment || (payment.status !== "paid" && payment.status !== "captured")) throw invalidResponse("Settlement event does not describe a settled payment");
+        type = "payment.paid";
+      } else if (event.type === "payment_failed") {
+        if (!payment || payment.status !== "failed") throw invalidResponse("Failure event does not describe a failed payment");
+        type = "payment.failed";
+      } else if (event.type === "payment_authorized") {
+        type = "payment.authorized";
+      }
       return {
-        id: payment.id,
-        customerId: data.customerId,
-        status: mapPaymentStatus(payment.status),
-        priceId: data.priceId,
-        currentPeriodStart: now,
-        currentPeriodEnd: periodEnd,
-        cancelAt: null,
-        canceledAt: null,
-        trialStart: data.trialDays ? now : null,
-        trialEnd: data.trialDays
-          ? new Date(now.getTime() + data.trialDays * 24 * 60 * 60 * 1000)
-          : null,
-        ...(data.metadata && { metadata: data.metadata }),
+        id: event.id, type, originalType: event.type,
+        environment: event.live ? "live" : "test", accountName: event.account_name,
+        data: { ...event.data, ...(payment && { paymentId: payment.id, paymentMethodId: payment.source.token, amount: payment.status === "captured" ? payment.captured : payment.amount }) },
+        createdAt: new Date(event.created_at),
       };
     },
 
-    async getSubscription(
-      subscriptionId: string,
-    ): Promise<GatewaySubscription | null> {
-      // subscriptionId is actually a payment ID for Moyasar
-      try {
-        const payment = await client.getPayment(subscriptionId);
-        const createdAt = new Date(payment.created_at);
-        const periodEnd = new Date(createdAt);
-        periodEnd.setMonth(periodEnd.getMonth() + 1);
-
-        return {
-          id: payment.id,
-          customerId: payment.metadata?.subscriberId ?? "",
-          status: mapPaymentStatus(payment.status),
-          currentPeriodStart: createdAt,
-          currentPeriodEnd: periodEnd,
-          cancelAt: null,
-          canceledAt: null,
-          trialStart: null,
-          trialEnd: null,
-          ...(payment.metadata && { metadata: payment.metadata }),
-        };
-      } catch {
-        return null;
-      }
-    },
-
-    async updateSubscription(
-      _subscriptionId: string,
-      _data: UpdateGatewaySubscriptionInput,
-    ): Promise<GatewaySubscription> {
-      // Moyasar doesn't support subscription updates
-      throw new MoyasarAdapterError(
-        "Moyasar does not support subscription updates. Cancel and create a new subscription instead.",
-      );
-    },
-
-    async cancelSubscription(
-      subscriptionId: string,
-      options?: CancelOptions,
-    ): Promise<GatewaySubscription> {
-      // Void the payment if immediate cancellation requested
-      if (options?.immediately) {
-        try {
-          const payment = await client.voidPayment(subscriptionId);
-          return {
-            id: payment.id,
-            customerId: payment.metadata?.subscriberId ?? "",
-            status: "canceled",
-            currentPeriodStart: new Date(payment.created_at),
-            currentPeriodEnd: new Date(payment.created_at),
-            cancelAt: new Date(),
-            canceledAt: new Date(),
-            trialStart: null,
-            trialEnd: null,
-            ...(payment.metadata && { metadata: payment.metadata }),
-          };
-        } catch {
-          // Payment may already be captured/completed
-        }
-      }
-
-      // For non-immediate cancellation, just return updated status
-      // The actual subscription record update happens in the subscriptions service
-      const payment = await client.getPayment(subscriptionId);
-      const createdAt = new Date(payment.created_at);
-      const periodEnd = new Date(createdAt);
-      periodEnd.setMonth(periodEnd.getMonth() + 1);
-
-      return {
-        id: payment.id,
-        customerId: payment.metadata?.subscriberId ?? "",
-        status: mapPaymentStatus(payment.status),
-        currentPeriodStart: createdAt,
-        currentPeriodEnd: periodEnd,
-        cancelAt: periodEnd,
-        canceledAt: new Date(),
-        trialStart: null,
-        trialEnd: null,
-        ...(payment.metadata && { metadata: payment.metadata }),
-      };
-    },
-
-    // ==================== Checkout & Portal ====================
-
-    async createCheckoutSession(
-      data: CreateCheckoutInput,
-    ): Promise<CheckoutSession> {
-      // For Moyasar, checkout is handled via their embedded form
-      // Return URL to frontend checkout page with config
-      const params = new URLSearchParams({
-        publishable_key: config.publishableKey,
-        amount: data.priceId,
-        currency: "SAR",
-        callback_url: data.successUrl,
-        ...(data.metadata && { metadata: JSON.stringify(data.metadata) }),
-      });
-
-      const expiresAt = new Date();
-      expiresAt.setHours(expiresAt.getHours() + 24);
-
-      return {
-        id: `moy_checkout_${Date.now()}`,
-        // This URL should point to your frontend checkout page
-        url: `${data.successUrl.split("?")[0]}/checkout?${params.toString()}`,
-        expiresAt,
-      };
-    },
-
-    async createPortalSession(
-      _customerId: string,
-      returnUrl: string,
-    ): Promise<PortalSession> {
-      // Moyasar doesn't have a customer portal
-      // Return URL to your own billing management page
-      return {
-        id: `moy_portal_${Date.now()}`,
-        url: `${returnUrl}/billing`,
-      };
-    },
-
-    // ==================== Webhooks ====================
-
-    async constructWebhookEvent(
-      payload: string | Uint8Array,
-      signature: string,
-    ): Promise<WebhookEvent> {
-      const payloadStr =
-        typeof payload === "string" ? payload : new TextDecoder().decode(payload);
-
-      // Verify signature if a webhook secret is configured.
-      //
-      // Fail CLOSED: when a secret is configured we require a valid signature.
-      // A missing/empty signature must be rejected rather than silently
-      // accepted, otherwise an attacker could bypass verification by simply
-      // omitting the header.
-      if (config.webhookSecret) {
-        if (!signature) {
-          throw new MoyasarAdapterError(
-            "Missing webhook signature",
-            "authentication_error",
-            "WEBHOOK_SIGNATURE_MISSING",
-          );
-        }
-        const isValid = await verifySignature(
-          payloadStr,
-          signature,
-          config.webhookSecret,
-        );
-        if (!isValid) {
-          throw new MoyasarAdapterError(
-            "Invalid webhook signature",
-            "authentication_error",
-            "WEBHOOK_SIGNATURE_INVALID",
-          );
-        }
-      } else {
-        console.warn(
-          "[Moyasar] WARNING: No webhookSecret configured. Webhook payloads are accepted without signature verification. " +
-          "Set webhookSecret in MoyasarConfig to enable verification.",
-        );
-      }
-
-      const webhookData = JSON.parse(payloadStr) as MoyasarWebhookPayload;
-
-      return {
-        id: webhookData.id,
-        type: webhookData.type,
-        data: webhookData.data as unknown as Record<string, unknown>,
-        createdAt: new Date(webhookData.created_at),
-      };
-    },
-
-    // ==================== Direct Payment ====================
-
-    async chargePayment(data: ChargePaymentInput) {
+    async chargePayment(data: ChargePaymentInput): Promise<ChargePaymentResult> {
+      const idempotencyKey = requireIdempotencyKey(data.idempotencyKey);
+      validateAmount(data.amount, data.currency);
       try {
         const payment = await client.createPayment({
-          amount: data.amount,
-          currency: data.currency,
+          givenId: idempotencyKey, amount: data.amount, currency: data.currency,
           ...(data.description && { description: data.description }),
           callbackUrl: data.callbackUrl ?? config.callbackUrl,
-          source: {
-            type: "token",
-            token: data.customerId, // Token ID stored as customerId
-          },
+          source: { type: "token", token: data.paymentMethodId ?? data.customerId },
           ...(data.metadata && { metadata: data.metadata }),
         });
-
-        // Map Moyasar status to our status
-        let status: "paid" | "pending" | "failed";
-        if (payment.status === "paid" || payment.status === "captured") {
-          status = "paid";
-        } else if (payment.status === "initiated") {
-          status = "pending";
-        } else {
-          status = "failed";
+        if (payment.id !== idempotencyKey || payment.amount !== data.amount || payment.currency !== data.currency) {
+          throw invalidResponse("Provider response does not match the persisted payment attempt");
         }
-
-        // Extract detailed error info for failed payments
-        if (status === "failed") {
-          const errorInfo = getPaymentErrorInfo(payment);
-          return {
-            id: payment.id,
-            status,
-            amount: payment.amount,
-            currency: payment.currency,
-            errorMessage:
-              errorInfo?.message ?? payment.source.message ?? "Payment failed",
-            errorCode: errorInfo?.code ?? "UNKNOWN",
-            isRetryable: errorInfo?.isRetryable ?? false,
-            userAction: errorInfo?.userAction ?? "use_different_card",
-            ...(payment.source.response_code && {
-              gatewayCode: payment.source.response_code,
-            }),
-          };
-        }
-
-        return {
-          id: payment.id,
-          status,
-          amount: payment.amount,
-          currency: payment.currency,
-          ...(payment.source.transaction_url && {
-            verificationUrl: payment.source.transaction_url,
-          }),
-        };
+        return toPayment(payment);
       } catch (error) {
-        // Handle MoyasarAdapterError with rich error info
-        if (error instanceof MoyasarAdapterError) {
-          return {
-            id: "",
-            status: "failed" as const,
-            amount: data.amount,
-            currency: data.currency,
-            errorMessage: error.userMessage ?? error.message,
-            errorCode: error.code,
-            isRetryable: error.isRetryable,
-            userAction: error.userAction,
-            ...(error.httpStatus && { httpStatus: error.httpStatus }),
-          };
-        }
-
-        // Handle generic errors
-        const errorMessage =
-          error instanceof Error ? error.message : "Payment failed";
+        const known = error instanceof MoyasarAdapterError;
+        const uncertain = !known || error.type === "network_error" || error.code === "INVALID_RESPONSE" || (error.httpStatus !== undefined && error.httpStatus >= 500);
         return {
-          id: "",
-          status: "failed" as const,
-          amount: data.amount,
-          currency: data.currency,
-          errorMessage,
-          errorCode: "UNKNOWN",
-          isRetryable: false,
-          userAction: "retry_later" as const,
+          id: uncertain ? idempotencyKey : "", status: uncertain ? "unknown" : "failed",
+          amount: data.amount, currency: data.currency,
+          errorMessage: known ? error.userMessage ?? error.message : error instanceof Error ? error.message : "Unknown collection outcome",
+          errorCode: known ? error.code : "UNKNOWN_OUTCOME",
+          isRetryable: known ? error.isRetryable : true,
+          userAction: "retry_later",
+          ...(known && error.httpStatus !== undefined && { httpStatus: error.httpStatus }),
         };
       }
     },
 
-    /**
-     * Get the reusable payment source (token) from a completed payment.
-     * Use this to save the payment method for future renewals.
-     */
-    async getPaymentSource(paymentId: string): Promise<string | null> {
+    async getPayment(paymentId): Promise<GatewayPayment | null> {
+      try { return toPayment(await client.getPayment(paymentId)); }
+      catch (error) { if (error instanceof MoyasarAdapterError && error.httpStatus === 404) return null; throw error; }
+    },
+
+    async getPaymentMethod(paymentMethodId): Promise<GatewayPaymentMethod | null> {
+      try {
+        const token = await client.getToken(paymentMethodId);
+        return { id: token.id, status: token.status === "initiated" ? "pending" : token.status,
+          metadata: { brand: token.brand, lastFour: token.last_four, expiry: `${token.month}/${token.year}` } };
+      } catch (error) { if (error instanceof MoyasarAdapterError && error.httpStatus === 404) return null; throw error; }
+    },
+
+    async getPaymentSource(paymentId): Promise<string | null> {
       try {
         const payment = await client.getPayment(paymentId);
-
-        // If payment has a source token and is paid, return it
-        if (payment.status === "paid" && payment.source.token) {
-          return payment.source.token;
-        }
-
-        return null;
-      } catch (_error) {
-        return null;
-      }
+        return (payment.status === "paid" || payment.status === "captured") ? payment.source.token ?? null : null;
+      } catch (error) { if (error instanceof MoyasarAdapterError && error.httpStatus === 404) return null; throw error; }
     },
   };
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// Charge Token Utility (for renewal job)
-// ═══════════════════════════════════════════════════════════════════════════════
-
-/**
- * Charge a saved token for subscription renewal.
- * Use this in your renewal cron job.
- *
- * @example
- * ```typescript
- * import { chargeToken } from '@abshahin/subscriptions/adapters/moyasar';
- *
- * // In your renewal cron job:
- * const result = await chargeToken({
- *   secretKey: process.env.MOYASAR_LIVE_SECRET_KEY!,
- *   tokenId: subscription.gatewayCustomerId!,
- *   amount: plan.price * 100, // Convert to smallest unit
- *   description: `Renewal for ${subscription.tenantId}`,
- *   callbackUrl: 'https://platform.example.com/subscriptions/callback',
- *   metadata: { tenantId: subscription.tenantId, planId: subscription.planId },
- * });
- * ```
- */
+/** Charge a saved token with a persisted logical UUID; callers own renewal scheduling. */
 export async function chargeToken(params: {
   secretKey: string;
   tokenId: string;
@@ -1571,22 +1290,15 @@ export async function chargeToken(params: {
   description?: string;
   callbackUrl: string;
   metadata?: Record<string, string>;
+  idempotencyKey: string;
 }): Promise<MoyasarPayment> {
-  const client = new MoyasarClient({
-    secretKey: params.secretKey,
-    publishableKey: "", // Not needed for server-side
-    callbackUrl: params.callbackUrl,
-  });
-
+  const givenId = requireIdempotencyKey(params.idempotencyKey);
+  validateAmount(params.amount, params.currency ?? "SAR");
+  const client = new MoyasarClient({ secretKey: params.secretKey, publishableKey: "", callbackUrl: params.callbackUrl });
   return client.createPayment({
-    amount: params.amount,
-    currency: params.currency ?? "SAR",
-    description: params.description ?? "Subscription renewal",
-    callbackUrl: params.callbackUrl,
-    source: {
-      type: "token",
-      token: params.tokenId,
-    },
+    givenId, amount: params.amount, currency: params.currency ?? "SAR",
+    description: params.description ?? "Subscription renewal", callbackUrl: params.callbackUrl,
+    source: { type: "token", token: params.tokenId },
     ...(params.metadata && { metadata: params.metadata }),
   });
 }

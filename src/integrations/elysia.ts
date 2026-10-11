@@ -10,6 +10,7 @@ import {
 } from "../core/errors.js";
 import type { FeatureRegistry } from "../core/types.js";
 import type { Subscriptions } from "../index.js";
+import { webhookFailureStatus, type SubscriptionOperation } from "./http.js";
 import {
   renderSubscriptionInvoice,
   wrapInvoiceForPrint,
@@ -50,19 +51,28 @@ export interface ElysiaPluginOptions<
   prefix?: TPrefix;
 
   /**
-   * Function to extract subscriber ID from context
-   * Defaults to using `user.activeTenantId`
+   * Resolve a subscriber ID from a trusted authenticated context.
+   * Subscriber routes return 401 when absent. Validate tenant membership here
+   * when authorizeSubscriber is omitted.
    */
-  getSubscriberId?: (ctx: unknown) => string | Promise<string>;
+  getSubscriberId?: (ctx: unknown) =>
+    string | null | undefined | Promise<string | null | undefined>;
+
+  /** Validate tenant membership and permission for each subscriber operation. */
+  authorizeSubscriber?: (
+    ctx: unknown,
+    subscriberId: string,
+    operation: SubscriptionOperation,
+  ) => boolean | Promise<boolean>;
 
   /**
    * Enable admin routes (plan management)
-   * @default true
+   * @default false
    */
   adminRoutes?: boolean;
 
   /**
-   * Custom authorization check for admin routes
+   * Explicit administrative authorization check. Required for adminRoutes.
    */
   adminGuard?: (ctx: unknown) => boolean | Promise<boolean>;
 
@@ -135,29 +145,45 @@ export function elysiaPlugin<
 >(subs: Subscriptions<TFeatures>, options?: ElysiaPluginOptions<TPrefix>) {
   const prefix = (options?.prefix ?? "/subscriptions") as TPrefix;
   const getSubscriberId =
-    options?.getSubscriberId ??
-    ((ctx: unknown) =>
-      (ctx as { user?: { activeTenantId?: string } }).user?.activeTenantId);
-  const adminRoutes = options?.adminRoutes ?? true;
-  const adminGuard = options?.adminGuard ?? (() => true);
+    options?.getSubscriberId ?? (() => null);
+  const adminRoutes = options?.adminRoutes ?? false;
+  const adminGuard = options?.adminGuard;
+  if (adminRoutes && typeof adminGuard !== "function") {
+    throw new Error("elysiaPlugin: adminRoutes requires an explicit adminGuard authorization policy");
+  }
 
-  const requireSubscriberId = async (ctx: unknown): Promise<string> => {
+  const requireSubscriberId = async (
+    ctx: unknown,
+    operation: SubscriptionOperation,
+  ): Promise<string> => {
     const subscriberId = await getSubscriberId(ctx);
-    if (!subscriberId) {
-      throw new Error("Subscriber ID is required");
+    if (typeof subscriberId !== "string" || !subscriberId.trim()) {
+      throw new SubscriptionError("Unauthorized", "UNAUTHORIZED", 401);
+    }
+    if (options?.authorizeSubscriber &&
+      await options.authorizeSubscriber(ctx, subscriberId, operation) !== true) {
+      throw new SubscriptionError("Access denied", "FORBIDDEN", 403);
     }
     return subscriberId;
   };
 
   const subscribeBodySchema = t.Object({
-    planId: t.String(),
-    /** Override plan's default trial days */
-    trialDays: t.Optional(t.Number()),
-    /** Verified token ID from frontend payment - save for future renewals */
-    verifiedTokenId: t.Optional(t.String()),
-    /** Payment ID from Moyasar after successful payment - used to create invoice */
-    paymentId: t.Optional(t.String()),
-  });
+    planId: t.String({ minLength: 1 }),
+  }, { additionalProperties: false });
+
+  // A host Elysia app may normalize unknown fields before schema validation.
+  // Transform runs first, so forbidden financial fields must be checked here.
+  const rejectUnknownFields = (body: unknown, allowed: string[]): void => {
+    if (!body || typeof body !== "object" || Array.isArray(body)) return;
+    const unknown = Object.keys(body).find((field) => !allowed.includes(field));
+    if (unknown) {
+      throw new SubscriptionError(
+        `Public request field is not allowed: ${unknown}`,
+        "INVALID_PUBLIC_INPUT",
+        400,
+      );
+    }
+  };
 
   const planIntervalSchema = t.Union([
     t.Literal("monthly"),
@@ -198,44 +224,17 @@ export function elysiaPlugin<
     const context = ctx as {
       body: {
         planId: string;
-        trialDays?: number;
-        verifiedTokenId?: string;
-        paymentId?: string;
       };
       set: { status: number };
     };
-    const subscriberId = await requireSubscriberId(ctx);
-    const {
-      planId,
-      trialDays: requestTrialDays,
-      verifiedTokenId,
-      paymentId,
-    } = context.body;
-
-    const plan = await subs.plans.get(planId);
-    if (!plan) {
-      context.set.status = 404;
-      return { error: "Plan not found" };
-    }
-
-    const effectiveTrialDays = requestTrialDays ?? plan.trialDays;
-
-    // The service is the single source of truth for invoicing. When the
-    // frontend already collected payment (verifiedTokenId + paymentId), tell
-    // the service to record the initial invoice as paid instead of creating a
-    // second invoice here.
-    const paidExternally = !!(verifiedTokenId && paymentId);
-    const subscription = await subs.subscriptions.create(subscriberId, planId, {
-      ...(effectiveTrialDays > 0 && { trialDays: effectiveTrialDays }),
-      ...(verifiedTokenId && { gatewayCustomerId: verifiedTokenId }),
-      ...(paidExternally && { paidExternally: true }),
-      ...(paymentId && { gatewayInvoiceId: paymentId }),
-    });
+    const subscriberId = await requireSubscriberId(ctx, "subscribe");
+    const subscription = await subs.subscriptions.createSelfService(subscriberId, context.body.planId);
+    context.set.status = 201;
 
     return { subscription };
   };
 
-  const app = new Elysia({ name: "Plugin.Subscriptions", prefix })
+  const app = new Elysia({ name: "Plugin.Subscriptions", prefix, normalize: false })
     // Error handling
     .onError(({ error, set }) => {
       // Enhanced handling for payment errors
@@ -259,12 +258,17 @@ export function elysiaPlugin<
           message: error.message,
         };
       }
+      const status = webhookFailureStatus(error);
+      if (status) {
+        set.status = status;
+        return { error: error instanceof Error ? error.message : "Webhook verification failed" };
+      }
     })
     // ==================== Subscriber Routes ====================
 
     // Get current subscription
     .get("/current", async (ctx) => {
-      const subscriberId = await requireSubscriberId(ctx);
+      const subscriberId = await requireSubscriberId(ctx, "current");
       const subscription = await subs.subscriptions.get(subscriberId);
       return { subscription };
     })
@@ -276,77 +280,70 @@ export function elysiaPlugin<
     })
 
     // Subscribe to a plan
-    .post("/subscribe", createSubscription, { body: subscribeBodySchema })
+    .post("/subscribe", createSubscription, {
+      body: subscribeBodySchema,
+      transform: ({ body }) => rejectUnknownFields(body, ["planId"]),
+    })
 
     // Alias route to avoid Eden Treaty reserved-name collision on "subscribe"
-    .post("/create", createSubscription, { body: subscribeBodySchema })
+    .post("/create", createSubscription, {
+      body: subscribeBodySchema,
+      transform: ({ body }) => rejectUnknownFields(body, ["planId"]),
+    })
 
     // Change plan
     .post(
       "/change-plan",
       async (ctx) => {
-        const subscriberId = await requireSubscriberId(ctx);
-        const {
-          planId,
-          immediately,
-          prorate,
-          tokenId,
-          callbackUrl,
-          skipPayment,
-          verifiedTokenId,
-          paymentId,
-        } = ctx.body;
-        // The service creates the upgrade invoice itself (single source of
-        // truth). When the frontend already collected payment, pass the
-        // paymentId so the service records it on that invoice — avoiding the
-        // duplicate invoice this route used to create.
+        const subscriberId = await requireSubscriberId(ctx, "change-plan");
+        const { planId, immediately, prorate, quoteId } = ctx.body;
         const result = await subs.subscriptions.changePlan(
           subscriberId,
           planId,
           {
             ...(immediately !== undefined && { immediately }),
             ...(prorate !== undefined && { prorate }),
-            ...(tokenId && { tokenId }),
-            ...(callbackUrl && { callbackUrl }),
-            ...(skipPayment !== undefined && { skipPayment }),
-            ...(verifiedTokenId && { verifiedTokenId }),
-            ...(paymentId && { gatewayInvoiceId: paymentId }),
+            quoteId,
           },
         );
 
         return result;
       },
       {
+        transform: ({ body }) => rejectUnknownFields(body, ["planId", "quoteId", "immediately", "prorate"]),
         body: t.Object({
-          planId: t.String(),
+          planId: t.String({ minLength: 1 }),
+          quoteId: t.String({ minLength: 1 }),
           immediately: t.Optional(t.Boolean()),
           prorate: t.Optional(t.Boolean()),
-          tokenId: t.Optional(t.String()),
-          callbackUrl: t.Optional(t.String()),
-          skipPayment: t.Optional(t.Boolean()),
-          /** Verified token ID from frontend 3DS - save for future renewals */
-          verifiedTokenId: t.Optional(t.String()),
-          /** Payment ID from Moyasar for invoice creation */
-          paymentId: t.Optional(t.String()),
-        }),
+        }, { additionalProperties: false }),
       },
     )
 
     // Preview plan change (shows what user will pay)
     .get("/change-plan/preview/:planId", async (ctx) => {
-      const subscriberId = await requireSubscriberId(ctx);
+      const subscriberId = await requireSubscriberId(ctx, "preview-change-plan");
       const preview = await subs.subscriptions.previewChangePlan(
         subscriberId,
         ctx.params.planId,
+        {
+          ...(ctx.query["immediately"] !== undefined && { immediately: ctx.query["immediately"] === "true" }),
+          ...(ctx.query["prorate"] !== undefined && { prorate: ctx.query["prorate"] === "true" }),
+        },
       );
       return { preview };
+    }, {
+      query: t.Object({
+        immediately: t.Optional(t.Union([t.Literal("true"), t.Literal("false")])),
+        prorate: t.Optional(t.Union([t.Literal("true"), t.Literal("false")])),
+      }),
     })
 
     // Cancel subscription
     .post(
       "/cancel",
       async (ctx) => {
-        const subscriberId = await requireSubscriberId(ctx);
+        const subscriberId = await requireSubscriberId(ctx, "cancel");
         const { immediately, reason } = ctx.body;
         const subscription = await subs.subscriptions.cancel(subscriberId, {
           ...(immediately !== undefined && { immediately }),
@@ -364,14 +361,14 @@ export function elysiaPlugin<
 
     // Resume subscription (from paused status)
     .post("/resume", async (ctx) => {
-      const subscriberId = await requireSubscriberId(ctx);
+      const subscriberId = await requireSubscriberId(ctx, "resume");
       const subscription = await subs.subscriptions.resume(subscriberId);
       return { subscription };
     })
 
     // Reactivate subscription (undo scheduled cancellation)
     .post("/reactivate", async (ctx) => {
-      const subscriberId = await requireSubscriberId(ctx);
+      const subscriberId = await requireSubscriberId(ctx, "reactivate");
       const subscription = await subs.subscriptions.reactivate(subscriberId);
       return { subscription };
     })
@@ -380,21 +377,21 @@ export function elysiaPlugin<
 
     // Get all feature values
     .get("/features", async (ctx) => {
-      const subscriberId = await requireSubscriberId(ctx);
+      const subscriberId = await requireSubscriberId(ctx, "features");
       const features = await subs.permissions.getFeatures(subscriberId);
       return { features };
     })
 
     // Get usage for all limit features
     .get("/usage", async (ctx) => {
-      const subscriberId = await requireSubscriberId(ctx);
+      const subscriberId = await requireSubscriberId(ctx, "usage");
       const usage = await subs.permissions.getAllUsage(subscriberId);
       return { usage };
     })
 
     // Get usage for a specific feature
     .get("/usage/:feature", async (ctx) => {
-      const subscriberId = await requireSubscriberId(ctx);
+      const subscriberId = await requireSubscriberId(ctx, "usage");
       const usage = await subs.permissions.remaining(
         subscriberId,
         ctx.params.feature as keyof TFeatures,
@@ -404,7 +401,7 @@ export function elysiaPlugin<
 
     // Check if can use a feature
     .get("/can/:feature", async (ctx) => {
-      const subscriberId = await requireSubscriberId(ctx);
+      const subscriberId = await requireSubscriberId(ctx, "can");
       const can = await subs.can(
         subscriberId,
         ctx.params.feature as keyof TFeatures,
@@ -415,7 +412,7 @@ export function elysiaPlugin<
     // ==================== Invoices ====================
 
     .get("/invoices", async (ctx) => {
-      const subscriberId = await requireSubscriberId(ctx);
+      const subscriberId = await requireSubscriberId(ctx, "invoices");
       const subscription = await subs.subscriptions.get(subscriberId);
       if (!subscription) {
         return { invoices: [] };
@@ -426,7 +423,7 @@ export function elysiaPlugin<
 
     // Download invoice as PDF (default) or printable HTML (?format=html&print=1)
     .get("/invoices/:id/download", async (ctx) => {
-      const subscriberId = await requireSubscriberId(ctx);
+      const subscriberId = await requireSubscriberId(ctx, "invoice");
       const { id } = ctx.params;
 
       // Get invoice with full details
@@ -553,9 +550,11 @@ export function elysiaPlugin<
         "";
       const body = await ctx.request.text();
 
-      const event = await subs.handleWebhook(provider, body, signature);
+      const event = await subs.handleWebhook(provider, body, signature, {
+        headers: Object.fromEntries(ctx.request.headers.entries()),
+      });
       return { received: true, eventId: event.id };
-    })
+    }, { parse: "none" })
 
     // ==================== Macros ====================
 
@@ -570,7 +569,7 @@ export function elysiaPlugin<
        */
       requireFeature: (feature: keyof TFeatures) => ({
         beforeHandle: async (ctx: unknown) => {
-          const subscriberId = await requireSubscriberId(ctx);
+          const subscriberId = await requireSubscriberId(ctx, "can");
           const allowed = await subs.can(subscriberId, feature);
           if (!allowed) {
             throw new FeatureNotAllowedError(feature as string);
@@ -588,7 +587,7 @@ export function elysiaPlugin<
        */
       requireUsage: (config: { feature: keyof TFeatures; count?: number }) => ({
         beforeHandle: async (ctx: unknown) => {
-          const subscriberId = await requireSubscriberId(ctx);
+          const subscriberId = await requireSubscriberId(ctx, "usage");
           const canUse = await subs.permissions.canUse(
             subscriberId,
             config.feature,
@@ -615,7 +614,7 @@ export function elysiaPlugin<
        */
       useFeature: (feature: keyof TFeatures) => ({
         afterHandle: async (ctx: unknown) => {
-          const subscriberId = await requireSubscriberId(ctx);
+          const subscriberId = await requireSubscriberId(ctx, "consume-usage");
           await subs.use(subscriberId, feature);
         },
       }),
@@ -626,8 +625,8 @@ export function elysiaPlugin<
     app
       .guard({
         beforeHandle: async (ctx) => {
-          const isAdmin = await adminGuard(ctx);
-          if (!isAdmin) {
+          const isAdmin = await adminGuard!(ctx);
+          if (isAdmin !== true) {
             throw new FeatureNotAllowedError("admin");
           }
         },

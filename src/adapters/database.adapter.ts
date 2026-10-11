@@ -1,6 +1,8 @@
 // file: packages/subscriptions/src/adapters/database.adapter.ts
 // Database adapter interface for subscriptions package
 
+import type { OutboxStore } from './outbox.adapter.js';
+
 import type {
     Coupon,
     CreateCouponInput,
@@ -47,6 +49,49 @@ export interface PlanQueryOptions {
     offset?: number;
 }
 
+/** Verified external resource association. IDs never cross provider account/environment boundaries. */
+export interface ProviderResourceMapping {
+    providerId: string;
+    accountId: string;
+    environment: 'test' | 'live';
+    kind: 'customer' | 'payment_method' | 'subscription' | 'product' | 'price' | 'payment';
+    localId: string;
+    externalId: string;
+}
+export type ProviderResourceScope = Pick<ProviderResourceMapping, 'providerId' | 'accountId' | 'environment' | 'kind'>;
+export interface ProviderResourceStore {
+    /** Replaying the same binding is safe; changing either side of an existing binding fails. */
+    bind(mapping: ProviderResourceMapping): Promise<ProviderResourceMapping>;
+    findByExternal(scope: ProviderResourceScope, externalId: string): Promise<ProviderResourceMapping | null>;
+    findByLocal(scope: ProviderResourceScope, localId: string): Promise<ProviderResourceMapping | null>;
+}
+
+/** Immutable identity for a durable local billing command or accepted event. */
+export interface BillingOperationRecord {
+    key: string;
+    status: 'reserved' | 'collecting' | 'unknown' | 'succeeded' | 'failed' | 'applied';
+    payload: Record<string, unknown>;
+    createdAt: Date;
+    updatedAt: Date;
+}
+export interface BillingOperationStore {
+    reserve(key: string, payload: Record<string, unknown>): Promise<{ created: boolean; record: BillingOperationRecord }>;
+    find(key: string): Promise<BillingOperationRecord | null>;
+    compareAndSet(key: string, expectedStatus: BillingOperationRecord['status'], data: { status: BillingOperationRecord['status']; payload?: Record<string, unknown> }): Promise<boolean>;
+    update(key: string, data: { status: BillingOperationRecord['status']; payload?: Record<string, unknown> }): Promise<BillingOperationRecord>;
+}
+export interface UsagePeriodOptions {
+    periodStart?: Date;
+    periodEnd?: Date;
+}
+export interface UsageMutationOptions extends UsagePeriodOptions {
+    count?: number;
+    tenantId?: string | null;
+}
+export interface UsageReservationOptions extends UsageMutationOptions {
+    limit?: number | null;
+}
+
 /**
  * Database adapter interface
  *
@@ -54,6 +99,12 @@ export interface PlanQueryOptions {
  * The package ships with a Prisma adapter, but you can implement your own.
  */
 export interface DatabaseAdapter<TFeatures extends FeatureRegistry = FeatureRegistry> {
+    /** Financial services require true awaited rollback and transaction-owned stores. */
+    capabilities?: { asyncTransactions: boolean };
+    billingOperations?: BillingOperationStore;
+    providerResources?: ProviderResourceStore;
+    outbox?: OutboxStore;
+
     // ==================== Plans ====================
     plans: {
         /**
@@ -226,6 +277,11 @@ export interface DatabaseAdapter<TFeatures extends FeatureRegistry = FeatureRegi
          * @returns The updated coupon
          */
         incrementRedemptions(id: string): Promise<Coupon>;
+        /** Atomic eligible redemption, idempotent for the same purchase. */
+        reserveRedemption?(id: string, purchaseId: string, options?: { now?: Date }): Promise<Coupon | null>;
+        redeem?(id: string, purchaseId: string, options?: { now?: Date }): Promise<Coupon | null>;
+        /** Return the reservation once; a retry cannot decrement another purchase. */
+        releaseRedemption?(id: string, purchaseId: string): Promise<void>;
     };
 
     // ==================== Usage Tracking ====================
@@ -236,7 +292,7 @@ export interface DatabaseAdapter<TFeatures extends FeatureRegistry = FeatureRegi
          * @param feature - The feature key
          * @param options - Optional: period date and tenantId for tenant-scoped features
          */
-        get(subscriberId: string, feature: string, options?: { period?: Date; tenantId?: string | null }): Promise<number>;
+        get(subscriberId: string, feature: string, options?: UsagePeriodOptions & { period?: Date; tenantId?: string | null }): Promise<number>;
 
         /**
          * Increment usage count atomically
@@ -245,7 +301,7 @@ export interface DatabaseAdapter<TFeatures extends FeatureRegistry = FeatureRegi
          * @param options - Optional: count and tenantId for tenant-scoped features
          * @returns The new count after increment
          */
-        increment(subscriberId: string, feature: string, options?: { count?: number; tenantId?: string | null }): Promise<number>;
+        increment(subscriberId: string, feature: string, options?: UsageMutationOptions): Promise<number>;
 
         /**
          * Decrement usage count atomically
@@ -254,7 +310,9 @@ export interface DatabaseAdapter<TFeatures extends FeatureRegistry = FeatureRegi
          * @param options - Optional: count and tenantId for tenant-scoped features
          * @returns The new count after decrement (never goes below 0)
          */
-        decrement(subscriberId: string, feature: string, options?: { count?: number; tenantId?: string | null }): Promise<number>;
+        reserve?(subscriberId: string, feature: string, options?: UsageReservationOptions): Promise<{ accepted: boolean; count: number }>;
+
+        decrement(subscriberId: string, feature: string, options?: UsageMutationOptions): Promise<number>;
 
         /**
          * Set usage count to a specific value
@@ -263,7 +321,7 @@ export interface DatabaseAdapter<TFeatures extends FeatureRegistry = FeatureRegi
          * @param count - The count to set
          * @param tenantId - Optional tenantId for tenant-scoped features
          */
-        set(subscriberId: string, feature: string, count: number, tenantId?: string | null): Promise<void>;
+        set(subscriberId: string, feature: string, count: number, tenantId?: string | null, options?: UsagePeriodOptions): Promise<void>;
 
         /**
          * Reset usage for a subscriber (optionally for a specific feature)

@@ -9,6 +9,8 @@ import type {
     CreateCustomerInput,
     CreateGatewaySubscriptionInput,
     GatewayCustomer,
+    GatewayPayment,
+    PaymentGatewayCapabilities,
     GatewaySubscription,
     PaymentGatewayAdapter,
     PortalSession,
@@ -27,6 +29,8 @@ export type FakeChargeOutcome =
     | 'paid'
     | 'pending'
     | 'failed'
+    | 'authorized'
+    | 'unknown'
     | Partial<ChargePaymentResult>
     | ((input: ChargePaymentInput) => Partial<ChargePaymentResult>);
 
@@ -39,6 +43,7 @@ export interface FakePaymentGatewayOptions {
      * @default 'fake'
      */
     provider?: string;
+    capabilities?: PaymentGatewayCapabilities;
 
     /**
      * Queue of charge outcomes consumed one per {@link chargePayment} call.
@@ -72,6 +77,9 @@ export interface FakePaymentGateway extends PaymentGatewayAdapter {
     /** Append an outcome to the charge outcome queue */
     queueChargeOutcome(outcome: FakeChargeOutcome): void;
 
+    /** Set a provider snapshot for reconciliation tests. */
+    setPayment(payment: GatewayPayment): void;
+
     /** Clear the recorded call log */
     clearCalls(): void;
 
@@ -104,6 +112,8 @@ export function fakePaymentGateway(
     const chargeOutcomes: FakeChargeOutcome[] = [...(options.chargeOutcomes ?? [])];
     const customers = new Map<string, GatewayCustomer>();
     const subscriptions = new Map<string, GatewaySubscription>();
+    const payments = new Map<string, GatewayPayment>();
+    const idempotentCharges = new Map<string, ChargePaymentResult>();
     let idCounter = 0;
 
     const nextId = (prefix: string): string => `${prefix}_${++idCounter}`;
@@ -126,6 +136,9 @@ export function fakePaymentGateway(
 
         if (typeof resolved === 'string') {
             switch (resolved) {
+                case 'authorized':
+                case 'unknown':
+                    return { ...base, status: resolved };
                 case 'paid':
                     return { ...base, status: 'paid' };
                 case 'pending':
@@ -176,8 +189,13 @@ export function fakePaymentGateway(
 
     return {
         provider: options.provider ?? 'fake',
+        capabilities: options.capabilities ?? { customers: true, nativeSubscriptions: true, checkout: 'hosted', portal: true, directPayments: true, paymentLookup: true, idempotentCharges: true },
 
         calls,
+
+        setPayment(payment: GatewayPayment): void {
+            payments.set(payment.id, payment);
+        },
 
         queueChargeOutcome(outcome: FakeChargeOutcome): void {
             chargeOutcomes.push(outcome);
@@ -192,6 +210,8 @@ export function fakePaymentGateway(
             chargeOutcomes.length = 0;
             customers.clear();
             subscriptions.clear();
+            payments.clear();
+            idempotentCharges.clear();
         },
 
         // ==================== Customer Management ====================
@@ -279,8 +299,11 @@ export function fakePaymentGateway(
                 ...(data.priceId !== undefined && { priceId: data.priceId }),
                 ...(data.metadata !== undefined && { metadata: data.metadata }),
             };
-            if (data.cancelAtPeriodEnd) {
+            if (data.cancelAtPeriodEnd === true) {
                 updated.cancelAt = existing.currentPeriodEnd;
+            } else if (data.cancelAtPeriodEnd === false) {
+                updated.cancelAt = null;
+                updated.canceledAt = null;
             }
             subscriptions.set(subscriptionId, updated);
             return updated;
@@ -354,8 +377,17 @@ export function fakePaymentGateway(
         // ==================== Direct Payment ====================
         async chargePayment(data: ChargePaymentInput): Promise<ChargePaymentResult> {
             record('chargePayment', [data]);
+            if (data.idempotencyKey && idempotentCharges.has(data.idempotencyKey)) return idempotentCharges.get(data.idempotencyKey)!;
             const outcome = chargeOutcomes.shift() ?? 'paid';
-            return resolveChargeOutcome(outcome, data);
+            const result = resolveChargeOutcome(outcome, data);
+            if (data.idempotencyKey) idempotentCharges.set(data.idempotencyKey, result);
+            payments.set(result.id, { ...result, ...(data.metadata && { metadata: data.metadata }), ...(data.paymentMethodId && { paymentMethodId: data.paymentMethodId }), createdAt: new Date() });
+            return result;
+        },
+
+        async getPayment(paymentId: string): Promise<GatewayPayment | null> {
+            record('getPayment', [paymentId]);
+            return payments.get(paymentId) ?? null;
         },
 
         async getPaymentSource(paymentId: string): Promise<string | null> {
@@ -376,9 +408,11 @@ export function fakePaymentGateway(
                 await verifySignature(raw, signature, options.webhookSecret);
             }
 
-            const parsed = JSON.parse(raw) as { type: string; data?: Record<string, unknown> };
+            const parsed = JSON.parse(raw) as { id?: string; type: string; data?: Record<string, unknown> };
+            const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(raw));
+            const eventId = [...new Uint8Array(digest)].map(byte => byte.toString(16).padStart(2, '0')).join('');
             return {
-                id: `evt_${crypto.randomUUID()}`,
+                id: parsed.id ?? `evt_${eventId}`,
                 type: parsed.type,
                 data: parsed.data ?? {},
                 createdAt: new Date(),

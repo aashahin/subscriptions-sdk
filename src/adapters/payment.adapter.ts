@@ -34,7 +34,7 @@ export interface GatewaySubscription {
 export interface CheckoutSession {
     id: string;
     url: string;
-    expiresAt: Date;
+    expiresAt?: Date;
 }
 
 /**
@@ -53,6 +53,11 @@ export interface WebhookEvent {
     type: string;
     data: Record<string, unknown>;
     createdAt: Date;
+    /** Original verified provider event name. */
+    originalType?: string;
+    /** Verified provider environment, where included in its contract. */
+    environment?: string;
+    accountName?: string;
 }
 
 /**
@@ -118,6 +123,10 @@ export interface CreateCheckoutInput {
 export interface ChargePaymentInput {
     /** Customer/token ID to charge */
     customerId: string;
+    /** Separate reusable payment method/token. Legacy customerId remains for compatibility. */
+    paymentMethodId?: string;
+    /** Persist this key before collection and reuse it for reconciliation/retries. */
+    idempotencyKey?: string;
     /** Amount in smallest currency unit (e.g., cents, halalas) */
     amount: number;
     /** Currency code (e.g., 'USD', 'SAR') */
@@ -137,7 +146,7 @@ export interface ChargePaymentResult {
     /** Payment ID from gateway */
     id: string;
     /** Payment status */
-    status: 'paid' | 'pending' | 'failed';
+    status: 'paid' | 'pending' | 'authorized' | 'failed' | 'unknown';
     /** Amount charged */
     amount: number;
     /** Currency */
@@ -158,6 +167,53 @@ export interface ChargePaymentResult {
     httpStatus?: number;
 }
 
+/** Verified payment snapshot from the owning provider account. Amount uses minor units. */
+export interface GatewayPayment extends ChargePaymentResult {
+    paymentMethodId?: string;
+    metadata?: Record<string, string>;
+    createdAt?: Date;
+}
+
+export interface GatewayPaymentMethod {
+    id: string;
+    status: 'active' | 'inactive' | 'pending';
+    metadata?: Record<string, string>;
+}
+
+/** Capability declarations describe actual provider operations, not local emulations. */
+export interface PaymentGatewayCapabilities {
+    customers?: boolean;
+    nativeSubscriptions?: boolean;
+    checkout?: 'hosted' | 'embedded' | 'none';
+    portal?: boolean;
+    directPayments?: boolean;
+    paymentLookup?: boolean;
+    idempotentCharges?: boolean;
+}
+
+export interface WebhookVerificationContext {
+    /** Complete headers; adapters select and verify their native transport fields. */
+    headers: Record<string, string>;
+}
+
+export interface EmbeddedCheckoutInput {
+    amount: number;
+    currency: string;
+    callbackUrl?: string;
+    description?: string;
+    metadata?: Record<string, string>;
+}
+
+export interface EmbeddedCheckoutConfiguration {
+    provider: string;
+    amount: number;
+    currency: string;
+    publishable_api_key: string;
+    callback_url: string;
+    description?: string;
+    metadata?: Record<string, string>;
+}
+
 /**
  * Payment gateway adapter interface
  *
@@ -169,18 +225,19 @@ export interface PaymentGatewayAdapter {
      * Provider name for logging and identification
      */
     readonly provider: string;
+    readonly capabilities?: PaymentGatewayCapabilities;
 
     // ==================== Customer Management ====================
 
     /**
      * Create a customer in the payment gateway
      */
-    createCustomer(data: CreateCustomerInput): Promise<GatewayCustomer>;
+    createCustomer?(data: CreateCustomerInput): Promise<GatewayCustomer>;
 
     /**
      * Get a customer by ID
      */
-    getCustomer(customerId: string): Promise<GatewayCustomer | null>;
+    getCustomer?(customerId: string): Promise<GatewayCustomer | null>;
 
     /**
      * Update customer details
@@ -192,17 +249,17 @@ export interface PaymentGatewayAdapter {
     /**
      * Create a subscription in the payment gateway
      */
-    createSubscription(data: CreateGatewaySubscriptionInput): Promise<GatewaySubscription>;
+    createSubscription?(data: CreateGatewaySubscriptionInput): Promise<GatewaySubscription>;
 
     /**
      * Get a subscription by ID
      */
-    getSubscription(subscriptionId: string): Promise<GatewaySubscription | null>;
+    getSubscription?(subscriptionId: string): Promise<GatewaySubscription | null>;
 
     /**
      * Update a subscription (e.g., change plan)
      */
-    updateSubscription(
+    updateSubscription?(
         subscriptionId: string,
         data: UpdateGatewaySubscriptionInput,
     ): Promise<GatewaySubscription>;
@@ -210,7 +267,7 @@ export interface PaymentGatewayAdapter {
     /**
      * Cancel a subscription
      */
-    cancelSubscription(subscriptionId: string, options?: CancelOptions): Promise<GatewaySubscription>;
+    cancelSubscription?(subscriptionId: string, options?: CancelOptions): Promise<GatewaySubscription>;
 
     /**
      * Pause a subscription (if supported)
@@ -227,12 +284,12 @@ export interface PaymentGatewayAdapter {
     /**
      * Create a checkout session for new subscriptions
      */
-    createCheckoutSession(data: CreateCheckoutInput): Promise<CheckoutSession>;
+    createCheckoutSession?(data: CreateCheckoutInput): Promise<CheckoutSession>;
 
     /**
      * Create a customer portal session for managing billing
      */
-    createPortalSession(customerId: string, returnUrl: string): Promise<PortalSession>;
+    createPortalSession?(customerId: string, returnUrl: string): Promise<PortalSession>;
 
     // ==================== Webhooks ====================
 
@@ -242,6 +299,11 @@ export interface PaymentGatewayAdapter {
      * Charge a one-time payment (for upgrades, renewals, etc.)
      * This uses a saved token/customer ID to charge directly.
      */
+    getEmbeddedCheckoutConfiguration?(data: EmbeddedCheckoutInput): EmbeddedCheckoutConfiguration;
+
+    getPayment?(paymentId: string): Promise<GatewayPayment | null>;
+    getPaymentMethod?(paymentMethodId: string): Promise<GatewayPaymentMethod | null>;
+
     chargePayment?(data: ChargePaymentInput): Promise<ChargePaymentResult>;
 
     /**
@@ -259,7 +321,7 @@ export interface PaymentGatewayAdapter {
      * @param payload - Raw webhook payload
      * @param signature - Webhook signature header
      */
-    constructWebhookEvent(payload: string | Uint8Array, signature: string): Promise<WebhookEvent>;
+    constructWebhookEvent(payload: string | Uint8Array, signature: string, context?: WebhookVerificationContext): Promise<WebhookEvent>;
 }
 
 /**
@@ -267,6 +329,7 @@ export interface PaymentGatewayAdapter {
  */
 export const noopPaymentAdapter: PaymentGatewayAdapter = {
     provider: 'manual',
+    capabilities: { customers: false, nativeSubscriptions: false, checkout: 'none', portal: false, directPayments: false, paymentLookup: false, idempotentCharges: false },
     createCustomer: async () => {
         throw new Error('Payment gateway not configured');
     },

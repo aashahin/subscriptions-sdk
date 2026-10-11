@@ -33,7 +33,9 @@ export interface NextRouteHandlers {
  * import { subs } from '@/lib/subscriptions';
  *
  * export const { GET, POST } = createNextHandlers(subs, {
- *   getSubscriberId: (req) => req.headers.get('x-tenant-id'),
+ *   getSubscriberId: async (req) => (await authenticate(req))?.activeTenantId,
+ *   authorizeSubscriber: async (req, tenantId, operation) =>
+ *     canManageSubscriptions(await authenticate(req), tenantId, operation),
  * });
  * ```
  */

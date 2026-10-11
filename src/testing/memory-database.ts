@@ -16,7 +16,11 @@ import type {
     UpdateSubscriptionInput,
     UsageRecord,
 } from '../core/types.js';
+import { queue, serialAdapter, usagePeriod, validateUsageCount, validateUsageLimit, validateProviderResource, providerResourceScope, providerResourceKey } from '../adapters/persistence-utils.js';
+import type { Coupon } from '../core/coupons.js';
+import type { OutboxRecord } from '../adapters/outbox.adapter.js';
 import type {
+    BillingOperationRecord, ProviderResourceMapping, UsageMutationOptions, UsagePeriodOptions, UsageReservationOptions,
     DatabaseAdapter,
     PlanQueryOptions,
     SubscriptionQueryOptions,
@@ -39,6 +43,12 @@ interface MemoryState<TFeatures extends FeatureRegistry> {
     subscriptions: Map<string, Subscription>;
     invoices: Map<string, Invoice>;
     usage: Map<string, StoredUsageRecord>;
+    operations: Map<string,BillingOperationRecord>;
+    outbox: Map<string,{event:OutboxRecord;status:string;claimedAt:number}>;
+    coupons: Map<string,Coupon>;
+    redemptions: Map<string,{couponId:string;status:string;couponSnapshot:Coupon}>;
+    sequences: Map<string,number>;
+    resources:Map<string,ProviderResourceMapping>;
 }
 
 /** Statuses considered "live" for subscriber/downgrade checks */
@@ -56,7 +66,7 @@ const DAY_MS = 24 * 60 * 60 * 1000;
  * `hasActiveSubscribers` and `hasPendingDowngrades`), subscriptions (including
  * `findExpiring`), invoices (including `findByGatewayInvoiceId` for idempotent
  * webhook handling), usage tracking (increment/decrement/set/reset with
- * never-below-zero decrement semantics), and transactions via a shallow
+ * never-below-zero decrement semantics), and transactions via a deep
  * snapshot that is restored when the transaction function throws.
  *
  * Useful for unit tests, demos, and as a reference implementation when
@@ -80,6 +90,7 @@ export function memoryDatabaseAdapter<
         subscriptions: new Map(),
         invoices: new Map(),
         usage: new Map(),
+        operations:new Map(),outbox:new Map(),coupons:new Map(),redemptions:new Map(),sequences:new Map(),resources:new Map(),
     };
 
     const usageKey = (
@@ -107,7 +118,46 @@ export function memoryDatabaseAdapter<
         return plan ? { ...subscription, plan } : null;
     };
 
-    const createAdapter = (): DatabaseAdapter<TFeatures> => ({
+    const run = queue();
+    const createAdapter = (inTransaction = false): DatabaseAdapter<TFeatures> => ({
+        capabilities: {asyncTransactions:true},
+        providerResources: {
+            async bind(mapping) {
+                const scope=providerResourceScope(mapping);validateProviderResource(scope,mapping.localId);validateProviderResource(scope,mapping.externalId);
+                const external=state.resources.get(providerResourceKey(scope,mapping.externalId));
+                const local=await this.findByLocal(scope,mapping.localId);
+                if(external&&external.localId!==mapping.localId||local&&local.externalId!==mapping.externalId)throw new Error('Provider resource is already bound to another local or external identity');
+                if(!external)state.resources.set(providerResourceKey(scope,mapping.externalId),structuredClone(mapping));
+                return structuredClone(external??mapping);
+            },
+            async findByExternal(scope,externalId) {validateProviderResource(scope,externalId);return structuredClone(state.resources.get(providerResourceKey(scope,externalId))??null);},
+            async findByLocal(scope,localId) {validateProviderResource(scope,localId);const key=providerResourceKey(scope,localId);return structuredClone([...state.resources.values()].find(r=>providerResourceKey(providerResourceScope(r),r.localId)===key)??null);},
+        },
+        billingOperations: {
+            async reserve(key,payload) {const existing=state.operations.get(key);if(existing)return {created:false,record:structuredClone(existing)};
+                const record:BillingOperationRecord={key,payload:structuredClone(payload),status:'reserved',createdAt:new Date(),updatedAt:new Date()};state.operations.set(key,record);return {created:true,record:structuredClone(record)};},
+            async find(key) {return structuredClone(state.operations.get(key)??null);},
+            async update(key,data) {const record=state.operations.get(key);if(!record)throw new Error('Billing operation not found');const updated={...record,...structuredClone(data),updatedAt:new Date()};state.operations.set(key,updated);return structuredClone(updated);},
+            async compareAndSet(key,expectedStatus,data) {const record=state.operations.get(key);if(!record||record.status!==expectedStatus)return false;state.operations.set(key,{...record,...structuredClone(data),updatedAt:new Date()});return true;},
+        },
+        outbox: {
+            async insert(event) {if(!state.outbox.has(event.id))state.outbox.set(event.id,{event:structuredClone(event),status:'pending',claimedAt:0});},
+            async claimPending(limit=100) {const result:OutboxRecord[]=[];for(const row of state.outbox.values())if(row.status==='pending'||row.status==='claimed'&&row.claimedAt<Date.now()-300000){row.status='claimed';row.claimedAt=Date.now();result.push(structuredClone(row.event));if(result.length>=limit)break;}return result;},
+            async releaseClaim(id) {const row=state.outbox.get(id);if(row?.status==='claimed'){row.status='pending';row.claimedAt=0;}},
+            async markSent(id) {const row=state.outbox.get(id);if(row)row.status='sent';},
+        },
+        coupons: {
+            async findByCode(code) {return structuredClone([...state.coupons.values()].find(c=>c.code===code)??null);},
+            async findById(id) {return structuredClone(state.coupons.get(id)??null);},
+            async create(data) {if([...state.coupons.values()].some(c=>c.code===data.code))throw new Error('Unique coupon code');const now=new Date();const coupon:Coupon={id:crypto.randomUUID(),code:data.code,type:data.type,value:data.value,currency:data.currency??null,duration:data.duration??'once',durationInMonths:data.durationInMonths??null,maxRedemptions:data.maxRedemptions??null,expiresAt:data.expiresAt??null,isActive:data.isActive??true,timesRedeemed:0,metadata:data.metadata??null,createdAt:now,updatedAt:now};state.coupons.set(coupon.id,coupon);return structuredClone(coupon);},
+            async update(id,data) {const coupon=state.coupons.get(id);if(!coupon)throw new Error('Coupon not found');const updated={...coupon,...data,updatedAt:new Date()};state.coupons.set(id,updated);return structuredClone(updated);},
+            async incrementRedemptions() {throw new Error('Coupon redemption requires a purchaseId; use redeem()');},
+            async reserveRedemption(id,purchaseId,options) {return this.redeem!(id,purchaseId,options);},
+            async redeem(id,purchaseId,options) {if(!purchaseId)throw new Error('Coupon redemption requires a purchaseId');const existing=state.redemptions.get(purchaseId);if(existing){if(existing.couponId!==id)throw new Error('Purchase already bound to another coupon');return existing.status==='reserved'?structuredClone(existing.couponSnapshot):null;}
+                const coupon=state.coupons.get(id);const now=options?.now??new Date();if(!coupon||!coupon.isActive||coupon.expiresAt&&coupon.expiresAt<=now||coupon.maxRedemptions!==null&&coupon.timesRedeemed>=coupon.maxRedemptions)return null;
+                coupon.timesRedeemed++;state.redemptions.set(purchaseId,{couponId:id,status:'reserved',couponSnapshot:structuredClone(coupon)});return structuredClone(coupon);},
+            async releaseRedemption(id,purchaseId) {const row=state.redemptions.get(purchaseId);if(row?.couponId===id&&row.status==='reserved'){row.status='released';const coupon=state.coupons.get(id);if(coupon)coupon.timesRedeemed--;}},
+        },
         // ==================== Plans ====================
         plans: {
             async findById(id: string): Promise<Plan<TFeatures> | null> {
@@ -152,6 +202,7 @@ export function memoryDatabaseAdapter<
                     name: data.name,
                     description: data.description ?? null,
                     price: data.price,
+                    ...(data.prices && {prices:structuredClone(data.prices)}),
                     currency: data.currency ?? 'USD',
                     interval: data.interval,
                     intervalCount: data.intervalCount ?? 1,
@@ -180,6 +231,7 @@ export function memoryDatabaseAdapter<
                     ...(data.name !== undefined && { name: data.name }),
                     ...(data.description !== undefined && { description: data.description }),
                     ...(data.price !== undefined && { price: data.price }),
+                    ...(data.prices !== undefined && {prices:structuredClone(data.prices)}),
                     ...(data.currency !== undefined && { currency: data.currency }),
                     ...(data.interval !== undefined && { interval: data.interval }),
                     ...(data.intervalCount !== undefined && { intervalCount: data.intervalCount }),
@@ -265,6 +317,9 @@ export function memoryDatabaseAdapter<
                 const now = new Date();
                 const subscription: Subscription = {
                     id: crypto.randomUUID(),
+                    quantity: data.quantity ?? 1,
+                    addOns: data.addOns ?? [],
+                    ...(data.billing && {billing:data.billing}),
                     subscriberId: data.subscriberId,
                     subscriberType: data.subscriberType ?? 'tenant',
                     planId: data.planId,
@@ -296,6 +351,7 @@ export function memoryDatabaseAdapter<
                 }
                 const updated: Subscription = {
                     ...existing,
+                    ...data,
                     ...(data.planId !== undefined && { planId: data.planId }),
                     ...(data.status !== undefined && { status: data.status }),
                     ...(data.currentPeriodStart !== undefined && {
@@ -388,8 +444,10 @@ export function memoryDatabaseAdapter<
                     throw new Error(`Subscription not found: ${data.subscriptionId}`);
                 }
 
+                if(data.gatewayInvoiceId && [...state.invoices.values()].some(row=>row.gatewayInvoiceId===data.gatewayInvoiceId))throw new Error('Unique gateway invoice id');
                 const now = new Date();
                 const invoice: Invoice = {
+                    ...data,
                     id: crypto.randomUUID(),
                     subscriptionId: data.subscriptionId,
                     subscriberId: subscription.subscriberId,
@@ -408,6 +466,8 @@ export function memoryDatabaseAdapter<
                 return invoice;
             },
 
+            async nextInvoiceNumber(prefix: string) {const value=(state.sequences.get(prefix)??0)+1;state.sequences.set(prefix,value);return `${prefix}${String(value).padStart(6,'0')}`;},
+
             async update(id: string, data: UpdateInvoiceInput): Promise<Invoice> {
                 const existing = state.invoices.get(id);
                 if (!existing) {
@@ -415,6 +475,7 @@ export function memoryDatabaseAdapter<
                 }
                 const updated: Invoice = {
                     ...existing,
+                    ...data,
                     ...(data.amount !== undefined && { amount: data.amount }),
                     ...(data.status !== undefined && { status: data.status }),
                     ...(data.gatewayInvoiceId !== undefined && {
@@ -436,7 +497,7 @@ export function memoryDatabaseAdapter<
             async get(
                 subscriberId: string,
                 feature: string,
-                options?: { period?: Date; tenantId?: string | null },
+                options?: UsagePeriodOptions & { period?: Date; tenantId?: string | null },
             ): Promise<number> {
                 const period = options?.period ?? new Date();
                 const tenantId = options?.tenantId ?? subscriberId;
@@ -446,7 +507,7 @@ export function memoryDatabaseAdapter<
                         record.subscriberId === subscriberId &&
                         record.tenantId === tenantId &&
                         record.feature === feature &&
-                        record.periodStart <= period &&
+                        (options?.periodStart ? record.periodStart.getTime() === options.periodStart.getTime() : record.periodStart <= period) &&
                         record.periodEnd >= period
                     ) {
                         return record.count;
@@ -458,12 +519,13 @@ export function memoryDatabaseAdapter<
             async increment(
                 subscriberId: string,
                 feature: string,
-                options?: { count?: number; tenantId?: string | null },
+                options?: UsageMutationOptions,
             ): Promise<number> {
                 const count = options?.count ?? 1;
+                validateUsageCount(count);
                 const tenantId = options?.tenantId ?? subscriberId;
                 const now = new Date();
-                const periodStart = getMonthStart(now);
+                const {periodStart,periodEnd} = usagePeriod(options);
                 const key = usageKey(subscriberId, tenantId, feature, periodStart);
 
                 const existing = state.usage.get(key);
@@ -480,7 +542,7 @@ export function memoryDatabaseAdapter<
                     feature,
                     count,
                     periodStart,
-                    periodEnd: getMonthEnd(now),
+                    periodEnd,
                     createdAt: now,
                     updatedAt: now,
                 };
@@ -488,15 +550,26 @@ export function memoryDatabaseAdapter<
                 return record.count;
             },
 
+            async reserve(subscriberId: string,feature: string,options?:UsageReservationOptions) {
+                const count=options?.count??1;validateUsageCount(count);validateUsageLimit(options?.limit);
+                const tenantId=options?.tenantId??subscriberId;const {periodStart,periodEnd}=usagePeriod(options);
+                const key=usageKey(subscriberId,tenantId,feature,periodStart);const existing=state.usage.get(key);
+                const current=existing?.count??0;const limit=options?.limit??Number.MAX_SAFE_INTEGER;
+                if(current>limit-count)return {accepted:false,count:current};
+                const now=new Date();if(existing){existing.count+=count;existing.updatedAt=now;}else state.usage.set(key,{id:crypto.randomUUID(),subscriberId,tenantId,feature,count,periodStart,periodEnd,createdAt:now,updatedAt:now});
+                return {accepted:true,count:current+count};
+            },
+
             async decrement(
                 subscriberId: string,
                 feature: string,
-                options?: { count?: number; tenantId?: string | null },
+                options?: UsageMutationOptions,
             ): Promise<number> {
                 const count = options?.count ?? 1;
+                validateUsageCount(count);
                 const tenantId = options?.tenantId ?? subscriberId;
                 const now = new Date();
-                const periodStart = getMonthStart(now);
+                const {periodStart,periodEnd} = usagePeriod(options);
                 const key = usageKey(subscriberId, tenantId, feature, periodStart);
 
                 // Never below zero: clamp the stored count when the release
@@ -515,10 +588,12 @@ export function memoryDatabaseAdapter<
                 feature: string,
                 count: number,
                 tenantId?: string | null,
+                options?: UsagePeriodOptions,
             ): Promise<void> {
+                validateUsageCount(count,true);
                 const tid = tenantId ?? subscriberId;
                 const now = new Date();
-                const periodStart = getMonthStart(now);
+                const {periodStart,periodEnd} = usagePeriod(options);
                 const key = usageKey(subscriberId, tid, feature, periodStart);
 
                 const existing = state.usage.get(key);
@@ -535,7 +610,7 @@ export function memoryDatabaseAdapter<
                     feature,
                     count,
                     periodStart,
-                    periodEnd: getMonthEnd(now),
+                    periodEnd,
                     createdAt: now,
                     updatedAt: now,
                 });
@@ -580,29 +655,14 @@ export function memoryDatabaseAdapter<
         async transaction<T>(
             fn: (tx: DatabaseAdapter<TFeatures>) => Promise<T>,
         ): Promise<T> {
-            // Shallow snapshot: the maps themselves are copied (records are
-            // shared by reference). On failure the copies are restored, which
-            // undoes any create/update/delete applied through map references.
-            const snapshot: MemoryState<TFeatures> = {
-                plans: new Map(state.plans),
-                subscriptions: new Map(state.subscriptions),
-                invoices: new Map(state.invoices),
-                usage: new Map(state.usage),
-            };
-
-            try {
-                return await fn(createAdapter());
-            } catch (error) {
-                state.plans = snapshot.plans;
-                state.subscriptions = snapshot.subscriptions;
-                state.invoices = snapshot.invoices;
-                state.usage = snapshot.usage;
-                throw error;
-            }
+            if(inTransaction)return fn(createAdapter(true));
+            const snapshot = structuredClone(state);
+            try { return await fn(createAdapter(true)); }
+            catch(error) {Object.assign(state,snapshot);throw error;}
         },
     });
 
-    return createAdapter();
+    return serialAdapter(createAdapter(),run);
 }
 
 // ==================== Helpers ====================

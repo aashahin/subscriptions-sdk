@@ -32,13 +32,20 @@ import {
 | `SubscriptionExpiredError`     | `SUBSCRIPTION_EXPIRED`      | 402    | Subscription period expired                                     |
 | `SubscriptionInactiveError`    | `SUBSCRIPTION_INACTIVE`     | 402    | Subscription is canceled, paused, unpaid, or otherwise inactive |
 | `PaymentGatewayError`          | `PAYMENT_GATEWAY_ERROR`     | 502    | Gateway call failed at the integration layer                    |
-| `PaymentFailedError`           | `PAYMENT_FAILED`            | 402    | Charge was declined or could not complete                       |
+| `PaymentFailedError`           | `PAYMENT_FAILED`            | 402    | Provider confirmed failure or a required payment method is unavailable |
 | `InvalidPlanError`             | `INVALID_PLAN`              | 400    | Plan feature overrides failed validation                        |
 | `DuplicateSubscriptionError`   | `DUPLICATE_SUBSCRIPTION`    | 409    | Subscriber already has an active subscription                   |
 | `SubscriptionNotCanceledError` | `SUBSCRIPTION_NOT_CANCELED` | 400    | Resume or reactivate was called in the wrong state              |
 | `CouponNotFoundError`          | `COUPON_NOT_FOUND`          | 404    | Coupon code does not exist                                      |
 | `CouponInvalidError`           | `COUPON_INVALID`            | 400    | Coupon is inactive, expired, or exhausted (`reason` field)      |
 | `InvoiceVoidError`             | `INVOICE_VOID`              | 400    | Invoice cannot be voided or credited in its current state       |
+| `SubscriptionError`            | `PAYMENT_OUTCOME_UNKNOWN`   | 409    | Collection may have succeeded; reconcile the persisted attempt before retrying |
+| `SubscriptionError`            | `QUOTE_REQUIRED` / `QUOTE_EXPIRED` | 409 | Preview and confirm the current payable quote |
+| `SubscriptionError`            | `BILLING_STORAGE_UNSUPPORTED` | 409  | Driver/schema cannot provide the required financial transaction |
+| `SubscriptionError`            | `PROVIDER_BINDING_REQUIRED` | 409    | Legacy subscription needs provider/account/environment backfill |
+| `SubscriptionError`            | `ATOMIC_USAGE_NOT_SUPPORTED` | 501  | Capped usage adapter lacks conditional admission |
+| `SubscriptionError`            | `INVALID_USAGE_VALUE`      | 400    | Quantity is not an allowed safe integer |
+| `SubscriptionError`            | `CACHE_NAMESPACE_REQUIRED` | 400    | Real cache lacks an application/database/environment namespace |
 
 ## Recommended Pattern
 
@@ -46,7 +53,7 @@ Catch specific package errors first, then fall back to the base `SubscriptionErr
 
 ```ts
 try {
-  await subscriptions.permissions.assertCanUse(tenantId, "maxProducts", 1);
+  // This performs durable conditional admission; preview checks do not reserve.
   await subscriptions.use(tenantId, "maxProducts");
 } catch (error) {
   if (error instanceof UsageLimitExceededError) {
@@ -122,9 +129,10 @@ try {
 
 ```ts
 try {
+  const preview = await subscriptions.subscriptions.previewChangePlan(tenantId, nextPlanId);
+  // Present the quote to the authenticated subscriber and obtain confirmation.
   await subscriptions.subscriptions.changePlan(tenantId, nextPlanId, {
-    prorate: true,
-    verifiedTokenId,
+    quoteId: preview.quoteId,
   });
 } catch (error) {
   if (error instanceof PaymentFailedError) {
@@ -140,7 +148,9 @@ try {
 }
 ```
 
-Use `PaymentGatewayError` for transport or upstream integration failures that should usually be logged and retried rather than presented as a business-rule denial.
+Transport failures may mean the provider accepted the charge. The SDK persists an unknown attempt and returns `PAYMENT_OUTCOME_UNKNOWN`; log the context and reconcile that same attempt. Do not start a new charge, release a coupon reservation, or manually grant access on the assumption that a rejected HTTP call proves payment failure. Confirmed failures may advance to a cycle-scoped server retry according to the dunning policy. Expired quotes require another preview and renewed confirmation.
+
+Provider-managed subscriptions reject local scheduled collection with `PROVIDER_OWNS_BILLING`. Unsupported native lifecycle operations return `UNSUPPORTED_OPERATION`. These are integration decisions to resolve on the server, not client payment fields to override.
 
 ## Subscription State Failures
 
@@ -218,7 +228,8 @@ export const subscriptionErrorHandler = new Elysia().onError(
 
 ## Operational Advice
 
-- Log `PaymentGatewayError` with the upstream error payload if available.
+- Log payment errors with the persisted attempt identity; avoid retaining payment secrets or raw webhook authentication tokens.
 - Treat `UsageLimitExceededError` and `FeatureNotAllowedError` as normal product events, not system failures.
 - Keep error codes stable if your frontend depends on them.
 - When adding custom routes around the package, preserve `statusCode` unless you have a deliberate API contract reason to remap it.
+- Configure trusted identity and operation-level tenant membership authorization before exposing routes. Missing identity returns 401; denied permissions return 403. Administrative guards are separate from subscriber authentication.

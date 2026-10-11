@@ -12,6 +12,7 @@ import type {
   CreateCustomerInput,
   CreateGatewaySubscriptionInput,
   GatewayCustomer,
+  GatewayPayment,
   GatewaySubscription,
   PaymentGatewayAdapter,
   PortalSession,
@@ -106,8 +107,11 @@ export interface StripePaymentIntent {
     | "canceled"
     | "succeeded";
   amount: number;
+  amount_received?: number;
   currency: string;
   payment_method: string | null;
+  metadata?: Record<string, string>;
+  created?: number;
   next_action?: {
     type: string;
     redirect_to_url?: { url: string };
@@ -136,6 +140,8 @@ export interface StripeWebhookPayload {
   type: string;
   data: { object: Record<string, unknown> };
   created: number;
+  livemode?: boolean;
+  account?: string;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -199,6 +205,7 @@ class StripeClient {
     method: string,
     path: string,
     params?: Record<string, string>,
+    idempotencyKey?: string,
   ): Promise<T> {
     const url = `${this.baseUrl}${path}`;
 
@@ -206,7 +213,7 @@ class StripeClient {
     try {
       response = await fetch(url, {
         method,
-        headers: this.headers,
+        headers: { ...this.headers, ...(idempotencyKey && { "Idempotency-Key": idempotencyKey }) },
         // Stripe expects form-encoded bodies; GET/DELETE send no body
         ...(params &&
           method !== "GET" && {
@@ -256,8 +263,8 @@ class StripeClient {
     return this.request<T>("GET", path);
   }
 
-  post<T>(path: string, params?: Record<string, string>): Promise<T> {
-    return this.request<T>("POST", path, params);
+  post<T>(path: string, params?: Record<string, string>, idempotencyKey?: string): Promise<T> {
+    return this.request<T>("POST", path, params, idempotencyKey);
   }
 
   delete<T>(path: string): Promise<T> {
@@ -273,10 +280,11 @@ class StripeClient {
 function encodeMetadata(
   metadata: Record<string, string> | undefined,
   params: Record<string, string>,
+  prefix = "metadata",
 ): void {
   if (!metadata) return;
   for (const [key, value] of Object.entries(metadata)) {
-    params[`metadata[${key}]`] = value;
+    params[`${prefix}[${key}]`] = value;
   }
 }
 
@@ -329,82 +337,36 @@ function mapSubscription(sub: StripeSubscription): GatewaySubscription {
   };
 }
 
-/** Constant-time string comparison for hex signatures */
-function timingSafeEqual(a: string, b: string): boolean {
-  const encoder = new TextEncoder();
-  const aBytes = encoder.encode(a);
-  const bBytes = encoder.encode(b);
-  if (aBytes.length !== bBytes.length) return false;
-
-  let diff = 0;
-  for (let i = 0; i < aBytes.length; i++) {
-    diff |= aBytes[i]! ^ bBytes[i]!;
-  }
-  return diff === 0;
-}
-
-/**
- * Verify a Stripe webhook signature (Stripe-Signature header).
- *
- * The header is a comma-separated list of `t=<timestamp>,v1=<hex hmac>` pairs.
- * The expected signature is HMAC-SHA256 of `${t}.${payload}` with the webhook
- * signing secret. Requests older than the tolerance window are rejected.
- */
+/** Verify the signed raw bytes without parsing/re-encoding the request body. */
 async function verifyStripeSignature(
-  payload: string,
+  payload: string | Uint8Array,
   signatureHeader: string,
   webhookSecret: string,
   toleranceSeconds: number,
 ): Promise<boolean> {
-  // Parse the Stripe-Signature header
-  let timestamp: string | null = null;
+  let timestamp: string | undefined;
   const signatures: string[] = [];
   for (const part of signatureHeader.split(",")) {
-    const [key, value] = part.split("=", 2);
-    if (key === "t" && value) {
-      timestamp = value;
-    } else if (key === "v1" && value) {
-      signatures.push(value);
-    }
+    const [key, value] = part.trim().split("=", 2);
+    if (key === "t") timestamp = value;
+    if (key === "v1" && value) signatures.push(value);
   }
-
-  if (!timestamp || signatures.length === 0) {
-    return false;
-  }
-
-  // Reject events outside the tolerance window (replay protection)
-  const timestampMs = parseInt(timestamp, 10) * 1000;
-  if (Number.isNaN(timestampMs)) {
-    return false;
-  }
-  const ageMs = Math.abs(Date.now() - timestampMs);
-  if (ageMs > toleranceSeconds * 1000) {
-    return false;
-  }
-
-  // Compute the expected HMAC-SHA256 signature
+  if (!timestamp || !/^\d+$/.test(timestamp) || !Number.isSafeInteger(Number(timestamp)) || !signatures.length ||
+      !Number.isFinite(toleranceSeconds) || toleranceSeconds < 0 ||
+      Math.abs(Date.now() - Number(timestamp) * 1000) > toleranceSeconds * 1000) return false;
   const encoder = new TextEncoder();
-  const key = await crypto.subtle.importKey(
-    "raw",
-    encoder.encode(webhookSecret),
-    { name: "HMAC", hash: "SHA-256" },
-    false,
-    ["sign"],
-  );
-  const signatureBytes = await crypto.subtle.sign(
-    "HMAC",
-    key,
-    encoder.encode(`${timestamp}.${payload}`),
-  );
-  const expectedSignature = Array.from(new Uint8Array(signatureBytes))
-    .map((byte) => byte.toString(16).padStart(2, "0"))
-    .join("");
-
-  // Constant-time compare against every v1 signature (Stripe may send several
-  // when the endpoint secret is being rolled)
-  return signatures.some((signature) =>
-    timingSafeEqual(signature.toLowerCase(), expectedSignature),
-  );
+  const key = await crypto.subtle.importKey("raw", encoder.encode(webhookSecret), { name: "HMAC", hash: "SHA-256" }, false, ["verify"]);
+  const rawBytes = typeof payload === "string" ? encoder.encode(payload) : payload;
+  const prefix = encoder.encode(`${timestamp}.`);
+  const signedBytes = new Uint8Array(prefix.length + rawBytes.length);
+  signedBytes.set(prefix);
+  signedBytes.set(rawBytes, prefix.length);
+  for (const signature of signatures) {
+    if (!/^[a-f0-9]{64}$/i.test(signature)) continue;
+    const bytes = new Uint8Array(signature.match(/.{2}/g)!.map(byte => parseInt(byte, 16)));
+    if (await crypto.subtle.verify("HMAC", key, bytes, signedBytes)) return true;
+  }
+  return false;
 }
 
 /** Map a Stripe card decline code to user-facing guidance */
@@ -479,6 +441,10 @@ export function stripeAdapter(config: StripeConfig): PaymentGatewayAdapter {
 
   return {
     provider: "stripe",
+    capabilities: {
+      customers: true, nativeSubscriptions: true, checkout: "hosted", portal: true,
+      directPayments: true, paymentLookup: true, idempotentCharges: true,
+    },
 
     // ==================== Customer Management ====================
 
@@ -497,8 +463,9 @@ export function stripeAdapter(config: StripeConfig): PaymentGatewayAdapter {
           `/customers/${encodeURIComponent(customerId)}`,
         );
         return mapCustomer(customer);
-      } catch {
-        return null;
+      } catch (error) {
+        if (error instanceof StripeAdapterError && error.httpStatus === 404) return null;
+        throw error;
       }
     },
 
@@ -547,8 +514,9 @@ export function stripeAdapter(config: StripeConfig): PaymentGatewayAdapter {
           `/subscriptions/${encodeURIComponent(subscriptionId)}`,
         );
         return mapSubscription(subscription);
-      } catch {
-        return null;
+      } catch (error) {
+        if (error instanceof StripeAdapterError && error.httpStatus === 404) return null;
+        throw error;
       }
     },
 
@@ -649,6 +617,7 @@ export function stripeAdapter(config: StripeConfig): PaymentGatewayAdapter {
         params["subscription_data[trial_period_days]"] = String(data.trialDays);
       }
       encodeMetadata(data.metadata, params);
+      encodeMetadata(data.metadata, params, "subscription_data[metadata]");
 
       const session = await client.post<StripeCheckoutSession>(
         "/checkout/sessions",
@@ -689,38 +658,16 @@ export function stripeAdapter(config: StripeConfig): PaymentGatewayAdapter {
     async constructWebhookEvent(
       payload: string | Uint8Array,
       signature: string,
+      context?: { headers: Record<string, string> },
     ): Promise<WebhookEvent> {
       const payloadStr =
         typeof payload === "string" ? payload : new TextDecoder().decode(payload);
 
-      // Fail CLOSED: when a secret is configured we require a valid signature.
-      if (config.webhookSecret) {
-        if (!signature) {
-          throw new StripeAdapterError(
-            "Missing webhook signature",
-            "authentication_error",
-            "WEBHOOK_SIGNATURE_MISSING",
-          );
-        }
-        const isValid = await verifyStripeSignature(
-          payloadStr,
-          signature,
-          config.webhookSecret,
-          config.webhookToleranceSeconds ?? 300,
-        );
-        if (!isValid) {
-          throw new StripeAdapterError(
-            "Invalid webhook signature",
-            "authentication_error",
-            "WEBHOOK_SIGNATURE_INVALID",
-          );
-        }
-      } else {
-        console.warn(
-          "[Stripe] WARNING: No webhookSecret configured. Webhook payloads are accepted without signature verification. " +
-            "Set webhookSecret in StripeConfig to enable verification.",
-        );
-      }
+      if (!config.webhookSecret) throw new StripeAdapterError("webhookSecret is required to verify Stripe webhooks", "authentication_error", "WEBHOOK_SECRET_MISSING");
+      const signatureHeader = signature || Object.entries(context?.headers ?? {}).find(([name]) => name.toLowerCase() === "stripe-signature")?.[1];
+      if (!signatureHeader) throw new StripeAdapterError("Missing webhook signature", "authentication_error", "WEBHOOK_SIGNATURE_MISSING");
+      const valid = await verifyStripeSignature(payload, signatureHeader, config.webhookSecret, config.webhookToleranceSeconds ?? 300);
+      if (!valid) throw new StripeAdapterError("Invalid webhook signature", "authentication_error", "WEBHOOK_SIGNATURE_INVALID");
 
       let event: StripeWebhookPayload;
       try {
@@ -733,10 +680,54 @@ export function stripeAdapter(config: StripeConfig): PaymentGatewayAdapter {
         );
       }
 
+      if (!event || typeof event.id !== "string" || !event.id || typeof event.type !== "string" ||
+          !Number.isFinite(event.created) || !event.data?.object || typeof event.data.object !== "object" || Array.isArray(event.data.object)) {
+        throw new StripeAdapterError("Invalid Stripe webhook payload", "invalid_request_error", "WEBHOOK_PAYLOAD_INVALID");
+      }
+      if ((config.secretKey.startsWith("sk_test_") && event.livemode === true) ||
+          (config.secretKey.startsWith("sk_live_") && event.livemode === false)) {
+        throw new StripeAdapterError("Webhook environment does not match the API key", "authentication_error", "WEBHOOK_ENVIRONMENT_MISMATCH");
+      }
+      const data = event.data.object;
+      const parent = data.parent as { subscription_details?: { subscription?: unknown; metadata?: Record<string, string> } } | undefined;
+      const subscriptionDetails = (data.subscription_details ?? parent?.subscription_details) as { metadata?: Record<string, string>; subscription?: unknown } | undefined;
+      const metadata = { ...(subscriptionDetails?.metadata ?? {}), ...((data.metadata as Record<string, string> | undefined) ?? {}) };
+      if (data.billing_reason === "subscription_cycle") metadata.type = "subscription_renewal";
+      let type = event.type;
+      if (type === "payment_intent.succeeded" && data.status === "succeeded") type = "payment.paid";
+      else if (type === "invoice.payment_succeeded" && (data.paid === true || data.status === "paid")) type = "payment.paid";
+      else if (type === "payment_intent.payment_failed" || type === "invoice.payment_failed") type = "payment.failed";
+      const settlement = type === "payment.paid" || type === "payment.failed";
+      const amount = type === "payment.paid"
+        ? (event.type.startsWith("invoice.") ? data.amount_paid : data.amount_received)
+        : (event.type.startsWith("invoice.") ? data.amount_due : data.amount);
+      if (settlement && (typeof data.id !== "string" || !data.id || !Number.isSafeInteger(amount) || (amount as number) < 0 || typeof data.currency !== "string")) {
+        throw new StripeAdapterError("Invalid Stripe settlement payload", "invalid_request_error", "WEBHOOK_PAYLOAD_INVALID");
+      }
+      const subscriptionId = data.subscription ?? subscriptionDetails?.subscription;
+      const invoicePayments = (data.payments as { data?: Array<{ payment?: { type?: string; payment_intent?: string } }> } | undefined)?.data;
+      const paymentId = typeof data.payment_intent === "string" ? data.payment_intent
+        : invoicePayments?.length === 1 && invoicePayments[0]?.payment?.type === "payment_intent" ? invoicePayments[0].payment.payment_intent ?? data.id : data.id;
+      const invoiceLines = (data.lines as { data?: Array<{ subscription?: unknown; type?: string; period?: { start?: number; end?: number }; parent?: { type?: string } }> } | undefined)?.data;
+      const invoicedPeriod = invoiceLines?.find(line => line.type === "subscription" || line.parent?.type === "subscription_item_details")?.period;
+      const periodStart = data.current_period_start ?? invoicedPeriod?.start;
+      const periodEnd = data.current_period_end ?? invoicedPeriod?.end;
       return {
         id: event.id,
-        type: event.type,
-        data: event.data.object,
+        type,
+        originalType: event.type,
+        ...(typeof event.livemode === "boolean" && { environment: event.livemode ? "live" : "test" }),
+        data: {
+          ...data,
+          metadata,
+          ...(settlement && { paymentId, amount, currency: (data.currency as string).toUpperCase() }),
+          ...(typeof subscriptionId === "string" && { subscriptionId }),
+          ...(type.startsWith("customer.subscription.") && { subscriptionId: data.id }),
+          ...(typeof periodStart === "number" && { currentPeriodStart: new Date(periodStart * 1000).toISOString() }),
+          ...(typeof periodEnd === "number" && { currentPeriodEnd: new Date(periodEnd * 1000).toISOString() }),
+          ...(event.account && { providerAccountId: event.account }),
+          ...(typeof event.livemode === "boolean" && { environment: event.livemode ? "live" : "test" }),
+        },
         createdAt: new Date(event.created * 1000),
       };
     },
@@ -744,9 +735,12 @@ export function stripeAdapter(config: StripeConfig): PaymentGatewayAdapter {
     // ==================== Direct Payment ====================
 
     async chargePayment(data: ChargePaymentInput): Promise<ChargePaymentResult> {
+      if (!data.idempotencyKey?.trim()) {
+        throw new StripeAdapterError("A stable idempotencyKey is required for direct charges", "invalid_request_error", "IDEMPOTENCY_KEY_REQUIRED");
+      }
       try {
         // Off-session charge requires a saved payment method on the customer
-        const paymentMethod = await resolveDefaultPaymentMethod(data.customerId);
+        const paymentMethod = data.paymentMethodId ?? await resolveDefaultPaymentMethod(data.customerId);
         if (!paymentMethod) {
           return {
             id: "",
@@ -776,6 +770,7 @@ export function stripeAdapter(config: StripeConfig): PaymentGatewayAdapter {
           intent = await client.post<StripePaymentIntent>(
             "/payment_intents",
             params,
+            data.idempotencyKey,
           );
         } catch (error) {
           // Card errors surface as HTTP 402 with a decline code
@@ -783,7 +778,7 @@ export function stripeAdapter(config: StripeConfig): PaymentGatewayAdapter {
             const { isRetryable, userAction } = mapDeclineCode(error.declineCode);
             return {
               id: "",
-              status: "failed",
+              status: error.code === "NETWORK_ERROR" || error.code === "INVALID_RESPONSE" || (error.httpStatus ?? 0) >= 500 ? "unknown" : "failed",
               amount: data.amount,
               currency: data.currency,
               errorMessage: error.message,
@@ -798,11 +793,14 @@ export function stripeAdapter(config: StripeConfig): PaymentGatewayAdapter {
         }
 
         if (intent.status === "succeeded") {
+          if (typeof intent.id !== "string" || !Number.isSafeInteger(intent.amount_received) || (intent.amount_received as number) < 0 || typeof intent.currency !== "string") {
+            throw new StripeAdapterError("Stripe response does not prove the settled amount", "api_error", "INVALID_RESPONSE");
+          }
           return {
             id: intent.id,
             status: "paid",
-            amount: intent.amount,
-            currency: intent.currency,
+            amount: intent.amount_received!,
+            currency: intent.currency.toUpperCase(),
           };
         }
 
@@ -813,9 +811,9 @@ export function stripeAdapter(config: StripeConfig): PaymentGatewayAdapter {
         ) {
           return {
             id: intent.id,
-            status: "pending",
+            status: intent.status === "requires_capture" ? "authorized" : "pending",
             amount: intent.amount,
-            currency: intent.currency,
+            currency: intent.currency.toUpperCase(),
             ...(intent.next_action?.redirect_to_url?.url && {
               verificationUrl: intent.next_action.redirect_to_url.url,
             }),
@@ -830,7 +828,7 @@ export function stripeAdapter(config: StripeConfig): PaymentGatewayAdapter {
           id: intent.id,
           status: "failed",
           amount: intent.amount,
-          currency: intent.currency,
+          currency: intent.currency.toUpperCase(),
           errorMessage: lastError?.message ?? "Payment failed",
           errorCode: lastError?.code ?? "PAYMENT_FAILED",
           isRetryable,
@@ -844,7 +842,7 @@ export function stripeAdapter(config: StripeConfig): PaymentGatewayAdapter {
           error instanceof Error ? error.message : "Payment failed";
         return {
           id: "",
-          status: "failed",
+          status: !(error instanceof StripeAdapterError) || error.code === "NETWORK_ERROR" || error.code === "INVALID_RESPONSE" || (error.httpStatus ?? 0) >= 500 ? "unknown" : "failed",
           amount: data.amount,
           currency: data.currency,
           errorMessage,
@@ -857,6 +855,34 @@ export function stripeAdapter(config: StripeConfig): PaymentGatewayAdapter {
             error.httpStatus && { httpStatus: error.httpStatus }),
         };
       }
+    },
+
+    async getPayment(paymentId: string): Promise<GatewayPayment | null> {
+      let intent: StripePaymentIntent;
+      try {
+        intent = await client.get<StripePaymentIntent>(`/payment_intents/${encodeURIComponent(paymentId)}`);
+      } catch (error) {
+        if (error instanceof StripeAdapterError && error.httpStatus === 404) return null;
+        throw error;
+      }
+      if (typeof intent.id !== "string" || intent.id !== paymentId || !Number.isSafeInteger(intent.amount) || intent.amount < 0 || typeof intent.currency !== "string" ||
+          (intent.status === "succeeded" && (!Number.isSafeInteger(intent.amount_received) || (intent.amount_received as number) < 0))) {
+        throw new StripeAdapterError("Invalid Stripe payment lookup response", "api_error", "INVALID_RESPONSE");
+      }
+      const status = intent.status === "succeeded" ? "paid"
+        : intent.status === "requires_capture" ? "authorized"
+        : intent.status === "canceled" || intent.status === "requires_payment_method" ? "failed"
+        : ["processing", "requires_action", "requires_confirmation"].includes(intent.status) ? "pending" : "unknown";
+      return {
+        id: intent.id,
+        status,
+        amount: status === "paid" ? intent.amount_received! : intent.amount,
+        currency: intent.currency.toUpperCase(),
+        ...(intent.payment_method && { paymentMethodId: intent.payment_method }),
+        ...(intent.metadata && { metadata: intent.metadata }),
+        ...(typeof intent.created === "number" && { createdAt: new Date(intent.created * 1000) }),
+        ...(intent.last_payment_error?.message && { errorMessage: intent.last_payment_error.message }),
+      };
     },
 
     /**
@@ -872,8 +898,9 @@ export function stripeAdapter(config: StripeConfig): PaymentGatewayAdapter {
           return intent.payment_method;
         }
         return null;
-      } catch {
-        return null;
+      } catch (error) {
+        if (error instanceof StripeAdapterError && error.httpStatus === 404) return null;
+        throw error;
       }
     },
   };

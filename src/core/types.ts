@@ -9,6 +9,7 @@ export interface FeatureDefinition<T extends FeatureType = FeatureType> {
     type: T;
     default: T extends 'boolean' ? boolean : number;
     description?: string;
+    usage?: { kind: 'persistent' } | { kind: 'periodic'; reset: 'calendar-month' | 'subscription-cycle' };
 }
 
 export type FeatureRegistry = Record<string, FeatureDefinition>;
@@ -130,6 +131,8 @@ export interface Subscription {
     trialEnd: Date | null;
     gatewaySubscriptionId: string | null;
     gatewayCustomerId: string | null;
+    /** Immutable provider routing; legacy rows require an explicit ownership backfill. */
+    billing?: ProviderBinding;
     /**
      * Seat/unit quantity for per-seat billing.
      * @default 1
@@ -160,6 +163,7 @@ export interface CreateSubscriptionInput {
     trialEnd?: Date | null | undefined;
     gatewaySubscriptionId?: string | undefined;
     gatewayCustomerId?: string | undefined;
+    billing?: ProviderBinding;
     quantity?: number | undefined;
     addOns?: string[] | undefined;
     metadata?: Record<string, unknown> | undefined;
@@ -176,6 +180,7 @@ export interface UpdateSubscriptionInput {
     trialEnd?: Date | null;
     gatewaySubscriptionId?: string;
     gatewayCustomerId?: string;
+    billing?: ProviderBinding;
     quantity?: number;
     addOns?: string[];
     metadata?: Record<string, unknown>;
@@ -327,6 +332,8 @@ export const noopLogger: SubscriptionsLogger = {};
 // ==================== Config ====================
 
 export interface SubscriptionsOptions {
+    /** Application/database/environment identity. Required when a cache is configured. */
+    cacheNamespace?: string;
     /**
      * Default subscriber type for new subscriptions
      * @default 'tenant'
@@ -362,6 +369,16 @@ export interface SubscriptionsOptions {
      * Pass `console` for basic logging, or a structured logger.
      */
     logger?: SubscriptionsLogger;
+}
+
+export interface ProviderBinding {
+    providerId: string;
+    accountId: string;
+    environment: 'test' | 'live';
+    billingOwner: 'sdk_managed' | 'provider_managed';
+    externalCustomerId?: string;
+    externalPaymentMethodId?: string;
+    externalSubscriptionId?: string;
 }
 
 // ==================== Coupons ====================
