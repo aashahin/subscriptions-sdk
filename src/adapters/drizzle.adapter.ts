@@ -19,11 +19,11 @@ import type {
     UpdateSubscriptionInput,
     UsageRecord,
 } from '../core/types.js';
-import { queue, serialAdapter, hydrateCoupon, usagePeriod, validateUsageCount, validateUsageLimit, validateProviderResource, providerResourceScope } from './persistence-utils.js';
+import { explicitUsagePeriod, queue, serialAdapter, hydrateCoupon, usagePeriod, validateUsageCount, validateUsageLimit, validateProviderResource, providerResourceScope } from './persistence-utils.js';
 import type { OutboxRecord } from './outbox.adapter.js';
 import type { Coupon } from '../core/coupons.js';
 import type {
-    BillingOperationRecord, ProviderResourceMapping, ProviderResourceScope, UsageMutationOptions, UsagePeriodOptions, UsageReservationOptions,
+    BillingOperationRecord, ProviderResourceMapping, ProviderResourceScope, UsageMutationOptions, UsagePeriodOptions, UsageReadOptions, UsageReservationOptions, UsageResetOptions,
     DatabaseAdapter,
     PlanQueryOptions,
     SubscriptionQueryOptions,
@@ -140,7 +140,7 @@ export function drizzleAdapter<TFeatures extends FeatureRegistry = FeatureRegist
     let run = connectionQueues.get((sqliteClient ?? db) as object);
     if (!run) { run = queue(); connectionQueues.set((sqliteClient ?? db) as object, run); }
     const createAdapter = (client: DrizzleDatabase, inTransaction = false): DatabaseAdapter<TFeatures> => ({
-        capabilities: { asyncTransactions: mode !== 'unsupported' },
+        capabilities: { asyncTransactions: mode !== 'unsupported', guardedUsageRelease: true },
         providerResources: {
             async bind(mapping) {
                 const scope=providerResourceScope(mapping);validateProviderResource(scope,mapping.localId);validateProviderResource(scope,mapping.externalId);
@@ -755,11 +755,12 @@ export function drizzleAdapter<TFeatures extends FeatureRegistry = FeatureRegist
             async get(
                 subscriberId: string,
                 feature: string,
-                options?: UsagePeriodOptions & { period?: Date; tenantId?: string | null },
+                options?: UsageReadOptions,
             ): Promise<number> {
                 const { and, eq, gte, lte } = await loadOps();
                 const now = options?.period ?? new Date();
                 const tenantId = options?.tenantId ?? subscriberId;
+                const explicitPeriod = explicitUsagePeriod(options);
 
                 const rows = await client
                     .select({ count: schema.usageRecords.count })
@@ -769,8 +770,9 @@ export function drizzleAdapter<TFeatures extends FeatureRegistry = FeatureRegist
                             eq(schema.usageRecords.subscriberId, subscriberId),
                             eq(schema.usageRecords.tenantId, tenantId),
                             eq(schema.usageRecords.feature, feature),
-                            options?.periodStart ? eq(schema.usageRecords.periodStart, options.periodStart) : lte(schema.usageRecords.periodStart, now),
-                            gte(schema.usageRecords.periodEnd, now),
+                            options?.expectedRecordId !== undefined ? eq(schema.usageRecords.id, options.expectedRecordId) : undefined,
+                            explicitPeriod ? eq(schema.usageRecords.periodStart, explicitPeriod.periodStart) : lte(schema.usageRecords.periodStart, now),
+                            explicitPeriod ? undefined : gte(schema.usageRecords.periodEnd, now),
                         ),
                     )
                     .limit(1);
@@ -815,6 +817,7 @@ export function drizzleAdapter<TFeatures extends FeatureRegistry = FeatureRegist
                         ],
                         set: {
                             count: sql`${schema.usageRecords.count} + ${count}`,
+                            periodEnd,
                             updatedAt: now,
                         },
                     }).returning({ count: schema.usageRecords.count });
@@ -832,9 +835,9 @@ export function drizzleAdapter<TFeatures extends FeatureRegistry = FeatureRegist
                 const now = new Date();
                 const rows = await client.insert(schema.usageRecords).values({id:crypto.randomUUID(),subscriberId,tenantId,feature,count,periodStart,periodEnd,createdAt:now,updatedAt:now})
                     .onConflictDoUpdate({target:[schema.usageRecords.subscriberId,schema.usageRecords.tenantId,schema.usageRecords.feature,schema.usageRecords.periodStart],
-                        set:{count:sql`${schema.usageRecords.count}+${count}`,updatedAt:now},setWhere:sql`${schema.usageRecords.count} <= ${limit-count}`})
-                    .returning({count:schema.usageRecords.count});
-                return rows[0] ? {accepted:true,count:Number(rows[0].count)} : {accepted:false,count:await readUsageCount(client,schema,subscriberId,tenantId,feature,periodStart)};
+                        set:{count:sql`${schema.usageRecords.count}+${count}`,periodEnd,updatedAt:now},setWhere:sql`${schema.usageRecords.count} <= ${limit-count}`})
+                    .returning({count:schema.usageRecords.count,id:schema.usageRecords.id});
+                return rows[0] ? {accepted:true,count:Number(rows[0].count),recordId:rows[0].id as string} : {accepted:false,count:await readUsageCount(client,schema,subscriberId,tenantId,feature,periodStart)};
             },
 
             async decrement(
@@ -866,6 +869,7 @@ export function drizzleAdapter<TFeatures extends FeatureRegistry = FeatureRegist
                             eq(schema.usageRecords.tenantId, tenantId),
                             eq(schema.usageRecords.feature, feature),
                             eq(schema.usageRecords.periodStart, periodStart),
+                            options?.expectedRecordId !== undefined ? eq(schema.usageRecords.id, options.expectedRecordId) : undefined,
                         ),
                     ).returning({ count: schema.usageRecords.count });
 
@@ -883,11 +887,12 @@ export function drizzleAdapter<TFeatures extends FeatureRegistry = FeatureRegist
                 const tid = tenantId ?? subscriberId;
                 const now = new Date();
                 const { periodStart, periodEnd } = usagePeriod(options);
+                const recordId = crypto.randomUUID();
 
                 await client
                     .insert(schema.usageRecords)
                     .values({
-                        id: crypto.randomUUID(),
+                        id: recordId,
                         subscriberId,
                         tenantId: tid,
                         feature,
@@ -904,21 +909,25 @@ export function drizzleAdapter<TFeatures extends FeatureRegistry = FeatureRegist
                             schema.usageRecords.feature,
                             schema.usageRecords.periodStart,
                         ],
-                        set: { count, updatedAt: now },
+                        set: { id: recordId, count, periodEnd, updatedAt: now },
                     });
             },
 
             async reset(
                 subscriberId: string,
-                options?: { feature?: string; tenantId?: string | null },
+                options?: UsageResetOptions,
             ): Promise<void> {
                 const { and, eq, isNull } = await loadOps();
 
                 const conditions: any[] = [eq(schema.usageRecords.subscriberId, subscriberId)];
+                const explicitPeriod = explicitUsagePeriod(options);
                 if (options?.feature) {
                     conditions.push(eq(schema.usageRecords.feature, options.feature));
                 }
-                if (options?.tenantId !== undefined) {
+                if (explicitPeriod) {
+                    conditions.push(eq(schema.usageRecords.periodStart, explicitPeriod.periodStart));
+                    conditions.push(eq(schema.usageRecords.tenantId, options?.tenantId ?? subscriberId));
+                } else if (options?.tenantId !== undefined) {
                     conditions.push(
                         options.tenantId === null
                             ? isNull(schema.usageRecords.tenantId)
@@ -927,6 +936,17 @@ export function drizzleAdapter<TFeatures extends FeatureRegistry = FeatureRegist
                 }
 
                 await client.delete(schema.usageRecords).where(and(...conditions));
+            },
+
+            async getForPeriods(subscriberId, periods, tenantId) {
+                if (!periods.length) return [];
+                const { and, eq, or } = await loadOps();
+                const keys = periods.map(period => and(eq(schema.usageRecords.feature, period.feature),
+                    eq(schema.usageRecords.periodStart, usagePeriod(period).periodStart)));
+                const records = await client.select().from(schema.usageRecords).where(and(
+                    eq(schema.usageRecords.subscriberId, subscriberId),
+                    eq(schema.usageRecords.tenantId, tenantId ?? subscriberId), or(...keys)));
+                return records.map(mapUsageRecordFromDrizzle);
             },
 
             async getAll(subscriberId: string, tenantId?: string | null): Promise<UsageRecord[]> {

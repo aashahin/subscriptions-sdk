@@ -240,7 +240,7 @@ describe("provider webhook transports", () => {
     const response = await createSubscriptionsHttpHandler(subs).fetch(webhookRequest());
     expect(response.status).toBe(200);
     expect((await response.json()).received).toBe(true);
-    expect(await db.invoices.findByGatewayInvoiceId("b35c31b6-bba4-40aa-9d61-42865e81c292")).toBeNull();
+    expect(await db.invoices.findByGatewayInvoiceId!("b35c31b6-bba4-40aa-9d61-42865e81c292")).toBeNull();
   });
 
   it("Elysia preserves the raw JSON body for native Moyasar authentication", async () => {

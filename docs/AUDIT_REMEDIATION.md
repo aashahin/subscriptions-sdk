@@ -6,6 +6,8 @@ All 38 IDs have a `fixed` disposition for the stated defect/minimum foundation, 
 
 ## Validation and evidence boundaries
 
+The commands below are historical evidence from that remediation run. Current development and package validation use the Bun workflow in [testing.md](testing.md); they do not invoke the historical Node/npm commands.
+
 Bun `1.4.2` is installed at `/workspace/.tools/node_modules/.bin/bun` in this environment. Final commands/results:
 
 | Command | Actual result |

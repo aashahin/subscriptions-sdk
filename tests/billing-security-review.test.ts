@@ -1,3 +1,4 @@
+import { mockFetch } from './helpers/fetch.ts';
 import { afterEach, describe, expect, it } from "bun:test";
 import { createSubscriptions } from "../src/index.ts";
 import { memoryDatabaseAdapter } from "../src/testing/memory-database.ts";
@@ -79,10 +80,10 @@ describe("independent financial security review", () => {
     const sdk = createSubscriptions({ database, features, providers: [{ id: "moyasar-test", accountId: "merchant", environment: "test", billingOwner: "sdk_managed", adapter }], defaultProvider: "moyasar-test" });
     let outbound: Record<string, any> = {};
     const payment = (id: string) => ({ id, status: "paid", amount: 10000, currency: "SAR", created_at: new Date().toISOString(), source: { type: "creditcard", token: "token" }, metadata: outbound.metadata });
-    globalThis.fetch = async (_request, init) => {
+    mockFetch(async (_request, init) => {
       outbound = JSON.parse(init!.body as string);
       return new Response(JSON.stringify(payment(outbound.given_id)), { status: 200, headers: { "content-type": "application/json" } });
-    };
+    });
     const originalTransaction = database.transaction.bind(database);
     let failPersistence = true;
     database.transaction = async (fn) => originalTransaction(async (tx) => {
@@ -236,7 +237,7 @@ describe("independent financial security review", () => {
     const charge = charges(adapter)[0]!;
     const attempt = await database.billingOperations!.find(charge.metadata!.paymentAttemptKey!);
     const paymentId = (attempt!.payload.result as { id: string }).id;
-    adapter.setPayment({ id: paymentId, status: "paid", amount: charge.amount, currency: charge.currency, metadata: charge.metadata });
+    adapter.setPayment({ id: paymentId, status: "paid", amount: charge.amount, currency: charge.currency, ...(charge.metadata ? { metadata: charge.metadata } : {}) });
     const events: { id: string; type: string }[] = [];
     const wrapped = withEvents(sdk, { emit: (event) => { events.push(event); } });
     await expect(wrapped.subscriptions.reconcilePayment("another-subscriber", charge.metadata!.purchaseKey!)).rejects.toThrow("does not belong");

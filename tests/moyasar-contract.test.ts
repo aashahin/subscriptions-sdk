@@ -1,3 +1,4 @@
+import { mockFetch } from './helpers/fetch.ts';
 import { afterEach, describe, expect, it } from "bun:test";
 import { moyasarAdapter } from "../src/adapters/moyasar.adapter";
 
@@ -7,7 +8,7 @@ const key = "a1168bd1-47a4-4b97-8a50-dd5caaccacf2";
 const config = { secretKey: "sk_test_test", publishableKey: "pk_test_test", webhookSecret: "secret", callbackUrl: "https://app.test/callback" };
 const payment = (status = "paid") => ({ id: key, status, amount: 10000, currency: "SAR", fee: 0, captured: 10000, refunded: 0, created_at: "2026-01-01T00:00:00Z", updated_at: "2026-01-01T00:00:00Z", metadata: { subscriberId: "sub_internal", attemptId: key, type: "renewal" }, source: { type: "creditcard", token: "token_saved" } });
 const webhook = (overrides = {}) => JSON.stringify({ id: "event_paid", type: "payment_paid", secret_token: "secret", account_name: "account", live: false, created_at: "2026-01-01T00:00:00Z", data: payment(), ...overrides });
-const mockResponse = (data: unknown, status = 200) => { globalThis.fetch = async () => new Response(JSON.stringify(data), { status, headers: { "content-type": "application/json" } }); };
+const mockResponse = (data: unknown, status = 200) => { mockFetch(async () => new Response(JSON.stringify(data), { status, headers: { "content-type": "application/json" } })); };
 
 describe("Moyasar official provider contracts", () => {
   it("authenticates native body secret and normalizes payment_paid", async () => {
@@ -18,7 +19,8 @@ describe("Moyasar official provider contracts", () => {
   });
 
   it("fails closed for missing configuration, wrong secret, wrong environment, and mismatched settlement", async () => {
-    await expect(moyasarAdapter({ ...config, webhookSecret: undefined }).constructWebhookEvent(webhook(), "")).rejects.toThrow();
+    const { webhookSecret: _secret, ...unsignedConfig } = config;
+    await expect(moyasarAdapter(unsignedConfig).constructWebhookEvent(webhook(), "")).rejects.toThrow();
     for (const fields of [{ secret_token: "wrong" }, { secret_token: undefined }, { live: true }, { data: payment("authorized") }]) {
       await expect(moyasarAdapter(config).constructWebhookEvent(webhook(fields), "")).rejects.toThrow();
     }
@@ -27,7 +29,7 @@ describe("Moyasar official provider contracts", () => {
   it("does not represent token billing as customers or native subscriptions", async () => {
     const gateway = moyasarAdapter(config);
     let calls = 0;
-    globalThis.fetch = async () => { calls++; return new Response(JSON.stringify(payment())); };
+    mockFetch(async () => { calls++; return new Response(JSON.stringify(payment())); });
     await expect(gateway.createCustomer!({ email: "test@example.com" })).rejects.toThrow("does not support");
     await expect(gateway.createSubscription!({ customerId: "token_saved", priceId: "10000", trialDays: 30 })).rejects.toThrow("does not support");
     await expect(gateway.getSubscription!(key)).rejects.toThrow("does not support");
@@ -43,7 +45,7 @@ describe("Moyasar official provider contracts", () => {
 
   it("uses the persisted UUID given_id and keeps authorization distinct", async () => {
     let body: Record<string, unknown> = {};
-    globalThis.fetch = async (_, init) => { body = JSON.parse(init!.body as string); return new Response(JSON.stringify(payment("authorized"))); };
+    mockFetch(async (_, init) => { body = JSON.parse(init!.body as string); return new Response(JSON.stringify(payment("authorized"))); });
     const result = await moyasarAdapter(config).chargePayment!({ customerId: "legacy_customer", paymentMethodId: "token_saved", amount: 10000, currency: "SAR", idempotencyKey: key });
     expect(body.given_id).toBe(key);
     expect(body.source).toEqual({ type: "token", token: "token_saved" });
@@ -52,7 +54,7 @@ describe("Moyasar official provider contracts", () => {
 
   it("rejects collection before network access without a stable UUID", async () => {
     let calls = 0;
-    globalThis.fetch = async () => { calls++; return new Response(JSON.stringify(payment())); };
+    mockFetch(async () => { calls++; return new Response(JSON.stringify(payment())); });
     await expect(moyasarAdapter(config).chargePayment!({ customerId: "token_saved", amount: 10000, currency: "SAR" })).rejects.toThrow("idempotencyKey");
     expect(calls).toBe(0);
   });
@@ -60,7 +62,7 @@ describe("Moyasar official provider contracts", () => {
   it("preserves unknown outcomes after transport, 5xx, and malformed successful responses", async () => {
     const gateway = moyasarAdapter(config);
     const charge = { customerId: "token_saved", amount: 10000, currency: "SAR", idempotencyKey: key };
-    globalThis.fetch = async () => { throw new Error("connection dropped after acceptance"); };
+    mockFetch(async () => { throw new Error("connection dropped after acceptance"); });
     expect((await gateway.chargePayment!(charge)).status).toBe("unknown");
     mockResponse({ type: "api_error", message: "outage" }, 503);
     const result = await gateway.chargePayment!(charge);
@@ -78,12 +80,12 @@ describe("Moyasar official provider contracts", () => {
       mockResponse({ type: "api_error", message: "error" }, status);
       await expect(gateway.getPaymentSource!(key)).rejects.toThrow();
     }
-    globalThis.fetch = async () => { throw new Error("offline"); };
+    mockFetch(async () => { throw new Error("offline"); });
     await expect(gateway.getPaymentSource!(key)).rejects.toThrow();
   });
   it("validates initiated/active/inactive token status through real lookups", async () => {
     const gateway = moyasarAdapter(config);
-    for (const [providerStatus, status] of [["initiated", "pending"], ["active", "active"], ["inactive", "inactive"]]) {
+    for (const [providerStatus, status] of [["initiated", "pending"], ["active", "active"], ["inactive", "inactive"]] as const) {
       mockResponse({ id: "token_saved", status: providerStatus, brand: "visa", last_four: "1111", month: "12", year: "2030" });
       expect((await gateway.getPaymentMethod!("token_saved"))?.status).toBe(status);
     }

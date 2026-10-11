@@ -96,16 +96,19 @@ export interface SubscriptionsHttpOptions {
   invoice?: {
     /**
      * Path to a custom Handlebars template (Node.js filesystem only).
-     * Prefer `templateSource` on non-Node runtimes. Defaults to the built-in
-     * inlined template, which needs no filesystem at all.
+     * Prefer `template` on Workers. Defaults to the built-in precompiled
+     * template, which needs no filesystem at all.
      */
     templatePath?: string;
 
     /**
-     * Inline Handlebars template source. Runtime-agnostic alternative to
-     * `templatePath`; takes precedence when both are set.
+     * Inline Handlebars source, compiled lazily on server runtimes.
+     * Takes precedence over `templatePath`. Use `template` on Workers.
      */
     templateSource?: string;
+
+    /** Precompiled template function; takes precedence over source and path. */
+    template?: import("../templates/invoice-utils.js").SubscriptionInvoiceTemplateRenderer;
 
     /**
      * PDF renderer for `format=pdf` (e.g. `puppeteerPdfRenderer` on Node,
@@ -240,15 +243,19 @@ export function createSubscriptionsHttpHandler<
   const readJsonBody = async (
     request: Request,
   ): Promise<Record<string, unknown>> => {
+    const rawBody = await request.text();
+    if (!rawBody.trim()) return {};
+    let body: unknown;
     try {
-      const body: unknown = await request.json();
-      if (body && typeof body === "object" && !Array.isArray(body)) {
-        return body as Record<string, unknown>;
-      }
-      return {};
-    } catch {
-      return {};
+      body = JSON.parse(rawBody);
+    } catch (error) {
+      if (!(error instanceof SyntaxError)) throw error;
+      throw new SubscriptionError("Request body must contain valid JSON", "INVALID_PUBLIC_INPUT", 400);
     }
+    if (!body || typeof body !== "object" || Array.isArray(body)) {
+      throw new SubscriptionError("Request body must be a JSON object", "INVALID_PUBLIC_INPUT", 400);
+    }
+    return body as Record<string, unknown>;
   };
 
   const rejectUnknownFields = (
@@ -299,7 +306,12 @@ export function createSubscriptionsHttpHandler<
       const patternSegment = route.pattern[i] as string;
       const segment = segments[i] as string;
       if (patternSegment.startsWith(":")) {
-        params[patternSegment.slice(1)] = decodeURIComponent(segment);
+        try {
+          params[patternSegment.slice(1)] = decodeURIComponent(segment);
+        } catch (error) {
+          if (!(error instanceof URIError)) throw error;
+          throw new SubscriptionError("Malformed URL encoding", "INVALID_PUBLIC_INPUT", 400);
+        }
       } else if (patternSegment !== segment) {
         return null;
       }
@@ -461,41 +473,30 @@ export function createSubscriptionsHttpHandler<
       }
     }
 
+    const { subscription: invoiceSubscription, plan: invoicePlan, ...invoiceRecord } = invoice;
     const invoiceData: SubscriptionInvoiceData = {
       invoice: {
-        id: invoice.id,
-        subscriptionId: invoice.subscriptionId,
-        subscriberId: invoice.subscriberId,
-        // Invoice amounts are persisted in major/display units (e.g. SAR/USD).
-        amount: invoice.amount,
-        currency: invoice.currency,
-        status: invoice.status,
-        gatewayInvoiceId: invoice.gatewayInvoiceId,
-        paidAt: invoice.paidAt,
-        dueDate: invoice.dueDate,
+        ...invoiceRecord,
         lineItems: invoice.lineItems.map((item) => ({
           ...item,
-          amount: item.amount || 0,
-          unitPrice: item.unitPrice || item.amount || 0,
+          amount: item.amount ?? 0,
+          unitPrice: item.unitPrice ?? item.amount ?? 0,
         })),
-        metadata: invoice.metadata,
-        createdAt: invoice.createdAt,
-        updatedAt: invoice.updatedAt,
       },
       subscription: {
-        id: invoice.subscription.id,
-        status: invoice.subscription.status,
-        currentPeriodStart: invoice.subscription.currentPeriodStart,
-        currentPeriodEnd: invoice.subscription.currentPeriodEnd,
-        subscriberId: invoice.subscription.subscriberId,
+        id: invoiceSubscription.id,
+        status: invoiceSubscription.status,
+        currentPeriodStart: invoiceSubscription.currentPeriodStart,
+        currentPeriodEnd: invoiceSubscription.currentPeriodEnd,
+        subscriberId: invoiceSubscription.subscriberId,
       },
       plan: {
-        name: invoice.plan.name,
-        description: invoice.plan.description,
-        price: invoice.plan.price,
-        currency: invoice.plan.currency,
-        interval: invoice.plan.interval,
-        intervalCount: invoice.plan.intervalCount,
+        name: invoicePlan.name,
+        description: invoicePlan.description,
+        price: invoicePlan.price,
+        currency: invoicePlan.currency,
+        interval: invoicePlan.interval,
+        intervalCount: invoicePlan.intervalCount,
       },
       platform: options?.invoice?.platform ?? {
         name: "Subscription Platform",
@@ -509,17 +510,12 @@ export function createSubscriptionsHttpHandler<
       html = await options.invoice.renderHtml(invoiceData);
     } else {
       // Lazy import so the invoice template machinery is only loaded when
-      // this route is actually hit. Explicit source > explicit path >
-      // built-in inlined template (no filesystem, edge-safe).
+      // this route is actually hit. The built-in template is precompiled;
+      // only explicit source/path options need a compiler or filesystem.
       const { renderSubscriptionInvoice } = await import(
         "../templates/invoice-utils.js"
       );
-      const renderSource = options?.invoice?.templateSource
-        ? { templateSource: options.invoice.templateSource }
-        : options?.invoice?.templatePath
-          ? { templatePath: options.invoice.templatePath }
-          : undefined;
-      html = await renderSubscriptionInvoice(renderSource, invoiceData);
+      html = await renderSubscriptionInvoice(options?.invoice, invoiceData);
     }
 
     // Output modes: printable HTML (default, zero server cost) or a
@@ -635,34 +631,34 @@ export function createSubscriptionsHttpHandler<
   // ==================== Dispatch ====================
 
   const fetch = async (request: Request): Promise<Response> => {
-    const pathname = new URL(request.url).pathname;
-    const segments = stripPrefix(pathname);
-    if (!segments) {
-      return json({ error: "Not found" }, 404);
-    }
-
-    // Match on path shape first so a known path with the wrong method
-    // returns 405 instead of 404.
-    let methodMismatch = false;
-    let matched: { route: Route; params: RouteParams } | null = null;
-
-    for (const route of routes) {
-      const params = matchRoute(route, segments);
-      if (!params) {
-        continue;
-      }
-      if (route.method === request.method) {
-        matched = { route, params };
-        break;
-      }
-      methodMismatch = true;
-    }
-
-    if (!matched) {
-      return json({ error: "Not found" }, methodMismatch ? 405 : 404);
-    }
-
     try {
+      const pathname = new URL(request.url).pathname;
+      const segments = stripPrefix(pathname);
+      if (!segments) {
+        return json({ error: "Not found" }, 404);
+      }
+
+      // Match on path shape first so a known path with the wrong method
+      // returns 405 instead of 404.
+      let methodMismatch = false;
+      let matched: { route: Route; params: RouteParams } | null = null;
+
+      for (const route of routes) {
+        const params = matchRoute(route, segments);
+        if (!params) {
+          continue;
+        }
+        if (route.method === request.method) {
+          matched = { route, params };
+          break;
+        }
+        methodMismatch = true;
+      }
+
+      if (!matched) {
+        return json({ error: "Not found" }, methodMismatch ? 405 : 404);
+      }
+
       let subscriberId: string | null = null;
       if (matched.route.auth) {
         const resolved = await getSubscriberId(request);

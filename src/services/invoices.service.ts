@@ -109,8 +109,10 @@ export class InvoicesService<TFeatures extends FeatureRegistry = FeatureRegistry
      * portion is extracted instead (`tax = amount - amount / (1 + rate)`).
      */
     computeTotals(lineItems: InvoiceLineItem[], discountAmount: number = 0, currency: string = "USD"): InvoiceTotals {
-        let subtotal = 0;
-        let taxAmount = 0;
+        let inclusiveGross = 0;
+        let inclusiveTax = 0;
+        let exclusiveSubtotal = 0;
+        let exclusiveTax = 0;
         const taxRates = new Set<number>();
         for (const item of lineItems) {
             const rate = item.taxRate ?? 0;
@@ -119,17 +121,21 @@ export class InvoicesService<TFeatures extends FeatureRegistry = FeatureRegistry
             }
             if (rate > 0 && item.taxInclusive) {
                 const net = item.amount / (1 + rate / 100);
-                subtotal += net;
-                taxAmount += item.amount - net;
+                inclusiveGross += item.amount;
+                inclusiveTax += item.amount - net;
             }
             else {
-                subtotal += item.amount;
-                taxAmount += (item.amount * rate) / 100;
+                exclusiveSubtotal += item.amount;
+                exclusiveTax += (item.amount * rate) / 100;
             }
         }
-        subtotal = roundMoney(subtotal, currency);
-        taxAmount = roundMoney(taxAmount, currency);
-        const total = roundMoney(Math.max(0, subtotal + taxAmount - discountAmount), currency);
+        // Inclusive gross is authoritative; rounding both extracted parts can add a minor unit.
+        const inclusiveTaxMinor = majorToMinor(inclusiveTax, currency);
+        const subtotalMinor = majorToMinor(inclusiveGross, currency) - inclusiveTaxMinor + majorToMinor(exclusiveSubtotal, currency);
+        const taxMinor = inclusiveTaxMinor + majorToMinor(exclusiveTax, currency);
+        const subtotal = minorToMajor(subtotalMinor, currency);
+        const taxAmount = minorToMajor(taxMinor, currency);
+        const total = minorToMajor(Math.max(0, subtotalMinor + taxMinor - majorToMinor(discountAmount, currency)), currency);
         return {
             subtotal,
             taxAmount,

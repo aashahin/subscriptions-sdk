@@ -1,6 +1,10 @@
 import type { DatabaseAdapter, ProviderResourceMapping, ProviderResourceScope, UsagePeriodOptions } from './database.adapter.js';
 import type { FeatureRegistry } from '../core/types.js';
 
+export function explicitUsagePeriod(options?: UsagePeriodOptions): { periodStart: Date; periodEnd: Date } | undefined {
+    return options?.periodStart !== undefined || options?.periodEnd !== undefined ? usagePeriod(options) : undefined;
+}
+
 export function usagePeriod(options?: UsagePeriodOptions): { periodStart: Date; periodEnd: Date } {
     if (options?.periodStart !== undefined || options?.periodEnd !== undefined) {
         const start = options.periodStart; const end = options.periodEnd;

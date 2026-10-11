@@ -37,7 +37,7 @@ The service layer uses web-standard primitives and models the subscribed entity 
 
 - Core services and payment interfaces are runtime-neutral and accept webhook payloads as `string | Uint8Array`
 - Existing Node.js callers can still pass `Buffer`, because `Buffer` extends `Uint8Array`
-- Invoice HTML can be rendered anywhere by passing a template string (`templateSource`); filesystem template paths remain available on Node.js/Bun/Deno
+- The built-in precompiled invoice template and custom `invoice.template` renderer functions work without dynamic compilation; `templateSource` and filesystem template paths require a runtime that permits compilation
 - Invoice PDF generation via `puppeteer-html-pdf` is Node.js-only; on Cloudflare Workers use `@cloudflare/puppeteer` with a Browser Rendering binding
 - See `docs/runtime-support.md` for the full support matrix and per-runtime setup recipes
 

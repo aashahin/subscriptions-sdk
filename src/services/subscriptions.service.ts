@@ -103,6 +103,7 @@ interface Purchase {
     previousPeriodStart: string;
     previousCancelAt: string | null;
     previousStatus: SubscriptionStatus;
+    previousBillingRevision?: string;
     price: ReturnType<typeof snapshotBillingPrice>;
     billingAnchor?: ReturnType<typeof billingCalendarAnchor>;
     quote?: PlanChangeQuote;
@@ -119,6 +120,14 @@ const cleanRecovery = (metadata: Record<string, unknown> | null): Record<string,
     return result;
 };
 const hydrateQuote = (raw: PlanChangeQuote): PlanChangeQuote => ({ ...raw, quotedAt: new Date(raw.quotedAt), validUntil: new Date(raw.validUntil), effectiveDate: new Date(raw.effectiveDate), periodStart: new Date(raw.periodStart), periodEnd: new Date(raw.periodEnd) });
+const billingRevision = (sub: Subscription): string => typeof sub.metadata?.billingRevision === 'string' ? sub.metadata.billingRevision : 'legacy';
+function purchaseStillCurrent(sub: Subscription, purchase: Purchase): boolean {
+    return sub.planId === purchase.previousPlanId && sub.currentPeriodStart.toISOString() === purchase.previousPeriodStart &&
+        sub.currentPeriodEnd.toISOString() === purchase.previousPeriodEnd && (sub.cancelAt?.toISOString() ?? null) === purchase.previousCancelAt &&
+        (purchase.previousBillingRevision === undefined || billingRevision(sub) === purchase.previousBillingRevision) &&
+        ['active', 'trialing', 'past_due', 'incomplete'].includes(sub.status) &&
+        (purchase.kind !== 'change' || sub.status === purchase.previousStatus);
+}
 export class SubscriptionsService<TFeatures extends FeatureRegistry> {
     private readonly cache: CacheAdapter;
     private readonly providers: ProviderRegistry;
@@ -247,11 +256,11 @@ export class SubscriptionsService<TFeatures extends FeatureRegistry> {
             const trialEnd = days ? new Date(now.getTime() + days * DAY) : null;
             const status: SubscriptionStatus = trialEnd ? 'trialing' : plan.price === 0 || policy !== 'purchase' ? 'active' : 'incomplete';
             const end = trialEnd ?? calculateBillingPeriodEnd(now, plan.interval, plan.intervalCount);
-            const metadata = { ...options.metadata, billingPolicy: policy, billingAnchor: billingCalendarAnchor(now), trialUsed: !!trialEnd || !!existing?.metadata?.trialUsed };
+            const metadata = { ...options.metadata, billingPolicy: policy, billingRevision: crypto.randomUUID(), billingAnchor: billingCalendarAnchor(now), trialUsed: !!trialEnd || !!existing?.metadata?.trialUsed };
             if (existing?.billing && options.billing && JSON.stringify(existing.billing) !== JSON.stringify(options.billing))
                 fail('Existing billing ownership requires an explicit provider migration', 'PROVIDER_MIGRATION_REQUIRED');
             const effectiveBinding = existing?.billing ?? (existing && !options.billing ? undefined : billing);
-            const data = { planId, status, currentPeriodStart: now, currentPeriodEnd: end, trialStart: trialEnd ? now : null, trialEnd, metadata, ...(effectiveBinding ? { billing: effectiveBinding } : {}) };
+            const data = { planId, status, currentPeriodStart: now, currentPeriodEnd: end, cancelAt: null, canceledAt: null, trialStart: trialEnd ? now : null, trialEnd, metadata, ...(effectiveBinding ? { billing: effectiveBinding } : {}) };
             const result = existing ? await tx.subscriptions.update(existing.id, data) : await tx.subscriptions.create({ ...data, subscriberId, subscriberType: this.options.subscriberType ?? 'tenant' });
             if (effectiveBinding)
                 await this.bindResources(tx, result, effectiveBinding);
@@ -284,7 +293,7 @@ export class SubscriptionsService<TFeatures extends FeatureRegistry> {
             throw new SubscriptionInactiveError(sub.status);
         const quote = quotePlanChange({ subscription: sub, currentPlan: sub.plan, newPlan: next, now: new Date(), ...options, hasPaidEntitlement: !!this.paidPrice(sub, options.immediately !== false && options.prorate !== false), ...(this.paidPrice(sub, options.immediately !== false && options.prorate !== false) ? { currentPaidPrice: this.paidPrice(sub, options.immediately !== false && options.prorate !== false)! } : {}) });
         const quoteId = crypto.randomUUID();
-        await this.db.billingOperations!.reserve(`quote:${quoteId}`, { subscriberId, subscriptionId: sub.id, quote, subscriptionVersion: sub.updatedAt.toISOString() });
+        await this.db.billingOperations!.reserve(`quote:${quoteId}`, { subscriberId, subscriptionId: sub.id, quote, subscriptionVersion: sub.updatedAt.toISOString(), billingRevision: billingRevision(sub) });
         return { currentPlan: { id: sub.plan.id, name: sub.plan.name, price: sub.plan.price, currency: sub.plan.currency }, newPlan: { id: next.id, name: next.name, price: next.price, currency: next.currency }, isUpgrade: quote.kind === 'upgrade', isDowngrade: quote.kind === 'downgrade', priceDifference: quote.priceDifference, daysRemaining: quote.daysRemaining, totalDays: quote.totalDays, prorationRatio: quote.prorationRatio, amountDue: quote.amountMinor, amountDueFormatted: quote.amountMajor, currency: quote.currency, effectiveDate: quote.effectiveDate, message: quote.timing === 'period_end' ? 'Change scheduled for the next renewal.' : `Amount due: ${quote.amountMajor} ${quote.currency}`, quoteId, validUntil: quote.validUntil };
     }
     async changePlan(subscriberId: string, newPlanId: string, options: ChangePlanOptions = {}): Promise<ChangePlanResult<TFeatures>> {
@@ -306,7 +315,7 @@ export class SubscriptionsService<TFeatures extends FeatureRegistry> {
             if (!stored || stored.payload.subscriberId !== subscriberId || stored.payload.subscriptionId !== sub.id)
                 fail('Quote does not belong to this purchase', 'INVALID_QUOTE');
             quote = hydrateQuote(stored.payload.quote as PlanChangeQuote);
-            if (quote.newPrice.planId !== newPlanId || quote.currentPrice.planId !== sub.planId || stored.payload.subscriptionVersion !== sub.updatedAt.toISOString() || new Date() >= quote.validUntil || JSON.stringify(quote.newPrice) !== JSON.stringify(snapshotBillingPrice(next)))
+            if (quote.newPrice.planId !== newPlanId || quote.currentPrice.planId !== sub.planId || stored.payload.subscriptionVersion !== sub.updatedAt.toISOString() || (stored.payload.billingRevision !== undefined && stored.payload.billingRevision !== billingRevision(sub)) || new Date() >= quote.validUntil || JSON.stringify(quote.newPrice) !== JSON.stringify(snapshotBillingPrice(next)))
                 fail('Quote changed or expired; preview and confirm again', 'QUOTE_EXPIRED');
             const paidPrice = this.paidPrice(sub, quote.timing === 'immediate' && quote.prorate);
             if (sub.status === 'active' && sub.plan.price > 0 && paidPrice && JSON.stringify(quote.currentPrice) !== JSON.stringify(paidPrice))
@@ -324,9 +333,9 @@ export class SubscriptionsService<TFeatures extends FeatureRegistry> {
         if (quote.timing === 'period_end') {
             const updated = await this.db.transaction(async (tx) => {
                 const current = await tx.subscriptions.findById(sub.id);
-                if (!current || current.updatedAt.getTime() !== sub.updatedAt.getTime())
+                if (!current || current.updatedAt.getTime() !== sub.updatedAt.getTime() || billingRevision(current) !== billingRevision(sub))
                     fail('Subscription changed; preview again');
-                const result = await tx.subscriptions.update(sub.id, { metadata: { ...current.metadata, pendingDowngradePlanId: next.id } });
+                const result = await tx.subscriptions.update(sub.id, { metadata: { ...current.metadata, pendingDowngradePlanId: next.id, billingRevision: crypto.randomUUID() } });
                 await this.emit(tx, 'subscription.plan_changed', `scheduled:${sub.id}:${next.id}:${sub.currentPeriodEnd.toISOString()}`, subscriberId, { subscriptionId: sub.id, newPlanId: next.id, effectiveAt: sub.currentPeriodEnd });
                 return result;
             });
@@ -334,10 +343,11 @@ export class SubscriptionsService<TFeatures extends FeatureRegistry> {
             return { subscription: { ...updated, plan: sub.plan }, charged: false, chargeAmount: 0 };
         }
         const binding = quote.amountMinor > 0 ? this.assertLocalBilling(sub) : (sub.billing ?? { providerId: 'manual', accountId: 'manual', environment: 'test', billingOwner: 'sdk_managed' } as ProviderBinding);
-        const purchase: Purchase = { kind: 'change', subscriberId, subscriptionId: sub.id, binding, planId: next.id, amountMinor: quote.amountMinor, currency: quote.currency, periodStart: quote.periodStart.toISOString(), periodEnd: quote.periodEnd.toISOString(), previousPlanId: sub.planId, previousPeriodEnd: sub.currentPeriodEnd.toISOString(), previousPeriodStart: sub.currentPeriodStart.toISOString(), previousCancelAt: sub.cancelAt?.toISOString() ?? null, previousStatus: sub.status, price: quote.newPrice, quote };
-        const key = `change:${sub.id}:${sub.planId}:${sub.currentPeriodEnd.toISOString()}:${next.id}:${JSON.stringify(quote.newPrice)}`;
+        const purchase: Purchase = { kind: 'change', subscriberId, subscriptionId: sub.id, binding, planId: next.id, amountMinor: quote.amountMinor, currency: quote.currency, periodStart: quote.periodStart.toISOString(), periodEnd: quote.periodEnd.toISOString(), previousPlanId: sub.planId, previousPeriodEnd: sub.currentPeriodEnd.toISOString(), previousPeriodStart: sub.currentPeriodStart.toISOString(), previousCancelAt: sub.cancelAt?.toISOString() ?? null, previousStatus: sub.status, previousBillingRevision: billingRevision(sub), price: quote.newPrice, quote };
+        const key = `change:${sub.id}:${billingRevision(sub)}:${sub.planId}:${sub.currentPeriodEnd.toISOString()}:${next.id}:${JSON.stringify(quote.newPrice)}`;
         const result = await this.runPurchase(key, purchase, 0);
-        return { subscription: { ...result.subscription, plan: next }, charged: !!result.paymentId, chargeAmount: purchase.amountMinor, ...(result.paymentId ? { paymentId: result.paymentId } : {}), ...(result.invoice ? { invoice: result.invoice } : {}) };
+        const appliedPlan = result.subscription.planId === next.id ? next : await this.plan(result.subscription.planId);
+        return { subscription: { ...result.subscription, plan: appliedPlan }, charged: !!result.paymentId, chargeAmount: purchase.amountMinor, ...(result.paymentId ? { paymentId: result.paymentId } : {}), ...(result.invoice ? { invoice: result.invoice } : {}) };
     }
     async renew(subscriberId: string, options: RenewSubscriptionOptions = {}): Promise<Subscription> {
         for (const key of ['skipPayment', 'paidExternally', 'gatewayInvoiceId'])
@@ -363,7 +373,7 @@ export class SubscriptionsService<TFeatures extends FeatureRegistry> {
                 day: number;
                 endOfMonth: boolean;
             } | undefined;
-        const purchase: Purchase = (existing?.payload.purchase as Purchase | undefined) ?? { kind: 'renewal', subscriberId, subscriptionId: sub.id, binding, planId: plan.id, amountMinor: majorToMinor(plan.price, plan.currency), currency: plan.currency, periodStart: periodStart.toISOString(), periodEnd: calculateBillingPeriodEnd(periodStart, plan.interval, plan.intervalCount, anchor).toISOString(), billingAnchor: anchor ?? billingCalendarAnchor(periodStart), previousPlanId: sub.planId, previousPeriodEnd: sub.currentPeriodEnd.toISOString(), previousPeriodStart: sub.currentPeriodStart.toISOString(), previousCancelAt: sub.cancelAt?.toISOString() ?? null, previousStatus: sub.status, price: snapshotBillingPrice(plan) };
+        const purchase: Purchase = (existing?.payload.purchase as Purchase | undefined) ?? { kind: 'renewal', subscriberId, subscriptionId: sub.id, binding, planId: plan.id, amountMinor: majorToMinor(plan.price, plan.currency), currency: plan.currency, periodStart: periodStart.toISOString(), periodEnd: calculateBillingPeriodEnd(periodStart, plan.interval, plan.intervalCount, anchor).toISOString(), billingAnchor: anchor ?? billingCalendarAnchor(periodStart), previousPlanId: sub.planId, previousPeriodEnd: sub.currentPeriodEnd.toISOString(), previousPeriodStart: sub.currentPeriodStart.toISOString(), previousCancelAt: sub.cancelAt?.toISOString() ?? null, previousStatus: sub.status, previousBillingRevision: billingRevision(sub), price: snapshotBillingPrice(plan) };
         return (await this.runPurchase(key, purchase, options.retryAttempt ?? 0)).subscription;
     }
     /** Server-only renewal policy for deliberate manual invoices or complimentary access. */
@@ -387,7 +397,7 @@ export class SubscriptionsService<TFeatures extends FeatureRegistry> {
             const latest = await tx.subscriptions.findById(sub.id);
             if (!latest || latest.updatedAt.getTime() !== sub.updatedAt.getTime())
                 fail('Subscription changed');
-            const metadata: Record<string, unknown> = { ...cleanRecovery(latest.metadata), billingPolicy: options.policy, billingAnchor: billingCalendarAnchor(start) };
+            const metadata: Record<string, unknown> = { ...cleanRecovery(latest.metadata), billingPolicy: options.policy, billingRevision: crypto.randomUUID(), billingAnchor: billingCalendarAnchor(start) };
             delete metadata.paidPrice;
             delete metadata.paidThrough;
             const updated = await tx.subscriptions.update(sub.id, { status: 'active', planId: plan.id, currentPeriodStart: start, currentPeriodEnd: end, trialStart: null, trialEnd: null, metadata });
@@ -413,6 +423,8 @@ export class SubscriptionsService<TFeatures extends FeatureRegistry> {
             const result = (await tx.billingOperations!.reserve(key, { purchase })).record;
             if (result.status === 'applied')
                 return result;
+            if (result.status !== 'succeeded' && !purchaseStillCurrent(current, result.payload.purchase as Purchase))
+                fail('Subscription changed before collection; preview again', 'STALE_SETTLEMENT');
             const latest = result.payload.latestAttempt as number | undefined;
             if (result.status !== 'succeeded') {
                 if (latest === undefined && retry !== 0)
@@ -604,7 +616,7 @@ export class SubscriptionsService<TFeatures extends FeatureRegistry> {
             if (!current)
                 fail('Subscription missing');
             const lock = await tx.billingOperations!.find(`billing-lock:${purchase.subscriptionId}`);
-            if (lock?.payload.purchaseKey !== key || current.planId !== purchase.previousPlanId || current.currentPeriodEnd.toISOString() !== purchase.previousPeriodEnd || current.currentPeriodStart.toISOString() !== purchase.previousPeriodStart || (current.cancelAt?.toISOString() ?? null) !== purchase.previousCancelAt || !['active', 'trialing', 'past_due', 'incomplete'].includes(current.status) || (purchase.kind === 'change' && current.status !== purchase.previousStatus))
+            if (lock?.payload.purchaseKey !== key || !purchaseStillCurrent(current, purchase))
                 fail('Stale settlement requires reconciliation', 'STALE_SETTLEMENT');
             const plan = await tx.plans.findById(purchase.planId);
             if (!plan)
@@ -622,7 +634,7 @@ export class SubscriptionsService<TFeatures extends FeatureRegistry> {
                 invoice = await new InvoicesService(tx).create({ subscriptionId: current.id, amount, currency: purchase.currency, status: 'paid', paidAt: new Date(), gatewayInvoiceId: scopedProviderReference(purchase.binding, purchase.paymentId), lineItems: [{ description: `${purchase.kind}: ${plan.name}`, quantity: 1, unitPrice: amount, amount }], metadata: { purchaseKey: key, paymentId: purchase.paymentId, paymentAttemptKey: purchase.paymentAttemptKey } });
                 await this.emit(tx, 'invoice.paid', `invoice.paid:${scopedProviderReference(purchase.binding, purchase.paymentId)}`, current.subscriberId, { invoiceId: invoice.id, amount, currency: purchase.currency });
             }
-            const metadata = { ...cleanRecovery(current.metadata), paidThrough: purchase.periodEnd, paidPrice: purchase.price, billingPolicy: 'purchase', ...(purchase.billingAnchor ? { billingAnchor: purchase.billingAnchor } : (purchase.kind === 'change' && !purchase.quote?.preserveAnchor) ? { billingAnchor: billingCalendarAnchor(new Date(purchase.periodStart)) } : {}) };
+            const metadata = { ...cleanRecovery(current.metadata), paidThrough: purchase.periodEnd, paidPrice: purchase.price, billingPolicy: 'purchase', billingRevision: crypto.randomUUID(), ...(purchase.billingAnchor ? { billingAnchor: purchase.billingAnchor } : (purchase.kind === 'change' && !purchase.quote?.preserveAnchor) ? { billingAnchor: billingCalendarAnchor(new Date(purchase.periodStart)) } : {}) };
             const subscription = await tx.subscriptions.update(current.id, { planId: purchase.planId, status: 'active', currentPeriodStart: new Date(purchase.periodStart), currentPeriodEnd: new Date(purchase.periodEnd), trialStart: null, trialEnd: null, metadata });
             await tx.billingOperations!.update(`billing-lock:${purchase.subscriptionId}`, { status: 'applied' });
             await tx.billingOperations!.update(key, { status: 'applied', payload: { ...record.payload, ...(invoice ? { invoiceId: invoice.id } : {}) } });
@@ -701,7 +713,7 @@ export class SubscriptionsService<TFeatures extends FeatureRegistry> {
             return;
         await tx.billingOperations!.update(lockKey, { status: 'failed' });
         const current = await tx.subscriptions.findById(purchase.subscriptionId);
-        if (purchase.kind === 'renewal' && current?.planId === purchase.previousPlanId && current.currentPeriodStart.toISOString() === purchase.previousPeriodStart && current.currentPeriodEnd.toISOString() === purchase.previousPeriodEnd && (current.cancelAt?.toISOString() ?? null) === purchase.previousCancelAt)
+        if (purchase.kind === 'renewal' && current && purchaseStillCurrent(current, purchase))
             await this.recordFailureInTransaction(tx, purchase.subscriberId, message, attemptKey);
     }
     /** Incoming snapshots never prove payment and never issue provider commands. */
@@ -812,6 +824,60 @@ export class SubscriptionsService<TFeatures extends FeatureRegistry> {
         await this.invalidate(id);
         return result;
     }
+    private async reserveDunningSlot(sub: Subscription, due: number, retryCount: number): Promise<{ attempts: number; cycleKey: string; retry?: number } | null> {
+        return this.db.transaction(async tx => {
+            const live = await tx.subscriptions.findById(sub.id);
+            const cycle = sub.currentPeriodEnd.toISOString();
+            if (!live || live.status !== 'past_due' || live.currentPeriodEnd.toISOString() !== cycle)
+                return null;
+            const attempts = typeof live.metadata?.dunningAttempts === 'number' ? live.metadata.dunningAttempts : 0;
+            const cycleKey = `renewal:${sub.id}:${cycle}`;
+            if (attempts >= due || attempts >= retryCount)
+                return { attempts, cycleKey };
+            const purchase = await tx.billingOperations!.find(cycleKey);
+            const latest = purchase?.payload.latestAttempt as number | undefined;
+            const prior = latest === undefined ? null : await tx.billingOperations!.find(`${cycleKey}:attempt:${latest}`);
+            const retry = latest === undefined ? 0 : prior?.status === 'failed' ? latest + 1 : latest;
+            // Concurrent sweeps for one scheduled retry share the same durable provider attempt.
+            const slot = await tx.billingOperations!.reserve(`dunning-slot:${sub.id}:${cycle}:${attempts}`, { retry });
+            return { attempts, cycleKey, retry: slot.record.payload.retry as number };
+        });
+    }
+    private async countDunningFailure(sub: Subscription, attemptKey: string, now: Date): Promise<number | null> {
+        return this.db.transaction(async tx => {
+            const live = await tx.subscriptions.findById(sub.id);
+            const attempt = await tx.billingOperations!.find(attemptKey);
+            const cycle = sub.currentPeriodEnd.toISOString();
+            if (!live || live.status !== 'past_due' || live.currentPeriodEnd.toISOString() !== cycle || live.metadata?.dunningCycle !== cycle || attempt?.status !== 'failed')
+                return null;
+            const purchase = await tx.billingOperations!.find(attempt.payload.purchaseKey as string);
+            if (!purchase || ['applied', 'succeeded'].includes(purchase.status) || !purchaseStillCurrent(live, purchase.payload.purchase as Purchase))
+                return null;
+            const count = typeof live.metadata.dunningAttempts === 'number' ? live.metadata.dunningAttempts : 0;
+            if (attempt.payload.dunningCounted)
+                return count;
+            await tx.billingOperations!.update(attemptKey, { status: 'failed', payload: { ...attempt.payload, dunningCounted: true } });
+            await tx.subscriptions.update(sub.id, { metadata: { ...live.metadata, dunningAttempts: count + 1, lastDunningAttemptAt: now.toISOString() } });
+            return count + 1;
+        });
+    }
+    private async suspendFailedCycle(sub: Subscription, action: 'pause' | 'cancel', retryCount: number): Promise<boolean> {
+        return this.db.transaction(async tx => {
+            const live = await tx.subscriptions.findById(sub.id);
+            const cycle = sub.currentPeriodEnd.toISOString();
+            if (!live || live.status !== 'past_due' || live.currentPeriodEnd.toISOString() !== cycle || live.metadata?.dunningCycle !== cycle || Number(live.metadata.dunningAttempts) < retryCount)
+                return false;
+            const key = `renewal:${sub.id}:${cycle}`;
+            const purchase = await tx.billingOperations!.find(key);
+            const lock = await tx.billingOperations!.find(`billing-lock:${sub.id}`);
+            const attempt = purchase ? await tx.billingOperations!.find(`${key}:attempt:${purchase.payload.latestAttempt}`) : null;
+            if (!purchase || ['succeeded', 'applied'].includes(purchase.status) || attempt?.status !== 'failed' || lock?.status !== 'failed' || lock.payload.purchaseKey !== key)
+                return false;
+            await tx.subscriptions.update(sub.id, { status: action === 'pause' ? 'paused' : 'canceled', metadata: { ...live.metadata, pauseReason: 'payment_failure' } });
+            await this.emit(tx, 'subscription.suspended', `dunning:${sub.id}:${cycle}`, sub.subscriberId, { subscriptionId: sub.id, action });
+            return true;
+        });
+    }
     async processDunning(now: Date = new Date()): Promise<DunningProcessResult[]> {
         const candidates = await this.db.subscriptions.findAll({ status: 'past_due' });
         const results: DunningProcessResult[] = [];
@@ -820,6 +886,8 @@ export class SubscriptionsService<TFeatures extends FeatureRegistry> {
             if (row.billing?.billingOwner !== 'sdk_managed')
                 continue;
             const sub = await this.getOrThrow(row.subscriberId);
+            if (sub.status !== 'past_due')
+                continue;
             const metadata = sub.metadata ?? {};
             const started = new Date(metadata.dunningStartedAt as string);
             if (!Number.isFinite(started.getTime()))
@@ -829,32 +897,30 @@ export class SubscriptionsService<TFeatures extends FeatureRegistry> {
             let recovered = false;
             let actionApplied: 'pause' | 'cancel' | 'none' = 'none';
             if (attempts < schedule.length && due > attempts) {
-                const cycleKey = `renewal:${sub.id}:${sub.currentPeriodEnd.toISOString()}`;
-                const cycle = await this.db.billingOperations?.find(cycleKey);
-                const latestAttempt = cycle?.payload.latestAttempt as number | undefined;
-                const prior = latestAttempt !== undefined ? await this.db.billingOperations?.find(`${cycleKey}:attempt:${latestAttempt}`) : undefined;
-                const retry = latestAttempt === undefined ? 0 : prior?.status === 'failed' ? latestAttempt + 1 : latestAttempt;
-                const retryKey = `${cycleKey}:attempt:${retry}`;
-                try {
-                    await this.renew(sub.subscriberId, { retryAttempt: retry });
-                    recovered = true;
-                }
-                catch (error) {
-                    const record = await this.db.billingOperations?.find(retryKey);
-                    if (record?.status === 'failed') {
-                        attempts++;
-                        const latest = await this.getOrThrow(sub.subscriberId);
-                        await this.db.subscriptions.update(sub.id, { metadata: { ...latest.metadata, dunningAttempts: attempts, lastDunningAttemptAt: now.toISOString() } });
+                const slot = await this.reserveDunningSlot(sub, due, schedule.length);
+                if (!slot)
+                    continue;
+                attempts = slot.attempts;
+                if (slot.retry !== undefined) {
+                    const retryKey = `${slot.cycleKey}:attempt:${slot.retry}`;
+                    try {
+                        await this.renew(sub.subscriberId, { retryAttempt: slot.retry });
+                        recovered = true;
                     }
-                    else
-                        this.logger.warn?.('Dunning payment unresolved; attempt is not advanced', error);
+                    catch (error) {
+                        const count = await this.countDunningFailure(sub, retryKey, now);
+                        if (count !== null)
+                            attempts = count;
+                        else
+                            this.logger.warn?.('Dunning payment unresolved; attempt is not advanced', error);
+                    }
                 }
             }
             const exhausted = !recovered && attempts >= schedule.length;
-            if (exhausted && (this.options.dunning?.action ?? 'none') !== 'none') {
-                actionApplied = this.options.dunning!.action!;
-                await this.local(async (tx) => { const live = await tx.subscriptions.findById(sub.id); if (!live)
-                    return; await tx.subscriptions.update(sub.id, { status: actionApplied === 'pause' ? 'paused' : 'canceled', metadata: { ...live.metadata, pauseReason: 'payment_failure' } }); await this.emit(tx, 'subscription.suspended', `dunning:${sub.id}:${sub.currentPeriodEnd.toISOString()}`, sub.subscriberId, { subscriptionId: sub.id, action: actionApplied }); });
+            const action = this.options.dunning?.action ?? 'none';
+            if (exhausted && action !== 'none') {
+                if (await this.suspendFailedCycle(sub, action, schedule.length))
+                    actionApplied = action;
             }
             await this.invalidate(sub.subscriberId);
             results.push({ subscriberId: sub.subscriberId, subscriptionId: sub.id, attempts, exhausted, recovered, actionApplied });

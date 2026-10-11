@@ -14,7 +14,8 @@ The core uses web-standard APIs (`fetch`, Web Crypto, `Request`, `Response`, and
 | Upstash HTTP cache | Web-standard HTTP | Web-standard HTTP | Web-standard HTTP |
 | Cloudflare KV cache | Requires a KV-compatible binding | Requires a KV-compatible binding | Supported cache binding |
 | In-memory database/cache | Development/test only | Development/test only | Per-isolate development/test only |
-| Invoice HTML with `templateSource` | Supported | Supported | Supported without filesystem access |
+| Invoice HTML with the built-in template or `invoice.template` function | Supported | Supported | Precompiled rendering without dynamic evaluation |
+| Runtime Handlebars compilation with `templateSource` | Supported | Requires compatible compiler resolution | Unsupported; use a precompiled `invoice.template` function |
 | `puppeteer-html-pdf` | Optional Node/Bun dependency | Unsupported recipe | Unsupported |
 | Browser Rendering PDF | Use platform tooling | Use platform tooling | Optional `@cloudflare/puppeteer` and Browser Rendering binding |
 | HTTP integrations | Fetch handler; Elysia/Hono/Next per framework runtime support | Fetch handler; framework support varies | Fetch/Hono; other frameworks require their own deployment support |
@@ -154,7 +155,7 @@ export default {
 
 This illustrates runtime wiring for supported reads; paid purchase, renewal, and other operations requiring financial transactions fail closed on D1. Keep collection and atomic settlement on a storage backend with verified transaction support. KV is eventually consistent and must never authorize entitlement or quota admission by itself.
 
-Render invoice HTML using a bundled `templateSource` or the built-in template. Use the SDK's authorized invoice routes, or verify invoice subscriber ownership before rendering a custom endpoint. For PDF, supply Browser Rendering through `@cloudflare/puppeteer`; `puppeteer-html-pdf` is unavailable in Workers. The neutral bundle check does not test Browser Rendering or a live D1 integration.
+Render invoice HTML using the built-in precompiled template or an `invoice.template` function created from a template precompiled during your application build. Workers prohibits dynamic function creation, so inline `templateSource` compilation is unavailable there. Use the SDK's authorized invoice routes, or verify invoice subscriber ownership before rendering a custom endpoint. For PDF, supply Browser Rendering through `@cloudflare/puppeteer`; `puppeteer-html-pdf` is unavailable in Workers. The neutral bundle check does not test Browser Rendering or a live D1 integration.
 
 The [Workers smoke fixture](../tests/workers-smoke/README.md) uses a memory database and fake KV, with a fixed demonstration subscriber and no production authentication. It validates bundling and local route behavior, not durable Workers billing.
 

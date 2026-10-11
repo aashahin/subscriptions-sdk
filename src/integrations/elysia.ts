@@ -1,15 +1,15 @@
 // file: packages/subscriptions/src/integrations/elysia.ts
 // Elysia integration for @abshahin/subscriptions
 
-import { Elysia, t } from "elysia";
+import { Elysia, ElysiaCustomStatusResponse, StatusMap, t } from "elysia";
 import {
   FeatureNotAllowedError,
   PaymentFailedError,
   SubscriptionError,
-  UsageLimitExceededError,
 } from "../core/errors.js";
 import type { FeatureRegistry } from "../core/types.js";
 import type { Subscriptions } from "../index.js";
+import type { UsageAdmission } from "../services/permissions.service.js";
 import { webhookFailureStatus, type SubscriptionOperation } from "./http.js";
 import {
   renderSubscriptionInvoice,
@@ -91,16 +91,19 @@ export interface ElysiaPluginOptions<
   invoice?: {
     /**
      * Path to custom Handlebars template (Node.js filesystem only).
-     * Prefer `templateSource` on non-Node runtimes. Defaults to the built-in
-     * inlined template, which needs no filesystem at all.
+     * Prefer `template` on Workers. Defaults to the built-in precompiled
+     * template, which needs no filesystem at all.
      */
     templatePath?: string;
 
     /**
-     * Inline Handlebars template source. Runtime-agnostic alternative to
-     * `templatePath`; takes precedence when both are set.
+     * Inline Handlebars source, compiled lazily on server runtimes.
+     * Takes precedence over `templatePath`. Use `template` on Workers.
      */
     templateSource?: string;
+
+    /** Precompiled template function; takes precedence over source and path. */
+    template?: import("../templates/invoice-utils.js").SubscriptionInvoiceTemplateRenderer;
 
     /**
      * PDF renderer for `format=pdf` (e.g. `puppeteerPdfRenderer` on Node,
@@ -152,19 +155,97 @@ export function elysiaPlugin<
     throw new Error("elysiaPlugin: adminRoutes requires an explicit adminGuard authorization policy");
   }
 
+  const subscriberIds = new WeakMap<Request, string>();
   const requireSubscriberId = async (
     ctx: unknown,
     operation: SubscriptionOperation,
   ): Promise<string> => {
-    const subscriberId = await getSubscriberId(ctx);
+    const request = (ctx as { request: Request }).request;
+    const subscriberId = subscriberIds.get(request) ?? await getSubscriberId(ctx);
     if (typeof subscriberId !== "string" || !subscriberId.trim()) {
       throw new SubscriptionError("Unauthorized", "UNAUTHORIZED", 401);
     }
+    subscriberIds.set(request, subscriberId);
     if (options?.authorizeSubscriber &&
       await options.authorizeSubscriber(ctx, subscriberId, operation) !== true) {
       throw new SubscriptionError("Access denied", "FORBIDDEN", 403);
     }
     return subscriberId;
+  };
+
+  type UsageContext = {
+    request: Request;
+    response?: unknown;
+    set: { status?: number | keyof typeof StatusMap };
+    error?: unknown;
+  };
+  const admissions = new WeakMap<Request, Map<keyof TFeatures, {
+    receipt: UsageAdmission;
+    consume: boolean;
+  }>>();
+
+  const admitFeature = async (
+    ctx: UsageContext,
+    feature: keyof TFeatures,
+    count: number,
+    operation: "usage" | "consume-usage",
+  ): Promise<void> => {
+    const subscriberId = await requireSubscriberId(ctx, operation);
+    let requestAdmissions = admissions.get(ctx.request);
+    if (!requestAdmissions) {
+      requestAdmissions = new Map();
+      admissions.set(ctx.request, requestAdmissions);
+    }
+    const existing = requestAdmissions.get(feature);
+    if (existing) {
+      existing.consume ||= operation === "consume-usage";
+      return;
+    }
+    const receipt = await subs.permissions.admitUsage(subscriberId, feature, count);
+    requestAdmissions.set(feature, { receipt, consume: operation === "consume-usage" });
+  };
+
+  const finishUsage = async (ctx: UsageContext): Promise<void> => {
+    const requestAdmissions = admissions.get(ctx.request);
+    if (!requestAdmissions) return;
+    const configuredStatus = typeof ctx.set.status === "string" ? StatusMap[ctx.set.status] : ctx.set.status ?? 200;
+    const responseStatus = ctx.response instanceof Response
+      ? ctx.response.status === 200 ? configuredStatus : ctx.response.status
+      : ctx.response instanceof ElysiaCustomStatusResponse ? ctx.response.code
+      : configuredStatus;
+    for (const [feature, admission] of requestAdmissions) {
+      if (!ctx.error && !(ctx.response instanceof Error) && responseStatus < 400 && admission.consume) await admission.receipt.commit();
+      else await admission.receipt.release();
+      requestAdmissions.delete(feature);
+    }
+    admissions.delete(ctx.request);
+  };
+
+  const subscriptionErrorResponse = ({ error, set }: UsageContext) => {
+    if (error instanceof PaymentFailedError) {
+      set.status = error.statusCode;
+      return {
+        error: error.code, message: error.message,
+        ...(error.errorCode && { errorCode: error.errorCode }),
+        ...(error.isRetryable !== undefined && { isRetryable: error.isRetryable }),
+        ...(error.userAction && { userAction: error.userAction }),
+        ...(error.paymentId && { paymentId: error.paymentId }),
+      };
+    }
+    if (error instanceof SubscriptionError) {
+      set.status = error.statusCode;
+      return { error: error.code, message: error.message };
+    }
+    const status = webhookFailureStatus(error);
+    if (status) {
+      set.status = status;
+      return { error: error instanceof Error ? error.message : "Webhook verification failed" };
+    }
+  };
+
+  const usageErrorResponse = async (ctx: UsageContext) => {
+    await finishUsage(ctx);
+    return subscriptionErrorResponse(ctx);
   };
 
   const subscribeBodySchema = t.Object({
@@ -235,35 +316,7 @@ export function elysiaPlugin<
   };
 
   const app = new Elysia({ name: "Plugin.Subscriptions", prefix, normalize: false })
-    // Error handling
-    .onError(({ error, set }) => {
-      // Enhanced handling for payment errors
-      if (error instanceof PaymentFailedError) {
-        set.status = error.statusCode;
-        return {
-          error: error.code,
-          message: error.message,
-          ...(error.errorCode && { errorCode: error.errorCode }),
-          ...(error.isRetryable !== undefined && {
-            isRetryable: error.isRetryable,
-          }),
-          ...(error.userAction && { userAction: error.userAction }),
-          ...(error.paymentId && { paymentId: error.paymentId }),
-        };
-      }
-      if (error instanceof SubscriptionError) {
-        set.status = error.statusCode;
-        return {
-          error: error.code,
-          message: error.message,
-        };
-      }
-      const status = webhookFailureStatus(error);
-      if (status) {
-        set.status = status;
-        return { error: error instanceof Error ? error.message : "Webhook verification failed" };
-      }
-    })
+    .onError(subscriptionErrorResponse)
     // ==================== Subscriber Routes ====================
 
     // Get current subscription
@@ -450,41 +503,30 @@ export function elysiaPlugin<
       }
 
       // Build invoice data for template
+      const { subscription: invoiceSubscription, plan: invoicePlan, ...invoiceRecord } = invoice;
       const invoiceData: SubscriptionInvoiceData = {
         invoice: {
-          id: invoice.id,
-          subscriptionId: invoice.subscriptionId,
-          subscriberId: invoice.subscriberId,
-          // Invoice amounts are persisted in major/display units (e.g. SAR/USD).
-          amount: invoice.amount,
-          currency: invoice.currency,
-          status: invoice.status,
-          gatewayInvoiceId: invoice.gatewayInvoiceId,
-          paidAt: invoice.paidAt,
-          dueDate: invoice.dueDate,
+          ...invoiceRecord,
           lineItems: invoice.lineItems.map((item) => ({
             ...item,
-            amount: item.amount || 0,
-            unitPrice: item.unitPrice || item.amount || 0,
+            amount: item.amount ?? 0,
+            unitPrice: item.unitPrice ?? item.amount ?? 0,
           })),
-          metadata: invoice.metadata,
-          createdAt: invoice.createdAt,
-          updatedAt: invoice.updatedAt,
         },
         subscription: {
-          id: invoice.subscription.id,
-          status: invoice.subscription.status,
-          currentPeriodStart: invoice.subscription.currentPeriodStart,
-          currentPeriodEnd: invoice.subscription.currentPeriodEnd,
-          subscriberId: invoice.subscription.subscriberId,
+          id: invoiceSubscription.id,
+          status: invoiceSubscription.status,
+          currentPeriodStart: invoiceSubscription.currentPeriodStart,
+          currentPeriodEnd: invoiceSubscription.currentPeriodEnd,
+          subscriberId: invoiceSubscription.subscriberId,
         },
         plan: {
-          name: invoice.plan.name,
-          description: invoice.plan.description,
-          price: invoice.plan.price,
-          currency: invoice.plan.currency,
-          interval: invoice.plan.interval,
-          intervalCount: invoice.plan.intervalCount,
+          name: invoicePlan.name,
+          description: invoicePlan.description,
+          price: invoicePlan.price,
+          currency: invoicePlan.currency,
+          interval: invoicePlan.interval,
+          intervalCount: invoicePlan.intervalCount,
         },
         platform: options?.invoice?.platform ?? {
           name: "Subscription Platform",
@@ -500,16 +542,7 @@ export function elysiaPlugin<
       const autoPrint = query["autoPrint"] === "1";
       const print = autoPrint || query["print"] === "1";
 
-      // Resolve the template: explicit source > explicit path > built-in
-      // inlined template (no filesystem, edge-safe).
-      const renderSource = options?.invoice?.templateSource
-        ? { templateSource: options.invoice.templateSource }
-        : options?.invoice?.templatePath
-          ? { templatePath: options.invoice.templatePath }
-          : undefined;
-
-      // Render the invoice HTML once; both modes build on it.
-      const html = await renderSubscriptionInvoice(renderSource, invoiceData);
+      const html = await renderSubscriptionInvoice(options?.invoice, invoiceData);
 
       if (format === "html") {
         const body = print
@@ -575,10 +608,12 @@ export function elysiaPlugin<
             throw new FeatureNotAllowedError(feature as string);
           }
         },
+        error: subscriptionErrorResponse,
       }),
 
       /**
-       * Require usage capacity for a limited feature
+       * Reserve capacity while the handler runs. Commit consumption only when
+       * paired with useFeature for the same feature; otherwise release it.
        *
        * @example
        * ```typescript
@@ -586,38 +621,38 @@ export function elysiaPlugin<
        * ```
        */
       requireUsage: (config: { feature: keyof TFeatures; count?: number }) => ({
-        beforeHandle: async (ctx: unknown) => {
-          const subscriberId = await requireSubscriberId(ctx, "usage");
-          const canUse = await subs.permissions.canUse(
-            subscriberId,
-            config.feature,
-            config.count ?? 1,
-          );
-          if (!canUse) {
-            const status = await subs.remaining(subscriberId, config.feature);
-            throw new UsageLimitExceededError(
-              config.feature as string,
-              status.limit as number,
-              status.used,
-            );
-          }
+        beforeHandle: async (ctx: UsageContext) => {
+          await admitFeature(ctx, config.feature, config.count ?? 1, "usage");
         },
+        mapResponse: finishUsage,
+        error: usageErrorResponse,
       }),
 
       /**
-       * Increment usage after successful handler execution
+       * Authorize and reserve usage before execution; retain it only for a
+       * successful response. A matching requireUsage supplies the count.
        *
        * @example
        * ```typescript
        * app.post('/products', handler, { useFeature: 'maxProducts' })
        * ```
        */
-      useFeature: (feature: keyof TFeatures) => ({
-        afterHandle: async (ctx: unknown) => {
-          const subscriberId = await requireSubscriberId(ctx, "consume-usage");
-          await subs.use(subscriberId, feature);
-        },
-      }),
+      useFeature: (feature: keyof TFeatures) => {
+        let count = 1;
+        return {
+          // Expansion order can remove requireUsage before this macro reads it.
+          // An existing request admission therefore also carries its exact count.
+          introspect: (routeOptions: unknown) => {
+            const usageConfig = (routeOptions as { requireUsage?: { feature: keyof TFeatures; count?: number } }).requireUsage;
+            if (usageConfig?.feature === feature) count = usageConfig.count ?? 1;
+          },
+          beforeHandle: async (ctx: UsageContext) => {
+            await admitFeature(ctx, feature, count, "consume-usage");
+          },
+          mapResponse: finishUsage,
+          error: usageErrorResponse,
+        };
+      },
     });
 
   // Add admin routes if enabled

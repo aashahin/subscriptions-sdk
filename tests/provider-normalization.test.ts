@@ -1,3 +1,4 @@
+import { mockFetch } from './helpers/fetch.ts';
 import { afterEach, describe, expect, it } from "bun:test";
 import { paddleAdapter } from "../src/adapters/paddle.adapter.ts";
 import { lemonSqueezyAdapter } from "../src/adapters/lemonsqueezy.adapter.ts";
@@ -139,10 +140,10 @@ describe("provider event normalization", () => {
 describe("provider charge contract", () => {
   it("Stripe sends the stable idempotency key and selected payment method and separates authorization from capture", async () => {
     let request: RequestInit | undefined;
-    globalThis.fetch = (async (_url, init) => {
+    mockFetch(async (_url, init) => {
       request = init;
       return Response.json({ id: "pi_1", status: "requires_capture", amount: 100, currency: "usd" });
-    }) as typeof fetch;
+    });
     const result = await stripe().chargePayment!({ customerId: "cus_1", paymentMethodId: "pm_selected", amount: 100, currency: "USD", idempotencyKey: "attempt_1" });
     expect(result.status).toBe("authorized");
     expect(new Headers(request?.headers).get("Idempotency-Key")).toBe("attempt_1");
@@ -151,15 +152,15 @@ describe("provider charge contract", () => {
 
   it("Stripe transport/5xx outcomes remain unknown and cannot invite a new charge", async () => {
     const input = { customerId: "cus_1", paymentMethodId: "pm_1", amount: 100, currency: "USD", idempotencyKey: "attempt_1" };
-    globalThis.fetch = (async () => { throw new Error("connection lost after write"); }) as typeof fetch;
+    mockFetch(async () => { throw new Error("connection lost after write"); });
     expect((await stripe().chargePayment!(input)).status).toBe("unknown");
-    globalThis.fetch = (async () => Response.json({ error: { message: "service unavailable" } }, { status: 503 })) as typeof fetch;
+    mockFetch(async () => Response.json({ error: { message: "service unavailable" } }, { status: 503 }));
     expect((await stripe().chargePayment!(input)).status).toBe("unknown");
   });
 
   it("Paddle cannot use a subscription entity as payment evidence and reports hosted transaction uncertainty", async () => {
     let calls = 0;
-    globalThis.fetch = (async () => { calls++; throw new Error("network error"); }) as typeof fetch;
+    mockFetch(async () => { calls++; throw new Error("network error"); });
     const rejected = await paddle().chargePayment!({ customerId: "sub_1", amount: 100, currency: "USD" });
     expect(rejected.status).toBe("failed");
     expect(rejected.errorCode).toBe("UNSUPPORTED_OPERATION");
@@ -173,13 +174,13 @@ describe("provider charge contract", () => {
 
   it("Stripe rejects direct charges without stable idempotency before any provider request", async () => {
     let calls = 0;
-    globalThis.fetch = (async () => { calls++; return Response.json({}); }) as typeof fetch;
+    mockFetch(async () => { calls++; return Response.json({}); });
     await expect(stripe().chargePayment!({ customerId: "cus_1", paymentMethodId: "pm_1", amount: 100, currency: "USD" })).rejects.toThrow("idempotencyKey");
     expect(calls).toBe(0);
   });
 
   it("Stripe lookup returns actual captured minor units, saved method and metadata, and propagates outages", async () => {
-    globalThis.fetch = (async () => Response.json({ id: "pi_1", status: "succeeded", amount: 100, amount_received: 70, currency: "usd", payment_method: "pm_1", metadata: { paymentAttemptId: "attempt_1" } })) as typeof fetch;
+    mockFetch(async () => Response.json({ id: "pi_1", status: "succeeded", amount: 100, amount_received: 70, currency: "usd", payment_method: "pm_1", metadata: { paymentAttemptId: "attempt_1" } }));
     const payment = await stripe().getPayment!("pi_1");
     expect(payment?.status).toBe("paid");
     expect(payment?.amount).toBe(70);
@@ -187,34 +188,34 @@ describe("provider charge contract", () => {
     expect(payment?.paymentMethodId).toBe("pm_1");
     expect(payment?.metadata).toEqual({ paymentAttemptId: "attempt_1" });
     expect(stripe().capabilities?.paymentLookup).toBe(true);
-    globalThis.fetch = (async () => Response.json({ error: { message: "not found" } }, { status: 404 })) as typeof fetch;
+    mockFetch(async () => Response.json({ error: { message: "not found" } }, { status: 404 }));
     expect(await stripe().getPayment!("pi_missing")).toBeNull();
-    globalThis.fetch = (async () => Response.json({ error: { message: "service unavailable" } }, { status: 503 })) as typeof fetch;
+    mockFetch(async () => Response.json({ error: { message: "service unavailable" } }, { status: 503 }));
     await expect(stripe().getPayment!("pi_1")).rejects.toThrow("service unavailable");
   });
 
   it("Paddle reactivation clears the provider scheduled change before reporting success", async () => {
     let body: Record<string, unknown> | undefined;
-    globalThis.fetch = (async (_url, init) => {
+    mockFetch(async (_url, init) => {
       body = JSON.parse(String(init?.body));
       return Response.json({ data: { id: "sub_1", status: "active", customer_id: "ctm_1", current_billing_period: { starts_at: instant, ends_at: "2026-11-11T07:00:00.000Z" }, scheduled_change: null, items: [], canceled_at: null } });
-    }) as typeof fetch;
+    });
     const subscription = await paddle().updateSubscription!("sub_1", { cancelAtPeriodEnd: false });
     expect(body).toEqual({ scheduled_change: null });
     expect(subscription.cancelAt).toBeNull();
   });
 
   it("provider responses cannot substitute requested amounts for missing settlement evidence", async () => {
-    globalThis.fetch = (async () => Response.json({ id: "pi_1", status: "succeeded", amount: 100, currency: "usd" })) as typeof fetch;
+    mockFetch(async () => Response.json({ id: "pi_1", status: "succeeded", amount: 100, currency: "usd" }));
     expect((await stripe().chargePayment!({ customerId: "cus_1", paymentMethodId: "pm_1", amount: 100, currency: "USD", idempotencyKey: "attempt_1" })).status).toBe("unknown");
     await expect(stripe().getPayment!("pi_1")).rejects.toThrow("lookup response");
-    globalThis.fetch = (async () => Response.json({ data: { id: "txn_1", status: "completed", currency_code: "USD" } })) as typeof fetch;
+    mockFetch(async () => Response.json({ data: { id: "txn_1", status: "completed", currency_code: "USD" } }));
     expect((await paddle().chargePayment!({ customerId: "ctm_1", amount: 100, currency: "USD" })).status).toBe("unknown");
   });
 
   it("Paddle and Lemon Squeezy reject unsupported trial overrides before creating checkouts", async () => {
     let calls = 0;
-    globalThis.fetch = (async () => { calls++; return Response.json({}); }) as typeof fetch;
+    mockFetch(async () => { calls++; return Response.json({}); });
     const checkout = { priceId: "1", successUrl: "https://app.example/success", cancelUrl: "https://app.example/cancel", trialDays: 14 };
     await expect(paddle().createCheckoutSession!(checkout)).rejects.toThrow("recurring price");
     await expect(lemon().createCheckoutSession!(checkout)).rejects.toThrow("variant");
@@ -222,9 +223,9 @@ describe("provider charge contract", () => {
   });
 
   it("Paddle and Lemon Squeezy checkout results omit expiry when the provider supplies none", async () => {
-    globalThis.fetch = (async () => Response.json({ data: { id: "txn_1", checkout: { url: "https://checkout.example" } } })) as typeof fetch;
+    mockFetch(async () => Response.json({ data: { id: "txn_1", checkout: { url: "https://checkout.example" } } }));
     expect((await paddle().createCheckoutSession!({ priceId: "pri_1", successUrl: "https://app.example/success", cancelUrl: "https://app.example/cancel" })).expiresAt).toBeUndefined();
-    globalThis.fetch = (async () => Response.json({ data: { id: "42", attributes: { url: "https://checkout.example", expires_at: null } } })) as typeof fetch;
+    mockFetch(async () => Response.json({ data: { id: "42", attributes: { url: "https://checkout.example", expires_at: null } } }));
     expect((await lemon().createCheckoutSession!({ priceId: "1", successUrl: "https://app.example/success", cancelUrl: "https://app.example/cancel" })).expiresAt).toBeUndefined();
   });
 });

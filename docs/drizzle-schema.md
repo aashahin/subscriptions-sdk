@@ -166,6 +166,7 @@ CREATE TABLE billing_outbox (
   status text NOT NULL DEFAULT 'pending',
   claimed_at integer
 );
+CREATE INDEX billing_outbox_status_claimed_at_idx ON billing_outbox (status, claimed_at);
 CREATE TABLE coupons (
   id text PRIMARY KEY NOT NULL,
   code text NOT NULL UNIQUE,
@@ -332,13 +333,23 @@ const subs = createSubscriptions({ database: drizzleAdapter(db), features });
 
 ### `usage_records`
 
-- Usage policies select explicit periods in application code: persistent gauges do not reset, calendar consumption uses UTC boundaries, and subscription-cycle consumption uses authoritative subscription boundaries. Adapter calls without explicit boundaries retain the legacy UTC monthly period.
+- Usage policies select explicit periods in application code: persistent gauges do not reset, calendar consumption uses UTC boundaries, and subscription-cycle consumption uses authoritative subscription boundaries. Exact-period reads remain available after the period ends, including during grace periods. Mutations keep the recorded end synchronized when a cycle is extended. Adapter calls without explicit boundaries retain the legacy UTC monthly period.
+- `usage.reset` with explicit boundaries resets only that period and defaults to the subscriber's tenant scope. Omitting boundaries preserves the legacy all-period reset. `usage.getForPeriods` optionally batches selected feature/period keys with the same default tenant scope.
+- A usage row's `id` identifies one counter incarnation: absolute `usage.set` replaces it, and reset deletes it; increments, reservations, and decrements preserve it. An admission receipt captures that identity so a release cannot decrement consumption created after a reset or absolute replacement.
 - The unique index on `(subscriber_id, tenant_id, feature, period_start)` backs the atomic `INSERT ... ON CONFLICT DO UPDATE` used by `usage.increment`, `usage.set`, and conditional `usage.reserve`
 - The adapter always writes a non-null `tenant_id` (defaulting to the subscriber ID) so the conflict target always matches; decrements are a single guarded `UPDATE` that floors the counter at zero
 
 ### `billing_sequences`
 
 - One row per invoice-number prefix; `invoices.nextInvoiceNumber()` atomically upserts and increments it (`ON CONFLICT DO UPDATE ... RETURNING`) so concurrent invoice creation never yields duplicate numbers
+
+### `billing_outbox`
+
+- Existing installations must add `billing_outbox_status_claimed_at_idx` using the index statement above so relay polling does not scan sent-event history.
+
+### Custom adapter admission contract
+
+Existing `permissions.use` integrations continue to use atomic `usage.reserve`. Before enabling `permissions.admitUsage` for handlers, a custom adapter must advertise `capabilities.guardedUsageRelease: true`, return an accepted reservation's row identity as `recordId`, and honor `expectedRecordId` in usage reads and decrements. A mismatch returns no matching usage and never mutates a replacement row. Absolute sets and resets must invalidate the captured incarnation atomically. Adapters without this capability reject admission before changing usage; they can continue using `permissions.use`.
 
 ## Transactions
 

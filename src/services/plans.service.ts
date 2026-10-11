@@ -5,7 +5,7 @@ import type { CacheAdapter } from '../adapters/cache.adapter.js';
 import { CacheKeys, noopCacheAdapter } from '../adapters/cache.adapter.js';
 import type { DatabaseAdapter, PlanQueryOptions } from '../adapters/database.adapter.js';
 import { InvalidPlanError, PlanNotFoundError, SubscriptionError } from '../core/errors.js';
-import { getFeatureValue, resolveFeatures, validatePlanFeatures } from '../core/features.js';
+import { getDefaultFeatures, getFeatureValue, resolveFeatures, validatePlanFeatures } from '../core/features.js';
 import type {
     CreatePlanInput,
     FeatureRegistry,
@@ -42,6 +42,7 @@ export class PlansService<TFeatures extends FeatureRegistry> {
         cache?: CacheAdapter,
         options?: PlansServiceOptions,
     ) {
+        getDefaultFeatures(features);
         if (cache && cache !== noopCacheAdapter && !options?.cacheNamespace?.trim()) {
             throw new SubscriptionError('A cacheNamespace is required when caching is enabled', 'CACHE_NAMESPACE_REQUIRED');
         }
@@ -171,10 +172,13 @@ export class PlansService<TFeatures extends FeatureRegistry> {
             name: `${original.name} (Copy)`,
             description: original.description,
             price: original.price,
+            ...(original.prices !== undefined && { prices: original.prices }),
             currency: original.currency,
             interval: original.interval,
             intervalCount: original.intervalCount,
+            trialDays: original.trialDays,
             features: original.features,
+            ...(original.metadata !== null && { metadata: original.metadata }),
             isActive: false, // Duplicates start inactive
             sortOrder: original.sortOrder + 1,
             ...overrides,
@@ -247,7 +251,10 @@ export class PlansService<TFeatures extends FeatureRegistry> {
                 if (typeof valueA === 'boolean') {
                     diff = valueB ? 'upgrade' : 'downgrade';
                 } else if (typeof valueA === 'number') {
-                    diff = (valueB as number) > valueA ? 'upgrade' : 'downgrade';
+                    const isLimit = this.features[key]!.type === 'limit';
+                    const comparableA = isLimit && valueA === -1 ? Infinity : valueA;
+                    const comparableB = isLimit && valueB === -1 ? Infinity : valueB as number;
+                    diff = comparableB > comparableA ? 'upgrade' : 'downgrade';
                 }
             }
 

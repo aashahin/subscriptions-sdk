@@ -30,7 +30,6 @@ export function puppeteerPdfRenderer(
 
             const htmlPDF = new PuppeteerHTMLPDF();
             try {
-                await htmlPDF.initializeBrowser();
                 await htmlPDF.setOptions({
                     format: "a4",
                     printBackground: true,
@@ -41,6 +40,7 @@ export function puppeteerPdfRenderer(
                             : undefined) ??
                         "/usr/bin/chromium",
                 });
+                await htmlPDF.initializeBrowser();
 
                 return await htmlPDF.create(html);
             } finally {

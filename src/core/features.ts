@@ -2,6 +2,7 @@
 // Type-safe feature definition system
 
 import type { FeatureDefinition, FeatureRegistry, FeatureValue, FeatureValues } from './types.js';
+import { SubscriptionError } from './errors.js';
 
 /**
  * Define a type-safe feature registry for your application.
@@ -16,6 +17,7 @@ import type { FeatureDefinition, FeatureRegistry, FeatureValue, FeatureValues } 
  * ```
  */
 export function defineFeatures<T extends FeatureRegistry>(features: T): T {
+    getDefaultFeatures(features);
     return features;
 }
 
@@ -28,6 +30,8 @@ export function getDefaultFeatures<T extends FeatureRegistry>(
     const defaults = {} as FeatureValues<T>;
 
     for (const [key, definition] of Object.entries(registry)) {
+        const defaultError = featureValueError(key, definition, definition.default);
+        if (defaultError) throw new SubscriptionError(defaultError, 'INVALID_FEATURE_DEFINITION');
         (defaults as Record<string, unknown>)[key] = definition.default;
     }
 
@@ -100,31 +104,22 @@ export function validatePlanFeatures<T extends FeatureRegistry>(
             continue;
         }
 
-        const expectedType = definition.type === 'boolean' ? 'boolean' : 'number';
-        const actualType = typeof value;
-
-        if (actualType !== expectedType) {
-            errors.push(
-                `Feature "${key}" expects ${expectedType}, got ${actualType}`,
-            );
-        }
-
-        // Validate limits are non-negative integers (or -1 for unlimited)
-        if (definition.type === 'limit' && typeof value === 'number') {
-            if (!Number.isFinite(value) || !Number.isInteger(value)) {
-                errors.push(`Feature "${key}" limit must be an integer`);
-            } else if (value < -1) {
-                errors.push(`Feature "${key}" limit must be >= -1 (use -1 for unlimited)`);
-            }
-        }
-
-        // Validate rates are between 0 and 100
-        if (definition.type === 'rate' && typeof value === 'number') {
-            if (value < 0 || value > 100) {
-                errors.push(`Feature "${key}" rate must be between 0 and 100`);
-            }
-        }
+        const featureError = featureValueError(key, definition, value);
+        if (featureError) errors.push(featureError);
     }
 
     return { valid: errors.length === 0, errors };
+}
+
+function featureValueError(key: string, definition: FeatureDefinition, featureValue: unknown): string | null {
+    const expectedType = definition.type === 'boolean' ? 'boolean' : 'number';
+    if (typeof featureValue !== expectedType) return `Feature "${key}" expects ${expectedType}, got ${typeof featureValue}`;
+    if (typeof featureValue !== 'number') return null;
+    if (definition.type === 'rate') {
+        return Number.isFinite(featureValue) && featureValue >= 0 && featureValue <= 100
+            ? null : `Feature "${key}" rate must be finite and between 0 and 100`;
+    }
+    const minimum = definition.type === 'limit' ? -1 : 0;
+    return Number.isSafeInteger(featureValue) && featureValue >= minimum
+        ? null : `Feature "${key}" ${definition.type} must be a safe integer >= ${minimum}`;
 }

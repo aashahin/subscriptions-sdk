@@ -590,8 +590,7 @@ export function stripeAdapter(config: StripeConfig): PaymentGatewayAdapter {
     ): Promise<GatewaySubscription> {
       const subscription = await client.post<StripeSubscription>(
         `/subscriptions/${encodeURIComponent(subscriptionId)}`,
-        // Empty string unsets pause_collection
-        { "pause_collection[behavior]": "" },
+        { pause_collection: "" },
       );
       return mapSubscription(subscription);
     },

@@ -19,7 +19,7 @@ No provider is registered, so this fixture does not test payment authentication,
 From the repository root:
 
 ```sh
-bunx wrangler dev --config tests/workers-smoke/wrangler.toml
+bunx --bun wrangler dev --config tests/workers-smoke/wrangler.toml
 ```
 
 In another terminal:

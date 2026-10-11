@@ -8,7 +8,7 @@
 // (they are lazy `await import()` calls behind explicit opt-ins).
 //
 // Usage (from the package root):
-//   node tests/workers-smoke/bundle-check.mjs
+//   bun tests/workers-smoke/bundle-check.mjs
 //
 // Exits 0 on success, 1 on failure (printing the esbuild diagnostics).
 
@@ -19,6 +19,7 @@ import { dirname, resolve } from "node:path";
 const packageRoot = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
 
 const args = [
+  "--bun",
   "esbuild",
   "src/index.ts",
   "--bundle",
@@ -39,7 +40,7 @@ const args = [
   "--log-level=warning",
 ];
 
-const result = spawnSync("npx", args, {
+const result = spawnSync("bunx", args, {
   cwd: packageRoot,
   stdio: "pipe",
   encoding: "utf8",

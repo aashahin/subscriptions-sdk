@@ -1,0 +1,10 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "rootDir": ".",
+    "composite": false,
+    "types": ["bun", "node"]
+  },
+  "include": ["src/**/*", "tests/**/*.ts", "scripts/**/*.ts", "tsdown.config.ts"],
+  "exclude": ["node_modules", "dist"]
+}

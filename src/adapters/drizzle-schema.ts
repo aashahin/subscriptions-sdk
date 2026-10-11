@@ -218,7 +218,7 @@ export const billingOutbox = sqliteTable('billing_outbox', {
   event: text('event', { mode: 'json' }).$type<Record<string, unknown>>().notNull(),
   status: text('status').notNull().default('pending'),
   claimedAt: integer('claimed_at', { mode: 'timestamp_ms' }),
-});
+}, table => [index('billing_outbox_status_claimed_at_idx').on(table.status, table.claimedAt)]);
 
 export const coupons = sqliteTable('coupons', {
   id: text('id').primaryKey(),

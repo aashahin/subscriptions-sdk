@@ -16,11 +16,11 @@ import type {
     UpdateSubscriptionInput,
     UsageRecord,
 } from '../core/types.js';
-import { queue, serialAdapter, usagePeriod, validateUsageCount, validateUsageLimit, validateProviderResource, providerResourceScope, providerResourceKey } from '../adapters/persistence-utils.js';
+import { explicitUsagePeriod, queue, serialAdapter, usagePeriod, validateUsageCount, validateUsageLimit, validateProviderResource, providerResourceScope, providerResourceKey } from '../adapters/persistence-utils.js';
 import type { Coupon } from '../core/coupons.js';
 import type { OutboxRecord } from '../adapters/outbox.adapter.js';
 import type {
-    BillingOperationRecord, ProviderResourceMapping, UsageMutationOptions, UsagePeriodOptions, UsageReservationOptions,
+    BillingOperationRecord, ProviderResourceMapping, UsageMutationOptions, UsagePeriodOptions, UsageReadOptions, UsageReservationOptions, UsageResetOptions,
     DatabaseAdapter,
     PlanQueryOptions,
     SubscriptionQueryOptions,
@@ -120,7 +120,7 @@ export function memoryDatabaseAdapter<
 
     const run = queue();
     const createAdapter = (inTransaction = false): DatabaseAdapter<TFeatures> => ({
-        capabilities: {asyncTransactions:true},
+        capabilities: {asyncTransactions:true,guardedUsageRelease:true},
         providerResources: {
             async bind(mapping) {
                 const scope=providerResourceScope(mapping);validateProviderResource(scope,mapping.localId);validateProviderResource(scope,mapping.externalId);
@@ -497,18 +497,20 @@ export function memoryDatabaseAdapter<
             async get(
                 subscriberId: string,
                 feature: string,
-                options?: UsagePeriodOptions & { period?: Date; tenantId?: string | null },
+                options?: UsageReadOptions,
             ): Promise<number> {
                 const period = options?.period ?? new Date();
                 const tenantId = options?.tenantId ?? subscriberId;
+                const explicitPeriod = explicitUsagePeriod(options);
 
                 for (const record of state.usage.values()) {
                     if (
                         record.subscriberId === subscriberId &&
                         record.tenantId === tenantId &&
                         record.feature === feature &&
-                        (options?.periodStart ? record.periodStart.getTime() === options.periodStart.getTime() : record.periodStart <= period) &&
-                        record.periodEnd >= period
+                        (options?.expectedRecordId === undefined || record.id === options.expectedRecordId) &&
+                        (explicitPeriod ? record.periodStart.getTime() === explicitPeriod.periodStart.getTime()
+                            : record.periodStart <= period && record.periodEnd >= period)
                     ) {
                         return record.count;
                     }
@@ -531,6 +533,7 @@ export function memoryDatabaseAdapter<
                 const existing = state.usage.get(key);
                 if (existing) {
                     existing.count += count;
+                    existing.periodEnd = periodEnd;
                     existing.updatedAt = now;
                     return existing.count;
                 }
@@ -556,8 +559,9 @@ export function memoryDatabaseAdapter<
                 const key=usageKey(subscriberId,tenantId,feature,periodStart);const existing=state.usage.get(key);
                 const current=existing?.count??0;const limit=options?.limit??Number.MAX_SAFE_INTEGER;
                 if(current>limit-count)return {accepted:false,count:current};
-                const now=new Date();if(existing){existing.count+=count;existing.updatedAt=now;}else state.usage.set(key,{id:crypto.randomUUID(),subscriberId,tenantId,feature,count,periodStart,periodEnd,createdAt:now,updatedAt:now});
-                return {accepted:true,count:current+count};
+                const recordId=existing?.id??crypto.randomUUID();
+                const now=new Date();if(existing){existing.count+=count;existing.periodEnd=periodEnd;existing.updatedAt=now;}else state.usage.set(key,{id:recordId,subscriberId,tenantId,feature,count,periodStart,periodEnd,createdAt:now,updatedAt:now});
+                return {accepted:true,count:current+count,recordId};
             },
 
             async decrement(
@@ -575,7 +579,7 @@ export function memoryDatabaseAdapter<
                 // Never below zero: clamp the stored count when the release
                 // amount exceeds what has been consumed.
                 const existing = state.usage.get(key);
-                if (existing) {
+                if (existing && (options?.expectedRecordId === undefined || existing.id === options.expectedRecordId)) {
                     existing.count = Math.max(0, existing.count - count);
                     existing.updatedAt = now;
                     return existing.count;
@@ -598,7 +602,9 @@ export function memoryDatabaseAdapter<
 
                 const existing = state.usage.get(key);
                 if (existing) {
+                    existing.id = crypto.randomUUID();
                     existing.count = count;
+                    existing.periodEnd = periodEnd;
                     existing.updatedAt = now;
                     return;
                 }
@@ -618,8 +624,10 @@ export function memoryDatabaseAdapter<
 
             async reset(
                 subscriberId: string,
-                options?: { feature?: string; tenantId?: string | null },
+                options?: UsageResetOptions,
             ): Promise<void> {
+                const explicitPeriod = explicitUsagePeriod(options);
+                const tenantId = explicitPeriod ? options?.tenantId ?? subscriberId : options?.tenantId;
                 for (const [key, record] of state.usage) {
                     if (record.subscriberId !== subscriberId) {
                         continue;
@@ -627,11 +635,24 @@ export function memoryDatabaseAdapter<
                     if (options?.feature !== undefined && record.feature !== options.feature) {
                         continue;
                     }
-                    if (options?.tenantId !== undefined && record.tenantId !== options.tenantId) {
+                    if (tenantId !== undefined && record.tenantId !== tenantId) {
+                        continue;
+                    }
+                    if (explicitPeriod && record.periodStart.getTime() !== explicitPeriod.periodStart.getTime()) {
                         continue;
                     }
                     state.usage.delete(key);
                 }
+            },
+
+            async getForPeriods(subscriberId, periods, tenantId) {
+                const records: UsageRecord[] = [];
+                for (const period of periods) {
+                    const key = usageKey(subscriberId, tenantId ?? subscriberId, period.feature, usagePeriod(period).periodStart);
+                    const record = state.usage.get(key);
+                    if (record) records.push(toUsageRecord(record));
+                }
+                return records;
             },
 
             async getAll(

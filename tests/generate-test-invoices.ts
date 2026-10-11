@@ -103,6 +103,7 @@ function createInvoiceData(
   return {
     ...baseData,
     ...overrides,
+    locale: overrides.locale ?? baseData.locale ?? "ar-SA",
     invoice: {
       ...baseData.invoice,
       ...overrides.invoice,

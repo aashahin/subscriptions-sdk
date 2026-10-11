@@ -188,4 +188,6 @@ The same modes exist on the Elysia plugin's `GET /invoices/:id/download` route (
 
 For programmatic use, `wrapInvoiceForPrint(html, { autoPrint })` (exported from the main entry) wraps any rendered invoice HTML with the same print CSS/toolbar — pure string manipulation, edge-safe.
 
-Custom templates on any runtime: pass `invoice.templateSource` (inline Handlebars string) instead of `templatePath` (Node filesystem only). With neither, the built-in inlined template is used — no filesystem needed.
+The default invoice template is precompiled and renders without filesystem access or dynamic evaluation. For a portable custom template, pass `invoice.template`, a function accepting `SubscriptionInvoiceData` and returning HTML. Build-time precompiled Handlebars templates can be wrapped in this function. On Bun/Node, `invoice.templateSource` and `templatePath` remain available through lazy runtime compilation; Workers requires the built-in template or the function option.
+
+Paddle checkout uses the provider's configured default payment page unless the adapter's `checkoutUrl` points to an approved page hosting Paddle.js. `successUrl` is a post-payment redirect and is not sent as that payment page. Configure success redirection in Paddle.js. Paddle pause takes effect immediately; resume continues the existing paid period and fails if that period can no longer be continued, rather than starting an untracked new charge.

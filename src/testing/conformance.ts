@@ -479,11 +479,11 @@ export async function cacheAdapterConformance(
             const cache = await factory();
 
             await cache.set('key', 'value');
-            expect(await cache.get('key')).toBe('value');
+            expect(await cache.get<string>('key')).toBe('value');
 
             const payload = { subscriberId: 'tenant_1', features: ['a', 'b'] };
             await cache.set('obj', payload);
-            expect(await cache.get('obj')).toEqual(payload);
+            expect(await cache.get<typeof payload>('obj')).toEqual(payload);
         });
 
         it('overwrites existing values', async () => {
@@ -491,14 +491,14 @@ export async function cacheAdapterConformance(
 
             await cache.set('key', 'first');
             await cache.set('key', 'second');
-            expect(await cache.get('key')).toBe('second');
+            expect(await cache.get<string>('key')).toBe('second');
         });
 
         it('expires values after their TTL', async () => {
             const cache = await factory();
 
             await cache.set('short-lived', 'value', 0.05);
-            expect(await cache.get('short-lived')).toBe('value');
+            expect(await cache.get<string>('short-lived')).toBe('value');
 
             await sleep(100);
             expect(await cache.get('short-lived')).toBeNull();
@@ -526,7 +526,7 @@ export async function cacheAdapterConformance(
 
             expect(await cache.get('sub:tenant:1')).toBeNull();
             expect(await cache.get('sub:tenant:2')).toBeNull();
-            expect(await cache.get('plan:1')).toBe('c');
+            expect(await cache.get<string>('plan:1')).toBe('c');
         });
 
         it('increments and decrements numeric values', async () => {

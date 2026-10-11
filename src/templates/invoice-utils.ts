@@ -1,9 +1,10 @@
 // file: packages/subscriptions/src/templates/invoice-utils.ts
 // Template utilities for subscription invoice rendering
 
-import handlebars from "handlebars";
+import handlebars from "handlebars/runtime";
 import type { Invoice } from "../core/types.js";
-import { subscriptionInvoiceTemplate } from "./invoice-template.js";
+import { currencyMinorUnits } from "../core/billing-policy.js";
+import { subscriptionInvoiceTemplateSpec } from "./invoice-template.precompiled.js";
 import type { PdfRenderer } from "./pdf-renderer.js";
 
 // Currency configuration map with ISO 4217 codes, symbols, and locale hints
@@ -90,19 +91,19 @@ export function formatCurrency(
 
     const formatLocale = locale || config.locale;
 
-    if (!amount && amount !== 0) return `0.00 ${config.symbol}`;
-
-    const value = Number(amount);
+    const fractionDigits = currencyMinorUnits(code);
+    const value = Number(amount ?? 0);
 
     try {
         return new Intl.NumberFormat(formatLocale, {
             style: "currency",
             currency: code,
-            minimumFractionDigits: 2,
-            maximumFractionDigits: 2,
+            minimumFractionDigits: fractionDigits,
+            maximumFractionDigits: fractionDigits,
         }).format(value);
-    } catch {
-        return `${value.toFixed(2)} ${config.symbol}`;
+    } catch (error) {
+        if (!(error instanceof RangeError)) throw error;
+        return `${value.toFixed(fractionDigits)} ${config.symbol}`;
     }
 }
 
@@ -235,6 +236,13 @@ handlebars.registerHelper("eq", function (a: unknown, b: unknown) {
     return a === b;
 });
 
+handlebars.registerHelper("coalesce", function (amount: unknown, fallback: unknown) {
+    return amount ?? fallback;
+});
+handlebars.registerHelper("isDefined", function (amount: unknown) {
+    return amount !== null && amount !== undefined;
+});
+
 /**
  * Invoice data structure for template rendering
  */
@@ -273,23 +281,27 @@ export interface SubscriptionInvoiceData {
 
 /**
  * How to resolve the Handlebars template used for invoice rendering.
- * Provide either `templatePath` (Node.js filesystem) or an inline
- * `templateSource` string (works in every runtime). When neither is given,
- * the built-in {@link subscriptionInvoiceTemplate} is used.
+ * The built-in template and precompiled `template` callbacks work without
+ * runtime code generation. Source/path templates require Bun or Node.js.
  */
 export interface RenderSubscriptionInvoiceOptions {
+    /** Portable precompiled template callback. Takes precedence over source/path. */
+    template?: SubscriptionInvoiceTemplateRenderer;
     /** Path to a `.hbs` template file (requires a filesystem; Node.js only). */
     templatePath?: string;
-    /** Inline Handlebars template source (universal, no filesystem). */
+    /** Inline Handlebars source (requires runtime compilation; Bun/Node.js). */
     templateSource?: string;
 }
+
+export type SubscriptionInvoiceTemplateRenderer = (data: SubscriptionInvoiceData) => string;
+
+const builtInInvoiceTemplate = handlebars.template<SubscriptionInvoiceData>(subscriptionInvoiceTemplateSpec);
 
 /**
  * Render the subscription invoice HTML.
  *
  * Backward compatible: the first argument may still be a template path
- * string. Prefer the options form — with `templateSource` or no arguments at
- * all the built-in template is used and no filesystem is touched.
+ * string. With no template option, the built-in precompiled template is used.
  */
 export async function renderSubscriptionInvoice(
     templatePath: string,
@@ -310,38 +322,25 @@ export async function renderSubscriptionInvoice(
         | undefined,
     data?: SubscriptionInvoiceData
 ): Promise<string> {
-    let templatePath: string | undefined;
-    let templateSource: string | undefined;
+    if (data === undefined) return builtInInvoiceTemplate(source as SubscriptionInvoiceData);
+    const options: RenderSubscriptionInvoiceOptions = typeof source === "string"
+        ? { templatePath: source }
+        : (source as RenderSubscriptionInvoiceOptions | undefined) ?? {};
+    if (options.template) return options.template(data);
+    if (options.templateSource === undefined && !options.templatePath) return builtInInvoiceTemplate(data);
+    const templateSource = options.templateSource ?? await readTemplateFile(options.templatePath!);
+    // Leave the optional compiler out of edge bundles; only explicit source/path
+    // templates need its Function constructor in Bun/Node.js.
+    const compilerSpecifier = "handlebars";
+    const { default: compiler } = (await import(compilerSpecifier)) as { default: typeof import("handlebars") };
+    const template = compiler.compile<SubscriptionInvoiceData>(templateSource);
+    return template(data, { helpers: handlebars.helpers, partials: handlebars.partials, decorators: handlebars.decorators });
+}
 
-    if (typeof source === "string") {
-        templatePath = source;
-    } else if (
-        source !== undefined &&
-        ("templatePath" in source || "templateSource" in source)
-    ) {
-        templatePath = source.templatePath;
-        templateSource = source.templateSource;
-    } else if (data === undefined) {
-        // Called as renderSubscriptionInvoice(data) — use the built-in default
-        data = source as SubscriptionInvoiceData;
-    }
-    // else: source is undefined and data is set — use the built-in default
-
-    if (!templateSource) {
-        if (templatePath) {
-            // Lazy import so Workers never execute Node APIs. The specifier is
-            // intentionally non-static so bundlers (wrangler/esbuild) leave it
-            // as a runtime-only import instead of failing at bundle time.
-            const fsSpecifier = "node:fs/promises";
-            const { readFile } = (await import(fsSpecifier)) as typeof import("node:fs/promises");
-            templateSource = await readFile(templatePath, "utf-8");
-        } else {
-            templateSource = subscriptionInvoiceTemplate;
-        }
-    }
-
-    const template = handlebars.compile(templateSource);
-    return template(data!);
+async function readTemplateFile(templatePath: string): Promise<string> {
+    const fsSpecifier = "node:fs/promises";
+    const { readFile } = (await import(fsSpecifier)) as typeof import("node:fs/promises");
+    return readFile(templatePath, "utf-8");
 }
 
 /**

@@ -1,5 +1,19 @@
 # Testing
 
+Development checks use Bun with native type checking (verified with Bun 1.4.3):
+
+```sh
+bun install --frozen-lockfile
+bun run --bun typecheck
+bun run --bun test
+bun run --bun check:templates
+bun run --bun build
+bun run --bun check:package
+bun run --bun check:edge
+```
+
+`typecheck` checks both source and the complete test/tooling project using `bun check`. `build` regenerates the built-in precompiled invoice template from `src/templates/subscription-invoice.hbs`. Package checks create a temporary tarball using Bun, then inspect it with the repository's package lint and resolution tools; they do not publish it.
+
 The `@abshahin/subscriptions/testing` export gives you in-memory adapters, a fake payment gateway, and conformance suites so you can test your application — and any custom adapters you write — without infrastructure.
 
 ```ts
@@ -37,6 +51,7 @@ function buildSubs() {
     database: memoryDatabaseAdapter(),
     features,
     cache: memoryCacheAdapter(),
+    options: { cacheNamespace: "test:isolated-database" },
   });
 }
 ```
@@ -61,7 +76,8 @@ const gateway = fakePaymentGateway({
 const subs = createSubscriptions({
   database: memoryDatabaseAdapter(),
   features,
-  payment: gateway,
+  providers: [{ id: "fake", accountId: "test-merchant", environment: "test", billingOwner: "sdk_managed", adapter: gateway }],
+  defaultProvider: "fake",
 });
 
 // Inspect what your code did:
@@ -103,4 +119,4 @@ await cacheAdapterConformance("redisCacheAdapter", () =>
 
 The database suite covers, among others: plan CRUD and filtering, subscription lifecycle persistence, invoice creation and `findByGatewayInvoiceId`, usage increment/decrement atomicity and the zero floor, and transaction commit/rollback. The cache suite covers TTL expiry, `deletePattern`, the optional `incrBy`/`decrBy` counters, and key existence checks.
 
-An adapter that passes its conformance suite is a drop-in replacement for the shipped ones.
+The suite checks its listed contracts. Financial operations additionally require the atomic billing capabilities and schema in the adapter documentation. Framework quota admission requires atomic `usage.reserve`, returned record identities, and guarded release; ordinary `use()` remains available under its existing adapter contract.

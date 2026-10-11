@@ -244,20 +244,20 @@ export * from "./core/types.js";
 // Adapters
 export { CacheKeys, noopCacheAdapter } from "./adapters/cache.adapter.js";
 export type { CacheAdapter } from "./adapters/cache.adapter.js";
-export type { DatabaseAdapter, BillingOperationRecord, BillingOperationStore, ProviderResourceMapping, ProviderResourceScope, ProviderResourceStore, UsagePeriodOptions, UsageMutationOptions, UsageReservationOptions, PlanQueryOptions, SubscriptionQueryOptions } from "./adapters/database.adapter.js";
+export type { DatabaseAdapter, BillingOperationRecord, BillingOperationStore, ProviderResourceMapping, ProviderResourceScope, ProviderResourceStore, UsagePeriodOptions, UsageReadOptions, UsageResetOptions, UsagePeriodQuery, UsageMutationOptions, UsageReservationOptions, UsageReservationResult, PlanQueryOptions, SubscriptionQueryOptions } from "./adapters/database.adapter.js";
 export { noopPaymentAdapter } from "./adapters/payment.adapter.js";
 export type { ChargePaymentInput, GatewayPayment, GatewayPaymentMethod, PaymentGatewayCapabilities, WebhookVerificationContext, EmbeddedCheckoutInput, EmbeddedCheckoutConfiguration, ChargePaymentResult, CheckoutSession, GatewayCustomer, GatewaySubscription, PaymentGatewayAdapter, PortalSession, WebhookEvent } from "./adapters/payment.adapter.js";
 // Services
 export { InvoicesService, type InvoicesServiceOptions } from "./services/invoices.service.js";
 export { CouponsService, type CouponsServiceOptions } from "./services/coupons.service.js";
-export { PermissionsService } from "./services/permissions.service.js";
+export { PermissionsService, type UsageAdmission } from "./services/permissions.service.js";
 export { PlansService } from "./services/plans.service.js";
 export { SubscriptionsService, type CreateSubscriptionOptions, type ChangePlanOptions, type RenewSubscriptionOptions, type ChangePlanResult, type DunningOptions, type DunningProcessResult, type PendingChangeResult, type PlanChangePreview } from "./services/subscriptions.service.js";
 // Events & Outbox
 export { noopEventsAdapter, withEvents, type EventsAdapter, type SubscriptionEvent, type SubscriptionEventType, type WithEventsOptions } from "./core/events.js";
 export { createOutboxEventsAdapter, relayOutbox, type OutboxRecord, type OutboxStore, type RelayOutboxOptions, type RelayOutboxResult } from "./adapters/outbox.adapter.js";
 // Invoice Templates
-export { formatCurrency, formatDate, generatePdfWith, generateSubscriptionInvoicePdf, getCurrencyInfo, renderSubscriptionInvoice, wrapInvoiceForPrint, type PrintWrapOptions, type SubscriptionInvoiceData } from "./templates/invoice-utils.js";
+export { formatCurrency, formatDate, generatePdfWith, generateSubscriptionInvoicePdf, getCurrencyInfo, renderSubscriptionInvoice, wrapInvoiceForPrint, type PrintWrapOptions, type SubscriptionInvoiceData, type RenderSubscriptionInvoiceOptions, type SubscriptionInvoiceTemplateRenderer } from "./templates/invoice-utils.js";
 export { subscriptionInvoiceTemplate } from "./templates/invoice-template.js";
 export { noopPdfRenderer, type PdfRenderer } from "./templates/pdf-renderer.js";
 // Integrations (web-standard HTTP)

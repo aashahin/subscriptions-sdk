@@ -23,10 +23,10 @@ import type {
     UpdateSubscriptionInput,
     UsageRecord,
 } from "../core/types.js";
-import { jsonData, hydrateCoupon, usagePeriod, validateUsageCount, validateUsageLimit, validateProviderResource, providerResourceScope } from './persistence-utils.js';
+import { explicitUsagePeriod, jsonData, hydrateCoupon, usagePeriod, validateUsageCount, validateUsageLimit, validateProviderResource, providerResourceScope } from './persistence-utils.js';
 import type { OutboxRecord } from './outbox.adapter.js';
 import type {
-    BillingOperationRecord, ProviderResourceMapping, ProviderResourceScope, UsageMutationOptions, UsagePeriodOptions, UsageReservationOptions,
+    BillingOperationRecord, ProviderResourceMapping, ProviderResourceScope, UsageMutationOptions, UsagePeriodOptions, UsageReadOptions, UsageReservationOptions, UsageResetOptions,
     DatabaseAdapter,
     PlanQueryOptions,
     SubscriptionQueryOptions,
@@ -98,7 +98,7 @@ export function prismaAdapter<TFeatures extends FeatureRegistry>(
     const coupons = createCouponsSection(client, inTransaction, transact);
 
     return {
-    capabilities: { asyncTransactions: typeof prisma.$transaction === 'function' },
+    capabilities: { asyncTransactions: typeof prisma.$transaction === 'function', guardedUsageRelease: true },
     ...(client.providerResource ? { providerResources: {
       async bind(mapping:ProviderResourceMapping) {
         const scope=providerResourceScope(mapping);validateProviderResource(scope,mapping.localId);validateProviderResource(scope,mapping.externalId);
@@ -569,18 +569,20 @@ export function prismaAdapter<TFeatures extends FeatureRegistry>(
       async get(
         subscriberId: string,
         feature: string,
-        options?: UsagePeriodOptions & { period?: Date; tenantId?: string | null },
+        options?: UsageReadOptions,
       ): Promise<number> {
         const now = options?.period ?? new Date();
         const tenantId = options?.tenantId ?? subscriberId;
+        const explicitPeriod = explicitUsagePeriod(options);
 
         const record = await client.usageRecord.findFirst({
           where: {
             subscriberId,
             tenantId: tenantId,
             feature,
-            periodStart: options?.periodStart ?? { lte: now },
-            periodEnd: { gte: now },
+            ...(options?.expectedRecordId !== undefined && { id: options.expectedRecordId }),
+            periodStart: explicitPeriod?.periodStart ?? { lte: now },
+            ...(!explicitPeriod && { periodEnd: { gte: now } }),
           },
         });
         return record?.count ?? 0;
@@ -616,6 +618,7 @@ export function prismaAdapter<TFeatures extends FeatureRegistry>(
           },
           update: {
             count: { increment: count },
+            periodEnd,
           },
         });
 
@@ -627,10 +630,10 @@ export function prismaAdapter<TFeatures extends FeatureRegistry>(
         const count=options?.count??1;validateUsageCount(count);validateUsageLimit(options?.limit);
         const limit=options?.limit??Number.MAX_SAFE_INTEGER;const tenantId=options?.tenantId??subscriberId;const {periodStart,periodEnd}=usagePeriod(options);
         const key={subscriberId,tenantId,feature,periodStart};
-        await client.usageRecord.upsert({where:{subscriberId_tenantId_feature_periodStart:key},create:{...key,count:0,periodEnd},update:{}});
+        await client.usageRecord.upsert({where:{subscriberId_tenantId_feature_periodStart:key},create:{...key,count:0,periodEnd},update:{periodEnd}});
         const result=await client.usageRecord.updateMany({where:{...key,count:{lte:limit-count}},data:{count:{increment:count}}});
         const row=await client.usageRecord.findUnique({where:{subscriberId_tenantId_feature_periodStart:key}});
-        return {accepted:result.count===1,count:row.count};
+        return {accepted:result.count===1,count:row.count,recordId:row.id};
       },
 
       async decrement(
@@ -652,7 +655,8 @@ export function prismaAdapter<TFeatures extends FeatureRegistry>(
         // is large enough we decrement in place; otherwise we floor it to zero.
         // Both branches are conditional `updateMany` calls, so no row is ever
         // overwritten with a stale value.
-        const baseWhere = { subscriberId, tenantId, feature, periodStart };
+        const baseWhere = { subscriberId, tenantId, feature, periodStart,
+          ...(options?.expectedRecordId !== undefined && { id: options.expectedRecordId }) };
 
         const decremented = await client.usageRecord.updateMany({
           where: { ...baseWhere, count: { gte: count } },
@@ -668,7 +672,8 @@ export function prismaAdapter<TFeatures extends FeatureRegistry>(
           });
         }
 
-        return this.get(subscriberId, feature, { tenantId, ...usagePeriod(options) });
+        return this.get(subscriberId, feature, { tenantId, ...usagePeriod(options),
+          ...(options?.expectedRecordId !== undefined && { expectedRecordId: options.expectedRecordId }) });
       },
 
       async set(
@@ -682,6 +687,7 @@ export function prismaAdapter<TFeatures extends FeatureRegistry>(
         const tid = tenantId ?? subscriberId;
         const now = new Date();
         const { periodStart, periodEnd } = usagePeriod(options);
+        const recordId = crypto.randomUUID();
 
         await client.usageRecord.upsert({
           where: {
@@ -693,6 +699,7 @@ export function prismaAdapter<TFeatures extends FeatureRegistry>(
             },
           },
           create: {
+            id: recordId,
             subscriberId,
             tenantId: tid,
             feature,
@@ -700,23 +707,34 @@ export function prismaAdapter<TFeatures extends FeatureRegistry>(
             periodStart,
             periodEnd,
           },
-          update: { count },
+          update: { id: recordId, count, periodEnd },
         });
       },
 
       async reset(
         subscriberId: string,
-        options?: { feature?: string; tenantId?: string | null },
+        options?: UsageResetOptions,
       ): Promise<void> {
         const where: Record<string, any> = { subscriberId };
+        const explicitPeriod = explicitUsagePeriod(options);
         if (options?.feature) {
           where.feature = options.feature;
         }
-        if (options?.tenantId !== undefined) {
+        if (explicitPeriod) {
+          where.periodStart = explicitPeriod.periodStart;
+          where.tenantId = options?.tenantId ?? subscriberId;
+        } else if (options?.tenantId !== undefined) {
           where.tenantId = options.tenantId;
         }
 
         await client.usageRecord.deleteMany({ where });
+      },
+
+      async getForPeriods(subscriberId, periods, tenantId) {
+        if (!periods.length) return [];
+        const keys = periods.map(period => ({ feature: period.feature, periodStart: usagePeriod(period).periodStart }));
+        const records = await client.usageRecord.findMany({ where: { subscriberId, tenantId: tenantId ?? subscriberId, OR: keys } });
+        return records.map(mapUsageRecordFromPrisma);
       },
 
       async getAll(

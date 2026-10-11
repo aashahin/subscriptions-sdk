@@ -29,6 +29,8 @@ export interface PaddleConfig {
   environment?: "production" | "sandbox";
   /** Override the API base URL (defaults to the environment's URL) */
   apiUrl?: string;
+  /** Approved page hosting Paddle.js. Omit to use Paddle's configured default payment page. */
+  checkoutUrl?: string;
 }
 
 /** Paddle subscription status */
@@ -373,7 +375,7 @@ class PaddleClient {
       "POST",
       `/subscriptions/${id}/pause`,
       {
-        effective_from: "next_billing_period",
+        effective_from: "immediately",
       },
     );
   }
@@ -384,6 +386,7 @@ class PaddleClient {
       `/subscriptions/${id}/resume`,
       {
         effective_from: "immediately",
+        on_resume: "continue_existing_billing_period",
       },
     );
   }
@@ -395,7 +398,7 @@ class PaddleClient {
     amount?: number;
     currency?: string;
     description?: string;
-    successUrl?: string;
+    checkoutUrl?: string;
     customData?: Record<string, string>;
   }): Promise<PaddleTransaction> {
     const item: Record<string, unknown> = params.priceId
@@ -419,7 +422,7 @@ class PaddleClient {
     return this.request<PaddleTransaction>("POST", "/transactions", {
       items: [item],
       ...(params.customerId && { customer_id: params.customerId }),
-      ...(params.successUrl && { checkout: { url: params.successUrl } }),
+      ...(params.checkoutUrl && { checkout: { url: params.checkoutUrl } }),
       ...(params.customData && { custom_data: params.customData }),
     });
   }
@@ -695,7 +698,7 @@ export function paddleAdapter(config: PaddleConfig): PaymentGatewayAdapter {
       const transaction = await client.createTransaction({
         ...(data.customerId && { customerId: data.customerId }),
         priceId: data.priceId,
-        successUrl: data.successUrl,
+        ...(config.checkoutUrl && { checkoutUrl: config.checkoutUrl }),
         ...(data.metadata && { customData: data.metadata }),
       });
 
@@ -808,7 +811,7 @@ export function paddleAdapter(config: PaddleConfig): PaymentGatewayAdapter {
           amount: data.amount,
           currency: data.currency,
           ...(data.description && { description: data.description }),
-          ...(data.callbackUrl && { successUrl: data.callbackUrl }),
+          ...(config.checkoutUrl && { checkoutUrl: config.checkoutUrl }),
           ...(data.metadata && { customData: data.metadata }),
         });
         // Map Paddle transaction status to our status

@@ -1,9 +1,10 @@
+<!DOCTYPE html>
 <html lang="ar" dir="rtl">
 
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>فاتورة اشتراك</title>
+  <title>{{#if invoice.creditNoteOfId}}إشعار دائن{{else}}فاتورة اشتراك{{/if}}</title>
 
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
@@ -463,8 +464,11 @@
       </div>
 
       <div class="document-title">
-        <h1>فاتورة اشتراك</h1>
-        <div class="document-id">رقم الفاتورة: {{#if invoice.id}}{{invoice.id}}{{else}}—{{/if}}</div>
+        <h1>{{#if invoice.creditNoteOfId}}إشعار دائن{{else}}فاتورة اشتراك{{/if}}</h1>
+        <div class="document-id">رقم الفاتورة: {{#if invoice.invoiceNumber}}{{invoice.invoiceNumber}}{{else}}{{#if invoice.id}}{{invoice.id}}{{else}}—{{/if}}{{/if}}</div>
+        {{#if invoice.creditNoteOfId}}
+        <div class="document-id">مرجع الفاتورة الأصلية: {{invoice.creditNoteOfId}}</div>
+        {{/if}}
         <div class="status-badge">{{translateInvoiceStatus invoice.status}}</div>
       </div>
     </header>
@@ -600,15 +604,25 @@
       </aside>
 
       <aside class="totals-box">
-        {{#if invoice.lineItems.length}}
         <div class="total-row">
           <div>المجموع الفرعي</div>
-          <div class="num">{{formatCurrency invoice.amount invoice.currency locale=locale}}</div>
+          <div class="num">{{formatCurrency (coalesce invoice.subtotal invoice.amount) invoice.currency locale=locale}}</div>
+        </div>
+        {{#if (isDefined invoice.taxAmount)}}
+        <div class="total-row">
+          <div>الضريبة{{#if (isDefined invoice.taxRate)}} ({{invoice.taxRate}}%){{/if}}</div>
+          <div class="num">{{formatCurrency invoice.taxAmount invoice.currency locale=locale}}</div>
+        </div>
+        {{/if}}
+        {{#if (isDefined invoice.discountAmount)}}
+        <div class="total-row">
+          <div>الخصم</div>
+          <div class="num">{{formatCurrency invoice.discountAmount invoice.currency locale=locale}}</div>
         </div>
         {{/if}}
         <div class="total-row grand">
           <div>الإجمالي</div>
-          <div class="num">{{formatCurrency invoice.amount invoice.currency locale=locale}}</div>
+          <div class="num">{{formatCurrency (coalesce invoice.total invoice.amount) invoice.currency locale=locale}}</div>
         </div>
       </aside>
     </section>

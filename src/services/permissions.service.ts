@@ -1,9 +1,10 @@
 // Permissions service for feature gates and durable usage limits.
 import type { CacheAdapter } from "../adapters/cache.adapter.js";
 import { CacheKeys, noopCacheAdapter } from "../adapters/cache.adapter.js";
-import type { DatabaseAdapter } from "../adapters/database.adapter.js";
+import type { DatabaseAdapter, UsageReservationResult } from "../adapters/database.adapter.js";
+import { queue } from "../adapters/persistence-utils.js";
 import { FeatureNotAllowedError, SubscriptionError, SubscriptionInactiveError, UsageLimitExceededError } from "../core/errors.js";
-import { resolveFeatures } from "../core/features.js";
+import { getDefaultFeatures, resolveFeatures } from "../core/features.js";
 import type { FeatureDefinition, FeatureRegistry, FeatureValues, SubscriptionWithPlan, UsageStatus } from "../core/types.js";
 
 const UNLIMITED = -1;
@@ -16,6 +17,23 @@ interface EntitlementEnvelope<TFeatures extends FeatureRegistry> {
 interface EntitlementContext<TFeatures extends FeatureRegistry> {
   subscription: SubscriptionWithPlan<TFeatures> | null;
   values: FeatureValues<TFeatures>;
+}
+interface UsageConsumption {
+  subscriberId: string;
+  feature: string;
+  count: number;
+  limit: number;
+  capped: boolean;
+  metered: boolean;
+  period: UsagePeriod;
+}
+
+export interface UsageAdmission {
+  status: UsageStatus;
+  /** Finalize successful consumption. A failed event write can be retried without releasing capacity. */
+  commit(): Promise<void>;
+  /** Return reserved capacity once, only before commit, using the originally captured period. */
+  release(): Promise<void>;
 }
 
 export interface PermissionsServiceOptions {
@@ -33,6 +51,7 @@ export class PermissionsService<TFeatures extends FeatureRegistry> {
 
   constructor(private readonly db: DatabaseAdapter<TFeatures>, private readonly features: TFeatures,
     cache?: CacheAdapter, options?: PermissionsServiceOptions) {
+    getDefaultFeatures(features);
     if (cache && cache !== noopCacheAdapter && !options?.cacheNamespace?.trim()) {
       throw new SubscriptionError("A cacheNamespace is required when caching is enabled", "CACHE_NAMESPACE_REQUIRED");
     }
@@ -72,39 +91,28 @@ export class PermissionsService<TFeatures extends FeatureRegistry> {
 
   /** Admit consumption in one durable conditional mutation. Cache errors cannot undo it. */
   async use<K extends keyof TFeatures>(subscriberId: string, feature: K, count = 1): Promise<UsageStatus> {
-    this.validateQuantity(count);
-    const definition = this.usageFeature(feature);
-    const context = await this.entitlements(subscriberId);
-    if (definition.type === "metered" && !context.subscription) throw new SubscriptionInactiveError("missing");
-    const limit = this.usageLimit(context.values[feature] as number, definition);
-    const period = this.period(definition, context.subscription);
-    const capped = definition.type !== "metered" && limit !== UNLIMITED;
-    let used: number;
-    if (this.db.usage.reserve) {
-      const eventId = `usage.limit_reached:${crypto.randomUUID()}`;
-      const reserve = async (tx: DatabaseAdapter<TFeatures>): Promise<number> => {
-        const reservation = await tx.usage.reserve!(subscriberId, feature as string, {
-          count, limit: capped ? limit : null, ...period,
-        });
-        if (!reservation.accepted) {
-          throw new UsageLimitExceededError(feature as string, capped ? limit : Number.MAX_SAFE_INTEGER, reservation.count);
-        }
-        if (capped && reservation.count === limit && tx.capabilities?.asyncTransactions && tx.outbox) {
-          await tx.outbox.insert({ id: eventId, type: 'usage.limit_reached', subscriberId,
-            data: { feature: feature as string, used: reservation.count, limit, periodStart: period.periodStart },
-            occurredAt: new Date() });
-        }
-        return reservation.count;
-      };
-      used = this.db.capabilities?.asyncTransactions && this.db.outbox
-        ? await this.db.transaction(reserve) : await reserve(this.db);
-    } else {
-      // A capped reservation cannot safely be emulated by incrementing and compensating.
-      if (capped) throw new SubscriptionError("Capped usage requires atomic usage.reserve support", "ATOMIC_USAGE_NOT_SUPPORTED", 501);
-      used = await this.db.usage.increment(subscriberId, feature as string, { count, ...period });
-    }
+    const consumption = await this.consumption(subscriberId, feature, count);
+    const eventId = `usage.limit_reached:${crypto.randomUUID()}`;
+    const reserve = async (tx: DatabaseAdapter<TFeatures>): Promise<number> => {
+      const reservation = await this.reserveUsage(tx, consumption);
+      await this.recordLimitEvent(tx, consumption, reservation.count, eventId);
+      return reservation.count;
+    };
+    const used = this.db.usage.reserve && this.db.capabilities?.asyncTransactions && this.db.outbox
+      ? await this.db.transaction(reserve) : await reserve(this.db);
     await this.invalidateUsage(subscriberId, feature as string);
-    return this.usageStatus(feature as string, limit, used, definition.type === "metered");
+    return this.usageStatus(consumption.feature, consumption.limit, used, consumption.metered);
+  }
+
+  /** Hold capacity before a handler starts; the receipt belongs to that handler's captured period. */
+  async admitUsage<K extends keyof TFeatures>(subscriberId: string, feature: K, count = 1): Promise<UsageAdmission> {
+    if (!this.db.usage.reserve || !this.db.capabilities?.guardedUsageRelease) {
+      throw new SubscriptionError('Handler admission requires usage reservations with guarded release support', 'ATOMIC_USAGE_NOT_SUPPORTED', 501);
+    }
+    const consumption = await this.consumption(subscriberId, feature, count);
+    const reservation = await this.reserveAdmission(consumption);
+    await this.invalidateUsage(subscriberId, feature as string);
+    return this.admission(consumption, reservation);
   }
 
   async release<K extends keyof TFeatures>(subscriberId: string, feature: K, count = 1): Promise<UsageStatus> {
@@ -169,11 +177,92 @@ export class PermissionsService<TFeatures extends FeatureRegistry> {
   }
 
   async getAllUsage(subscriberId: string): Promise<Record<string, UsageStatus>> {
-    const result: Record<string, UsageStatus> = {};
-    for (const [feature, definition] of Object.entries(this.features)) {
-      if (definition.type === "limit" || definition.type === "metered") result[feature] = await this.remaining(subscriberId, feature as keyof TFeatures);
+    const definitions = Object.entries(this.features).filter(([, definition]) => definition.type === 'limit' || definition.type === 'metered');
+    if (!definitions.length) return {};
+    const context = await this.entitlements(subscriberId);
+    const selections = definitions.map(([feature, definition]) => ({ feature, definition, ...this.period(definition, context.subscription) }));
+    const usageCounts = this.db.usage.getForPeriods
+      ? (await this.db.usage.getForPeriods(subscriberId, selections, subscriberId)).map(record => [record.feature, record.count] as const)
+      : await Promise.all(selections.map(async selection => [selection.feature,
+        await this.db.usage.get(subscriberId, selection.feature, selection)] as const));
+    const countsByFeature = new Map(usageCounts);
+    const usageByFeature: Record<string, UsageStatus> = {};
+    for (const selection of selections) {
+      const limit = this.usageLimit(context.values[selection.feature] as number, selection.definition);
+      usageByFeature[selection.feature] = this.usageStatus(selection.feature, limit, countsByFeature.get(selection.feature) ?? 0, selection.definition.type === 'metered');
     }
-    return result;
+    return usageByFeature;
+  }
+
+  private async consumption<K extends keyof TFeatures>(subscriberId: string, feature: K, count: number): Promise<UsageConsumption> {
+    this.validateQuantity(count);
+    const definition = this.usageFeature(feature);
+    const context = await this.entitlements(subscriberId);
+    const metered = definition.type === 'metered';
+    if (metered && !context.subscription) throw new SubscriptionInactiveError('missing');
+    const limit = this.usageLimit(context.values[feature] as number, definition);
+    const period = this.period(definition, context.subscription);
+    return { subscriberId, feature: feature as string, count, limit, metered, capped: !metered && limit !== UNLIMITED,
+      period: { periodStart: new Date(period.periodStart), periodEnd: new Date(period.periodEnd) } };
+  }
+
+  private async reserveUsage(tx: DatabaseAdapter<TFeatures>, consumption: UsageConsumption): Promise<UsageReservationResult> {
+    const { subscriberId, feature, count, limit, capped, period } = consumption;
+    if (tx.usage.reserve) {
+      const reservation = await tx.usage.reserve(subscriberId, feature, { count, limit: capped ? limit : null, ...period });
+      if (!reservation.accepted) throw new UsageLimitExceededError(feature, capped ? limit : Number.MAX_SAFE_INTEGER, reservation.count);
+      return reservation;
+    }
+    if (capped) throw new SubscriptionError('Capped usage requires atomic usage.reserve support', 'ATOMIC_USAGE_NOT_SUPPORTED', 501);
+    return { accepted: true, count: await tx.usage.increment(subscriberId, feature, { count, ...period }) };
+  }
+
+  private async reserveAdmission(consumption: UsageConsumption): Promise<{ count: number; recordId: string }> {
+    const reserve = async (tx: DatabaseAdapter<TFeatures>) => {
+      const reservation = await this.reserveUsage(tx, consumption);
+      if (!reservation.recordId) throw new SubscriptionError('Usage reservation did not return its record identity', 'INVALID_USAGE_RESERVATION', 501);
+      return { count: reservation.count, recordId: reservation.recordId };
+    };
+    return this.db.capabilities?.asyncTransactions ? this.db.transaction(reserve) : reserve(this.db);
+  }
+
+  private async recordLimitEvent(tx: DatabaseAdapter<TFeatures>, consumption: UsageConsumption, used: number, eventId: string): Promise<void> {
+    if (!consumption.capped || used !== consumption.limit || !tx.capabilities?.asyncTransactions || !tx.outbox) return;
+    await tx.outbox.insert({ id: eventId, type: 'usage.limit_reached', subscriberId: consumption.subscriberId,
+      data: { feature: consumption.feature, used, limit: consumption.limit, periodStart: consumption.period.periodStart }, occurredAt: new Date() });
+  }
+
+  private admission(consumption: UsageConsumption, reservation: { count: number; recordId: string }): UsageAdmission {
+    const serialize = queue();
+    const eventId = `usage.limit_reached:${crypto.randomUUID()}`;
+    let state: 'reserved' | 'committed' | 'released' = 'reserved';
+    let eventRecorded = false;
+    return {
+      status: this.usageStatus(consumption.feature, consumption.limit, reservation.count, consumption.metered),
+      commit: () => serialize(async () => {
+        if (state === 'released' || eventRecorded) return;
+        // Successful business effects have already occurred; event failures must not return their capacity.
+        state = 'committed';
+        await this.commitAdmission(consumption, eventId, reservation);
+        eventRecorded = true;
+      }),
+      release: () => serialize(async () => {
+        if (state !== 'reserved') return;
+        await this.db.usage.decrement(consumption.subscriberId, consumption.feature,
+          { count: consumption.count, expectedRecordId: reservation.recordId, ...consumption.period });
+        state = 'released';
+        await this.invalidateUsage(consumption.subscriberId, consumption.feature);
+      }),
+    };
+  }
+
+  private async commitAdmission(consumption: UsageConsumption, eventId: string, reservation: { count: number; recordId: string }): Promise<void> {
+    if (!consumption.capped || reservation.count !== consumption.limit || !this.db.capabilities?.asyncTransactions || !this.db.outbox) return;
+    await this.db.transaction(async tx => {
+      const used = await tx.usage.get(consumption.subscriberId, consumption.feature,
+        { expectedRecordId: reservation.recordId, ...consumption.period });
+      await this.recordLimitEvent(tx, consumption, used, eventId);
+    });
   }
 
   private async entitlements(subscriberId: string): Promise<EntitlementContext<TFeatures>> {

@@ -43,7 +43,7 @@ export default defineConfig({
 	clean: true,
 	sourcemap: true,
 	minify: false,
-	external,
+	deps: { neverBundle: external },
 	// Keep .js/.d.ts output paths stable (package is "type": "module")
 	outExtensions: () => ({ js: '.js', dts: '.d.ts' }),
 });

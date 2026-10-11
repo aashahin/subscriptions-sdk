@@ -81,15 +81,39 @@ export interface BillingOperationStore {
     update(key: string, data: { status: BillingOperationRecord['status']; payload?: Record<string, unknown> }): Promise<BillingOperationRecord>;
 }
 export interface UsagePeriodOptions {
+    /** Provide both boundaries for an exact period key, or omit both for legacy current-period behavior. */
     periodStart?: Date;
     periodEnd?: Date;
+}
+export interface UsagePeriodQuery {
+    feature: string;
+    periodStart: Date;
+    periodEnd: Date;
+}
+export interface UsageReadOptions extends UsagePeriodOptions {
+    period?: Date;
+    tenantId?: string | null;
+    /** A different counter incarnation is treated as missing. */
+    expectedRecordId?: string;
+}
+export interface UsageResetOptions extends UsagePeriodOptions {
+    feature?: string;
+    tenantId?: string | null;
 }
 export interface UsageMutationOptions extends UsagePeriodOptions {
     count?: number;
     tenantId?: string | null;
+    /** A decrement changes only this reservation's row; replacing/resetting the row invalidates the reversal. */
+    expectedRecordId?: string;
 }
 export interface UsageReservationOptions extends UsageMutationOptions {
     limit?: number | null;
+}
+export interface UsageReservationResult {
+    accepted: boolean;
+    count: number;
+    /** Required for accepted reservations when guardedUsageRelease is advertised. */
+    recordId?: string;
 }
 
 /**
@@ -100,7 +124,7 @@ export interface UsageReservationOptions extends UsageMutationOptions {
  */
 export interface DatabaseAdapter<TFeatures extends FeatureRegistry = FeatureRegistry> {
     /** Financial services require true awaited rollback and transaction-owned stores. */
-    capabilities?: { asyncTransactions: boolean };
+    capabilities?: { asyncTransactions: boolean; guardedUsageRelease?: boolean };
     billingOperations?: BillingOperationStore;
     providerResources?: ProviderResourceStore;
     outbox?: OutboxStore;
@@ -292,7 +316,7 @@ export interface DatabaseAdapter<TFeatures extends FeatureRegistry = FeatureRegi
          * @param feature - The feature key
          * @param options - Optional: period date and tenantId for tenant-scoped features
          */
-        get(subscriberId: string, feature: string, options?: UsagePeriodOptions & { period?: Date; tenantId?: string | null }): Promise<number>;
+        get(subscriberId: string, feature: string, options?: UsageReadOptions): Promise<number>;
 
         /**
          * Increment usage count atomically
@@ -310,7 +334,7 @@ export interface DatabaseAdapter<TFeatures extends FeatureRegistry = FeatureRegi
          * @param options - Optional: count and tenantId for tenant-scoped features
          * @returns The new count after decrement (never goes below 0)
          */
-        reserve?(subscriberId: string, feature: string, options?: UsageReservationOptions): Promise<{ accepted: boolean; count: number }>;
+        reserve?(subscriberId: string, feature: string, options?: UsageReservationOptions): Promise<UsageReservationResult>;
 
         decrement(subscriberId: string, feature: string, options?: UsageMutationOptions): Promise<number>;
 
@@ -326,9 +350,12 @@ export interface DatabaseAdapter<TFeatures extends FeatureRegistry = FeatureRegi
         /**
          * Reset usage for a subscriber (optionally for a specific feature)
          * @param subscriberId - The subscriber ID
-         * @param options - Optional: feature to reset and tenantId
+         * @param options - Explicit boundaries select one period and default tenant scope; omitted boundaries preserve all-period reset.
          */
-        reset(subscriberId: string, options?: { feature?: string; tenantId?: string | null }): Promise<void>;
+        reset(subscriberId: string, options?: UsageResetOptions): Promise<void>;
+
+        /** Read selected exact period keys in one bounded query; omitted tenant defaults to subscriberId. */
+        getForPeriods?(subscriberId: string, periods: UsagePeriodQuery[], tenantId?: string | null): Promise<UsageRecord[]>;
 
         /**
          * Get all usage records for a subscriber

@@ -1,9 +1,11 @@
 import { Database } from 'bun:sqlite';
 import { drizzle } from 'drizzle-orm/bun-sqlite';
 import { getTableConfig } from 'drizzle-orm/sqlite-core';
+import type { Logger } from 'drizzle-orm';
 import { drizzleAdapter, subscriptionsSchema } from '../../src/adapters/drizzle.adapter.ts';
+import type { FeatureRegistry } from '../../src/core/types.ts';
 /** Instantiate the shipped SQLite schema including actual unique indexes/FKs. */
-export function sqliteDatabase() {
+export function sqliteDatabase<TFeatures extends FeatureRegistry = FeatureRegistry>(logger?: Logger) {
     const connection = new Database(':memory:');
     connection.exec('PRAGMA foreign_keys = ON');
     for (const table of Object.values(subscriptionsSchema)) {
@@ -21,5 +23,8 @@ export function sqliteDatabase() {
             }).name}"`).join(',')})`);
         }
     }
-    return { connection, database: drizzleAdapter(drizzle(connection, { schema: subscriptionsSchema })) };
+    return { connection, database: drizzleAdapter<TFeatures>(drizzle(connection, {
+        schema: subscriptionsSchema,
+        ...(logger && { logger }),
+    })) };
 }

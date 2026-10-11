@@ -155,6 +155,7 @@
   },
   "devDependencies": {
     "@arethetypeswrong/cli": "^0.18.5",
+    "@types/bun": "^1.4.2",
     "@types/node": "^22.20.1",
     "drizzle-orm": "^0.44.0",
     "elysia": "^1.4.29",
@@ -164,11 +165,14 @@
     "typescript": "^5.9.3"
   },
   "scripts": {
-    "build": "tsdown",
-    "prepare": "bun run build",
+    "generate:templates": "bun scripts/generate-invoice-template.ts",
+    "check:templates": "bun scripts/generate-invoice-template.ts --check",
+    "build": "bun run --bun generate:templates && bunx --bun tsdown",
+    "prepare": "bun run --bun build",
     "test": "bun test",
     "test:invoices": "bun tests/generate-test-invoices.ts",
-    "typecheck": "tsc --noEmit -p tsconfig.json",
-    "check:package": "publint && attw --pack . --ignore-rules no-resolution --ignore-rules cjs-resolves-to-esm"
+    "typecheck": "bun check -p tsconfig.json && bun check -p tsconfig.tests.json",
+    "check:package": "bun scripts/check-package.mjs",
+    "check:edge": "bun tests/workers-smoke/bundle-check.mjs"
   }
 }

@@ -17,8 +17,8 @@ export type FeatureRegistry = Record<string, FeatureDefinition>;
 /**
  * Infer the value type for a feature based on its definition
  */
-export type FeatureValue<T extends FeatureDefinition> =
-    T['type'] extends 'boolean' ? boolean : number;
+type FeatureValueForType<T extends FeatureType> = T extends 'boolean' ? boolean : number;
+export type FeatureValue<T extends FeatureDefinition> = FeatureValueForType<T['type']>;
 
 /**
  * Infer all feature values from a registry
