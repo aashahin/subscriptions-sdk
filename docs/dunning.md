@@ -12,7 +12,14 @@ import { createSubscriptions } from "@abshahin/subscriptions";
 const subs = createSubscriptions({
   database,
   features,
-  payment,
+  providers: [{
+    id: "moyasar-sa-test",
+    accountId: "your-account-identity",
+    environment: "test",
+    billingOwner: "sdk_managed",
+    adapter: payment,
+  }],
+  defaultProvider: "moyasar-sa-test",
   options: {
     gracePeriodDays: 3,
     dunning: {
@@ -36,6 +43,8 @@ const subs = createSubscriptions({
 
 If `options.dunning` is omitted, the defaults are `{ retryScheduleDays: [1, 3, 5, 7], action: "none" }` — retries still run when you call `processDunning()`, but no terminal action is applied when the schedule is exhausted (the subscription stays `past_due`). Nothing runs on its own either way: dunning is driven externally via `processDunning()`.
 
+Local collection requires an adapter with real awaited transactions, durable billing-operation records, and a transaction-owned outbox, plus a gateway supporting idempotent direct payment charges. Each subscription must persist its provider/account/environment association, `billingOwner: "sdk_managed"`, and a separate reusable payment method ID. Legacy generic customer/subscription IDs are insufficient and require an explicit backfill. Provider-managed subscriptions (including a future Polar/Creem integration) are excluded from local renewal collection and dunning.
+
 ## `processDunning()`
 
 `processDunning()` is the sweep that executes the schedule. Call it from whatever scheduler your platform provides — node-cron, a Bun cron, `setInterval`, or a Cloudflare Workers `scheduled()` handler:
@@ -53,12 +62,12 @@ const results = await subs.subscriptions.processDunning();
 // }
 ```
 
-`processDunning(now?)` accepts an optional reference time (defaults to now), which is handy for testing the schedule. The sweep is idempotent and safe to run daily (or more often):
+`processDunning(now?)` accepts an optional reference time (defaults to now), which is handy for testing the schedule:
 
-1. Finds `past_due` subscriptions with a recorded payment failure (failures are recorded via `recordPaymentFailure`, which the webhook flow calls automatically).
-2. For each, checks how many retries have already been attempted against `retryScheduleDays` and attempts the next due retry by charging the saved payment method.
-3. On success, renews the subscription and clears the failure state.
-4. On the final failed retry, applies `action` (`pause`, `cancel`, or `none`).
+1. Finds SDK-managed `past_due` subscriptions with a recorded renewal failure. A confirmed failure from `renew()` or a verified payment event enrolls the failed period in a recovery cycle; a failed optional upgrade preserves the already paid current period.
+2. Checks confirmed failed retries against `retryScheduleDays`. Collection uses a durable attempt and stable provider idempotency key. A pending, authorized, or unknown payment does not consume a confirmed failed retry and must be reconciled before further collection.
+3. Uses one persisted renewal quote for the charged amount, selected plan (including a pending downgrade), currency, period, and invoice. Settlement clears the failed cycle and retry metadata through direct collection and verified external completion alike.
+4. On the final confirmed failed retry, applies `action` (`pause`, `cancel`, or `none`). A payment suspension revokes access; it supplies no paid pause credit and cannot be cleared with ordinary `resume()`.
 
 Cloudflare Workers example:
 
@@ -71,7 +80,7 @@ export default {
 };
 ```
 
-Combine with `withEvents` (see `events.md`) to notify customers on each `subscription.payment_failed` and on the final pause/cancel.
+Deliver the transactionally persisted outbox events to notify customers on `subscription.payment_failed` and `subscription.suspended`. Notification delivery must not recollect the payment or replay the business mutation.
 
 ## Manual Lifecycle Controls
 
@@ -83,12 +92,13 @@ The same building blocks dunning uses are available for support tooling and cust
 // Access stops immediately; billing state is preserved.
 await subs.subscriptions.pause(subscriberId);
 
-// Billing periods recalculate on resume, even if the subscription would
-// have expired while paused.
+// Restore the prior active/trialing state after a voluntary pause.
 await subs.subscriptions.resume(subscriberId);
 ```
 
-Pause is reversible and does not create invoices or touch the gateway unless a payment adapter with `pauseSubscription`/`resumeSubscription` is configured, in which case the gateway is kept in sync.
+Voluntary SDK-managed pauses preserve the previous state. Resume extends the existing period by the voluntary pause duration; a paused trial remains `trialing`, and its trial end moves with the period. It does not create paid credit for an unpaid trial or manufacture a new paid period when pause metadata is absent. A suspension caused by payment failure requires settlement and cannot use this path.
+
+For provider-managed subscriptions, pause, resume, cancellation, and reactivation issue the command to the owning provider first. Unsupported commands fail explicitly. Provider periods remain authoritative and are not extended from local processing time. Incoming verified provider snapshots update local state without issuing another outgoing provider command.
 
 ### `extendTrial()`
 
@@ -106,4 +116,6 @@ await subs.subscriptions.cancel(subscriberId, {
 });
 ```
 
-`reason` is a free-form string. Record it for churn analytics — it is persisted on the subscription as `metadata.cancelReason`. Dunning uses the same field when the final action is `cancel` (`reason: "Dunning: payment retry schedule exhausted"`).
+`reason` is a free-form string, persisted as `metadata.cancelReason` for support reporting. To undo a scheduled cancellation while the period is still eligible, call `reactivate()`; provider-managed subscriptions must support remote reactivation before the SDK clears the local cancellation.
+
+`executePendingChanges()` no longer grants a scheduled target plan before payment: the pending change is applied by renewal together with its persisted quote and settlement. It returns no standalone changes. Replace schedulers that depended on that method with the due-renewal flow.

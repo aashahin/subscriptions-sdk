@@ -50,7 +50,9 @@ export interface HonoLikeApp {
  * import { honoPlugin } from '@abshahin/subscriptions/integrations/hono';
  *
  * const app = new Hono();
- * app.route('/api', await honoPlugin(subs));
+ * app.route('/api', await honoPlugin(subs, {
+ *   getSubscriberId: async (request) => (await authenticate(request))?.subscriberId,
+ * }));
  * ```
  */
 export async function honoPlugin<TFeatures extends FeatureRegistry>(

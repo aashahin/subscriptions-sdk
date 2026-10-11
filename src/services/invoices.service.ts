@@ -1,31 +1,21 @@
 // file: packages/subscriptions/src/services/invoices.service.ts
 // Invoices service for invoice management
-
 import type { DatabaseAdapter } from '../adapters/database.adapter.js';
 import { InvoiceVoidError, SubscriptionError } from '../core/errors.js';
-import type {
-    CreateInvoiceInput,
-    FeatureRegistry,
-    Invoice,
-    InvoiceLineItem,
-    InvoiceWithDetails,
-    UpdateInvoiceInput,
-} from '../core/types.js';
-
+import { majorToMinor, minorToMajor } from '../core/billing-policy.js';
+import type { CreateInvoiceInput, FeatureRegistry, Invoice, InvoiceLineItem, InvoiceWithDetails, UpdateInvoiceInput, } from '../core/types.js';
 export interface InvoicesServiceOptions {
     /**
      * Prefix for generated sequential invoice numbers
      * @default 'INV-'
      */
     invoiceNumberPrefix?: string;
-
     /**
      * Prefix for generated credit note numbers
      * @default 'CN-'
      */
     creditNotePrefix?: string;
 }
-
 export interface InvoiceTotals {
     subtotal: number;
     taxAmount: number;
@@ -36,47 +26,37 @@ export interface InvoiceTotals {
      */
     taxRate?: number;
 }
-
 export class InvoicesService<TFeatures extends FeatureRegistry = FeatureRegistry> {
     private readonly invoiceNumberPrefix: string;
     private readonly creditNotePrefix: string;
-
-    constructor(
-        private readonly db: DatabaseAdapter<TFeatures>,
-        options?: InvoicesServiceOptions,
-    ) {
+    constructor(private readonly db: DatabaseAdapter<TFeatures>, options?: InvoicesServiceOptions) {
         this.invoiceNumberPrefix = options?.invoiceNumberPrefix ?? 'INV-';
         this.creditNotePrefix = options?.creditNotePrefix ?? 'CN-';
     }
-
     /**
      * Get invoice by ID
      */
     async get(id: string): Promise<Invoice | null> {
         return this.db.invoices.findById(id);
     }
-
     /**
      * Get invoice by ID with full subscription and plan details
      */
     async getWithDetails(id: string): Promise<InvoiceWithDetails<TFeatures> | null> {
         return this.db.invoices.findByIdWithDetails(id);
     }
-
     /**
      * Get all invoices for a subscription
      */
     async listBySubscription(subscriptionId: string): Promise<Invoice[]> {
         return this.db.invoices.findBySubscription(subscriptionId);
     }
-
     /**
      * Get all invoices for a subscriber (by subscriber ID)
      */
     async listBySubscriber(subscriberId: string): Promise<Invoice[]> {
         return this.db.invoices.findBySubscriber(subscriberId);
     }
-
     /**
      * Create a new invoice
      *
@@ -86,13 +66,15 @@ export class InvoicesService<TFeatures extends FeatureRegistry = FeatureRegistry
      * sequential `invoiceNumber` is assigned automatically.
      */
     async create(data: CreateInvoiceInput): Promise<Invoice> {
+        if (!this.db.capabilities?.asyncTransactions)
+            throw new SubscriptionError("Invoice creation requires an awaited atomic transaction", "BILLING_STORAGE_UNSUPPORTED", 501);
+        return this.db.transaction(tx => new InvoicesService(tx, { invoiceNumberPrefix: this.invoiceNumberPrefix, creditNotePrefix: this.creditNotePrefix }).createInTransaction(data));
+    }
+    private async createInTransaction(data: CreateInvoiceInput): Promise<Invoice> {
+        majorToMinor(data.amount, data.currency);
         const computed: Partial<CreateInvoiceInput> = {};
-
         if (data.lineItems && data.lineItems.length > 0) {
-            const totals = this.computeTotals(
-                data.lineItems,
-                data.discountAmount ?? 0,
-            );
+            const totals = this.computeTotals(data.lineItems, data.discountAmount ?? 0, data.currency);
             computed.subtotal = totals.subtotal;
             computed.taxAmount = totals.taxAmount;
             computed.total = totals.total;
@@ -100,27 +82,24 @@ export class InvoicesService<TFeatures extends FeatureRegistry = FeatureRegistry
                 computed.taxRate = totals.taxRate;
             }
         }
-
-        if (this.db.invoices.nextInvoiceNumber) {
-            computed.invoiceNumber = await this.db.invoices.nextInvoiceNumber(
-                this.invoiceNumberPrefix,
-            );
+        if (!data.invoiceNumber && this.db.invoices.nextInvoiceNumber) {
+            computed.invoiceNumber = await this.db.invoices.nextInvoiceNumber(this.invoiceNumberPrefix);
         }
-
-        return this.db.invoices.create({
+        const invoice = await this.db.invoices.create({
             ...computed,
             ...data,
             status: data.status ?? 'draft',
         });
+        if (invoice.status === 'paid' && this.db.outbox)
+            await this.db.outbox.insert({ id: `invoice.paid:${invoice.gatewayInvoiceId ?? invoice.id}`, type: 'invoice.paid', occurredAt: invoice.paidAt ?? new Date(), subscriberId: invoice.subscriberId, data: { invoiceId: invoice.id, amount: invoice.amount, currency: invoice.currency } });
+        return invoice;
     }
-
     /**
      * Update an invoice
      */
     async update(id: string, data: UpdateInvoiceInput): Promise<Invoice> {
         return this.db.invoices.update(id, data);
     }
-
     /**
      * Compute subtotal, tax, and total from line items.
      *
@@ -129,32 +108,28 @@ export class InvoicesService<TFeatures extends FeatureRegistry = FeatureRegistry
      * `taxInclusive` flag, its `amount` already contains the tax and the tax
      * portion is extracted instead (`tax = amount - amount / (1 + rate)`).
      */
-    computeTotals(lineItems: InvoiceLineItem[], discountAmount: number = 0): InvoiceTotals {
+    computeTotals(lineItems: InvoiceLineItem[], discountAmount: number = 0, currency: string = "USD"): InvoiceTotals {
         let subtotal = 0;
         let taxAmount = 0;
         const taxRates = new Set<number>();
-
         for (const item of lineItems) {
             const rate = item.taxRate ?? 0;
-
             if (rate > 0) {
                 taxRates.add(rate);
             }
-
             if (rate > 0 && item.taxInclusive) {
                 const net = item.amount / (1 + rate / 100);
                 subtotal += net;
                 taxAmount += item.amount - net;
-            } else {
+            }
+            else {
                 subtotal += item.amount;
                 taxAmount += (item.amount * rate) / 100;
             }
         }
-
-        subtotal = roundMoney(subtotal);
-        taxAmount = roundMoney(taxAmount);
-        const total = roundMoney(Math.max(0, subtotal + taxAmount - discountAmount));
-
+        subtotal = roundMoney(subtotal, currency);
+        taxAmount = roundMoney(taxAmount, currency);
+        const total = roundMoney(Math.max(0, subtotal + taxAmount - discountAmount), currency);
         return {
             subtotal,
             taxAmount,
@@ -162,7 +137,6 @@ export class InvoicesService<TFeatures extends FeatureRegistry = FeatureRegistry
             ...(taxRates.size === 1 ? { taxRate: [...taxRates][0]! } : {}),
         };
     }
-
     /**
      * Create a credit note for an invoice: a negative-amount invoice linked
      * to the original via `creditNoteOfId`.
@@ -175,54 +149,37 @@ export class InvoicesService<TFeatures extends FeatureRegistry = FeatureRegistry
      *   note, or already has a credit note
      */
     async createCreditNote(invoiceId: string): Promise<Invoice> {
+        if (!this.db.capabilities?.asyncTransactions)
+            throw new SubscriptionError("Credit notes require an awaited atomic transaction", "BILLING_STORAGE_UNSUPPORTED", 501);
+        return this.db.transaction(tx => new InvoicesService(tx, { invoiceNumberPrefix: this.invoiceNumberPrefix, creditNotePrefix: this.creditNotePrefix }).createCreditNoteInTransaction(invoiceId));
+    }
+    private async createCreditNoteInTransaction(invoiceId: string): Promise<Invoice> {
         const original = await this.db.invoices.findById(invoiceId);
         if (!original) {
-            throw new SubscriptionError(
-                `Invoice not found: ${invoiceId}`,
-                'INVOICE_NOT_FOUND',
-                404,
-            );
+            throw new SubscriptionError(`Invoice not found: ${invoiceId}`, 'INVOICE_NOT_FOUND', 404);
         }
-
         if (original.status === 'void') {
-            throw new InvoiceVoidError(
-                `Cannot create a credit note for a void invoice: ${invoiceId}`,
-            );
+            throw new InvoiceVoidError(`Cannot create a credit note for a void invoice: ${invoiceId}`);
         }
-
         if (original.creditNoteOfId) {
-            throw new InvoiceVoidError(
-                `Cannot create a credit note for another credit note: ${invoiceId}`,
-            );
+            throw new InvoiceVoidError(`Cannot create a credit note for another credit note: ${invoiceId}`);
         }
-
-        const existing = await this.db.invoices.findBySubscription(
-            original.subscriptionId,
-        );
+        const existing = await this.db.invoices.findBySubscription(original.subscriptionId);
         if (existing.some((inv) => inv.creditNoteOfId === invoiceId)) {
-            throw new InvoiceVoidError(
-                `Invoice ${invoiceId} already has a credit note`,
-            );
+            throw new InvoiceVoidError(`Invoice ${invoiceId} already has a credit note`);
         }
-
         let invoiceNumber: string | undefined;
         if (this.db.invoices.nextInvoiceNumber) {
-            invoiceNumber = await this.db.invoices.nextInvoiceNumber(
-                this.creditNotePrefix,
-            );
+            invoiceNumber = await this.db.invoices.nextInvoiceNumber(this.creditNotePrefix);
         }
-
-        const negate = (value: number | undefined): number | undefined =>
-            value === undefined ? undefined : roundMoney(-value);
-
+        const negate = (value: number | undefined): number | undefined => value === undefined ? undefined : roundMoney(-value, original.currency);
         const subtotal = negate(original.subtotal);
         const taxAmount = negate(original.taxAmount);
         const discountAmount = negate(original.discountAmount);
         const total = negate(original.total);
-
-        return this.db.invoices.create({
+        return this.createInTransaction({
             subscriptionId: original.subscriptionId,
-            amount: roundMoney(-original.amount),
+            amount: roundMoney(-original.amount, original.currency),
             currency: original.currency,
             status: 'open',
             ...(invoiceNumber !== undefined && { invoiceNumber }),
@@ -234,13 +191,12 @@ export class InvoicesService<TFeatures extends FeatureRegistry = FeatureRegistry
             creditNoteOfId: invoiceId,
             lineItems: original.lineItems.map((item) => ({
                 ...item,
-                amount: roundMoney(-item.amount),
-                unitPrice: roundMoney(-item.unitPrice),
+                amount: roundMoney(-item.amount, original.currency),
+                unitPrice: roundMoney(-item.unitPrice, original.currency),
             })),
             metadata: { creditNoteFor: invoiceId },
         });
     }
-
     /**
      * Void an invoice with safety checks.
      *
@@ -253,36 +209,33 @@ export class InvoicesService<TFeatures extends FeatureRegistry = FeatureRegistry
     async voidInvoice(id: string): Promise<Invoice> {
         const invoice = await this.db.invoices.findById(id);
         if (!invoice) {
-            throw new SubscriptionError(
-                `Invoice not found: ${id}`,
-                'INVOICE_NOT_FOUND',
-                404,
-            );
+            throw new SubscriptionError(`Invoice not found: ${id}`, 'INVOICE_NOT_FOUND', 404);
         }
-
         if (invoice.status === 'void') {
             throw new InvoiceVoidError(`Invoice is already void: ${id}`);
         }
-
         if (invoice.status === 'paid') {
-            throw new InvoiceVoidError(
-                `Cannot void a paid invoice: ${id}. Create a credit note instead.`,
-            );
+            throw new InvoiceVoidError(`Cannot void a paid invoice: ${id}. Create a credit note instead.`);
         }
-
         return this.db.invoices.update(id, { status: 'void' });
     }
-
     /**
      * Mark invoice as paid
      */
     async markPaid(id: string): Promise<Invoice> {
-        return this.db.invoices.update(id, {
-            status: 'paid',
-            paidAt: new Date(),
+        if (!this.db.capabilities?.asyncTransactions || !this.db.outbox)
+            throw new SubscriptionError('markPaid requires atomic outbox persistence', 'BILLING_STORAGE_UNSUPPORTED', 501);
+        return this.db.transaction(async (tx) => {
+            const current = await tx.invoices.findById(id);
+            if (!current)
+                throw new SubscriptionError('Invoice not found', 'INVOICE_NOT_FOUND', 404);
+            if (current.status === 'paid')
+                return current;
+            const invoice = await tx.invoices.update(id, { status: 'paid', paidAt: new Date() });
+            await tx.outbox!.insert({ id: `invoice.paid:${invoice.gatewayInvoiceId ?? invoice.id}`, type: 'invoice.paid', occurredAt: invoice.paidAt!, subscriberId: invoice.subscriberId, data: { invoiceId: id, amount: invoice.amount, currency: invoice.currency } });
+            return invoice;
         });
     }
-
     /**
      * Mark invoice as void
      *
@@ -294,7 +247,6 @@ export class InvoicesService<TFeatures extends FeatureRegistry = FeatureRegistry
             status: 'void',
         });
     }
-
     /**
      * Mark invoice as uncollectible
      */
@@ -303,7 +255,6 @@ export class InvoicesService<TFeatures extends FeatureRegistry = FeatureRegistry
             status: 'uncollectible',
         });
     }
-
     /**
      * Finalize a draft invoice (make it open for payment)
      */
@@ -313,10 +264,9 @@ export class InvoicesService<TFeatures extends FeatureRegistry = FeatureRegistry
         });
     }
 }
-
 /**
- * Round a money amount to 2 decimal places
+ * Round a money amount using the currency minor-unit precision
  */
-function roundMoney(amount: number): number {
-    return Math.round(amount * 100) / 100;
+function roundMoney(amount: number, currency: string): number {
+    return minorToMajor(majorToMinor(amount, currency), currency);
 }

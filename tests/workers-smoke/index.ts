@@ -1,16 +1,14 @@
 // file: packages/subscriptions/tests/workers-smoke/index.ts
 // Minimal Cloudflare Worker smoke test for @abshahin/subscriptions.
 //
-// Proves the package boots inside a Workers (V8 isolate, no Node APIs)
-// runtime: the core bundle, the in-memory database adapter and the
-// Cloudflare KV cache adapter are all exercised through real HTTP routes.
+// Exercises the core, memory database and fake KV through local HTTP routes.
+// This is a demonstration fixture, not production authentication or durable billing.
 //
 // Routes:
-//   GET  /can?feature=<key>   -> { allowed: boolean } using the
-//                                `x-subscriber-id` header
-//   POST /webhooks/:provider  -> subscriptions.handleWebhookRequest()
+//   GET  /can?feature=<key>   -> fixed demo-subscriber feature check
+//   POST /webhooks           -> no-provider error path
 //
-// Run with: npx wrangler dev tests/workers-smoke/wrangler.toml
+// Run with: bunx wrangler dev --config tests/workers-smoke/wrangler.toml
 
 import { createSubscriptions, defineFeatures } from "../../src/index.js";
 import { memoryDatabaseAdapter } from "../../src/testing/memory-database.js";
@@ -86,7 +84,7 @@ function createFakeKV(): KVNamespaceLike {
 
 const features = defineFeatures({
   analytics: { type: "boolean", default: false },
-  maxProducts: { type: "limit", default: 3 },
+  maxProducts: { type: "limit", default: 3, usage: { kind: "persistent" } },
 });
 
 const kv = createFakeKV();
@@ -95,6 +93,7 @@ const subscriptions = createSubscriptions({
   database: memoryDatabaseAdapter<typeof features>(),
   features,
   cache: kvCacheAdapter(kv as never),
+  options: { cacheNamespace: "workers-smoke:development:memory" },
 });
 
 // Seed one active plan + subscriber so /can returns meaningful answers.
@@ -118,13 +117,14 @@ export default {
 
     const url = new URL(request.url);
 
-    // GET /can?feature=<key> — feature gate check for the caller's subscriber.
+    // Fixed identity demonstration only. Real APIs require trusted sessions
+    // and membership/operation authorization; request headers never authenticate here.
     if (request.method === "GET" && url.pathname === "/can") {
       const feature = url.searchParams.get("feature");
-      const subscriberId = request.headers.get("x-subscriber-id");
-      if (!feature || !subscriberId) {
+      const subscriberId = "demo-subscriber";
+      if (!feature) {
         return json(
-          { error: "Missing `feature` query param or `x-subscriber-id` header" },
+          { error: "Missing `feature` query param" },
           400,
         );
       }
@@ -135,12 +135,9 @@ export default {
       return json({ subscriberId, feature, allowed });
     }
 
-    // POST /webhooks/:provider — signature-verified webhook handling.
-    // The provider is taken from the URL and forwarded via a query-agnostic
-    // option: handleWebhookRequest resolves it from config by default, so we
-    // build a Request the factory can route with.
-    const webhookMatch = url.pathname.match(/^\/webhooks\/([^/]+)$/);
-    if (request.method === "POST" && webhookMatch) {
+    // No payment provider is configured: test raw Request/error handling,
+    // without claiming real provider authentication or settlement coverage.
+    if (request.method === "POST" && url.pathname === "/webhooks") {
       // handleWebhookRequest returns a web-standard Response directly
       // (200 on success, 400 on verification failure, 500 otherwise).
       return subscriptions.handleWebhookRequest(request);

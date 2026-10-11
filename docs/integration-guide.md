@@ -1,318 +1,199 @@
 # Integration Guide
 
-This guide documents the integration pattern already used in the backend project. It focuses on the current package API, not a hypothetical future abstraction.
+The SDK owns subscription policy, durable usage admission, payment attempts, and settlement effects. Your application supplies authentication, tenant permissions, provider credentials, verified resource ownership, and a scheduler. Review the [schema migrations](prisma-schema.md) and [audit remediation record](AUDIT_REMEDIATION.md) before upgrading an existing installation.
 
-The backend uses `@abshahin/subscriptions` as the subscription source of truth and adds app-level layers around it for faster usage counters and scheduled renewals.
-
-## Recommended Architecture
-
-Split the integration into three layers:
-
-1. A single shared subscriptions instance in your application core
-2. An Elysia controller exposing subscription routes and policy checks
-3. Optional app-specific infrastructure for Redis counters, cron jobs, and payment verification callbacks
-
-## 1. Define Features in One Place
-
-The backend keeps all subscription features in one module and exports the inferred feature type.
+## Define Feature Policies
 
 ```ts
 import { defineFeatures } from "@abshahin/subscriptions";
 
 export const features = defineFeatures({
-  analyticsEnabled: {
-    type: "boolean",
-    default: true,
-    description: "Visitor analytics and reporting",
-  },
-  certificatesEnabled: {
-    type: "boolean",
-    default: true,
-    description: "Issue completion certificates",
-  },
-  customDomain: {
-    type: "boolean",
-    default: true,
-    description: "Connect custom domain to store",
-  },
-  maxCourses: {
-    type: "limit",
-    default: -1,
-    description: "Maximum number of courses",
-  },
+  analyticsEnabled: { type: "boolean", default: false },
   maxProducts: {
-    type: "limit",
-    default: -1,
-    description: "Maximum number of products",
+    type: "limit", default: 10,
+    usage: { kind: "persistent" },
   },
   maxMembers: {
-    type: "limit",
-    default: -1,
-    description: "Maximum team members",
+    type: "limit", default: 3,
+    usage: { kind: "persistent" },
   },
-  transactionFee: {
-    type: "rate",
-    default: 5,
-    description: "Platform transaction fee percentage",
+  apiRequests: {
+    type: "limit", default: 1000,
+    usage: { kind: "periodic", reset: "calendar-month" },
   },
+  meteredExports: {
+    type: "metered", default: 100,
+    usage: { kind: "periodic", reset: "subscription-cycle" },
+  },
+  transactionFee: { type: "rate", default: 5 },
 });
-
-export type AppFeatures = typeof features;
 ```
 
-## 2. Create a Shared Subscriptions Instance
+Existing products and team members remain counted across month boundaries. Periodic policies use UTC calendar months or the persisted subscription cycle. Omitted policies retain calendar-month behavior; migrate inventory features by reconciling their current domain resource counts with `setUsage`.
+
+## Configure Storage, Cache, and Provider Identity
 
 ```ts
 import { createSubscriptions } from "@abshahin/subscriptions";
-import type { CacheAdapter } from "@abshahin/subscriptions/adapters/cache";
-import { moyasarAdapter } from "@abshahin/subscriptions/adapters/moyasar";
 import { prismaAdapter } from "@abshahin/subscriptions/adapters/prisma";
+import { moyasarAdapter } from "@abshahin/subscriptions/adapters/moyasar";
+import { redisCacheAdapter } from "@abshahin/subscriptions/adapters/redis";
+import { Redis } from "ioredis";
 import { db } from "./db";
 import { features } from "./features";
 
-const paymentAdapter = process.env.MOYASAR_LIVE_SECRET_KEY
-  ? moyasarAdapter({
-      secretKey: process.env.MOYASAR_LIVE_SECRET_KEY,
-      publishableKey: process.env.MOYASAR_LIVE_PUBLIC_KEY ?? "",
-      webhookSecret: process.env.MOYASAR_WEBHOOK_SECRET,
-      callbackUrl: "https://platform.example.com/subscription",
-    })
-  : undefined;
-
-const cacheAdapter: CacheAdapter = {
-  async get<T>(key) {
-    try {
-      return await redis.get<T>(`subscriptions:${key}`);
-    } catch {
-      return null;
-    }
-  },
-  async set<T>(key, value, ttlSeconds) {
-    try {
-      await redis.set(`subscriptions:${key}`, value, { ttl: ttlSeconds });
-    } catch {
-      // cache failures should not break billing
-    }
-  },
-  async delete(key) {
-    try {
-      await redis.del(`subscriptions:${key}`);
-    } catch {
-      // ignore cache delete failures
-    }
-  },
-  async deletePattern(pattern) {
-    try {
-      await redis.deleteByPattern(`subscriptions:${pattern}`);
-    } catch {
-      // ignore cache delete failures
-    }
-  },
-};
-
+const database = prismaAdapter(db);
 export const subscriptions = createSubscriptions({
-  database: prismaAdapter(db),
+  database,
   features,
-  cache: cacheAdapter,
-  payment: paymentAdapter,
+  cache: redisCacheAdapter(new Redis(process.env.REDIS_URL!)),
+  providers: [{
+    id: "moyasar-sa-live",
+    accountId: "your-merchant-account-id",
+    environment: "live",
+    billingOwner: "sdk_managed",
+    adapter: moyasarAdapter({
+      secretKey: process.env.MOYASAR_SECRET_KEY!,
+      webhookSecret: process.env.MOYASAR_WEBHOOK_SECRET!,
+    }),
+  }],
+  defaultProvider: "moyasar-sa-live",
   options: {
     subscriberType: "tenant",
     trialDays: 14,
     gracePeriodDays: 3,
-    defaultCurrency: "USD",
+    defaultCurrency: "SAR",
+    cacheNamespace: "my-app:production:main-db",
     cacheTtlSeconds: 300,
   },
 });
 ```
 
-This is the same overall pattern used in the backend project.
+The namespace must identify the application, environment, and database; every real cache requires it. Cache outages cannot reverse durable usage or make a committed plan update appear failed. Entitlement reads check authoritative subscription eligibility and plan features before using cached values.
 
-## 3. Resolve Subscriber IDs from Auth Context
+Financial operations require awaited transactions, durable billing operations, provider-resource mappings, invoice sequencing, and an outbox. Install the documented schema before collection. Prisma transaction support depends on the connected database/driver. The Drizzle adapter's verified SQLite transaction mode is covered by real `bun:sqlite` tests; D1 and unspecified async driver modes fail closed for interactive financial transactions. Do not interpret memory conformance or a successful bundle as database financial integration evidence.
 
-The package itself stays neutral about auth. In the backend integration, the subscriber ID is the current tenant ID.
-
-```ts
-function extractTenantId(ctx: {
-  user?: { activeTenantId?: string | null };
-  member?: { tenantId: string } | null;
-}): string {
-  const tenantId = ctx.user?.activeTenantId ?? ctx.member?.tenantId ?? null;
-
-  if (!tenantId) {
-    throw new Error("Tenant context required");
-  }
-
-  return tenantId;
-}
-```
-
-Keep this resolution logic in one place. It reduces route bugs and makes it easier to evolve auth later.
-
-## 4. Mount the Elysia Plugin
+## Authenticate and Authorize Every Subscriber Operation
 
 ```ts
 import { Elysia } from "elysia";
 import { elysiaPlugin } from "@abshahin/subscriptions/elysia";
-import { subscriptions } from "./subscriptions";
+import { authenticatedSession, canManageTenantBilling, isPlanAdministrator } from "./auth";
 
-const app = new Elysia().use(
-  elysiaPlugin(subscriptions, {
-    prefix: "/subscriptions",
-    getSubscriberId: extractTenantId,
-    adminRoutes: true,
-    adminGuard: (ctx) => ctx.user?.role === "admin",
-    invoice: {
-      platform: {
-        name: "Manhali",
-        website: "https://example.com",
-        supportEmail: "support@example.com",
-      },
-      locale: "ar-EG",
-      getSubscriberInfo: async (tenantId) => {
-        const tenant = await db.tenant.findUnique({
-          where: { id: tenantId },
-          select: { name: true },
-        });
-
-        return tenant ? { name: tenant.name ?? undefined } : null;
-      },
-    },
-  }),
-);
-```
-
-This gives you the built-in subscription endpoints plus admin plan management endpoints.
-
-## 5. Use Controller Macros for Feature Enforcement
-
-The built-in Elysia macros are useful when your application uses the package's database-backed usage records directly.
-
-```ts
-app.get("/analytics", handler, {
-  requireFeature: "analyticsEnabled",
-});
-
-app.post("/courses", handler, {
-  requireUsage: { feature: "maxCourses", count: 1 },
-});
-
-app.post("/courses", handler, {
-  useFeature: "maxCourses",
-});
-```
-
-In the backend project, controller-level macros are still valuable, but some domain modules route usage tracking through a Redis-backed layer for speed. That is an application concern on top of this package, not a package requirement.
-
-## 6. Handle Payment-Backed Upgrades Carefully
-
-The backend uses saved Moyasar token IDs for plan upgrades and renewals.
-
-Typical upgrade flow:
-
-1. Frontend verifies the card or reusable payment source.
-2. App stores the reusable token as `gatewayCustomerId` on the subscription.
-3. App calls `subscriptions.subscriptions.changePlan(...)`.
-4. If payment succeeds, app creates an invoice.
-5. If 3DS is required, the result exposes `paymentPending` and `verificationUrl`.
-
-Example:
-
-```ts
-const result = await subscriptions.subscriptions.changePlan(
-  tenantId,
-  newPlanId,
-  {
-    prorate: true,
-    verifiedTokenId: verifiedTokenIdFromFrontend,
-    callbackUrl: "https://platform.example.com/subscription/callback",
+const app = new Elysia().use(elysiaPlugin(subscriptions, {
+  getSubscriberId: async ctx => (await authenticatedSession(ctx))?.activeTenantId ?? null,
+  authorizeSubscriber: async (ctx, tenantId, operation) => {
+    const session = await authenticatedSession(ctx);
+    return !!session && await canManageTenantBilling(session, tenantId, operation);
   },
-);
-
-if (result.paymentPending) {
-  return {
-    verificationUrl: result.verificationUrl,
-  };
-}
-
-if (result.charged && result.paymentId) {
-  await subscriptions.invoices.create({
-    subscriptionId: result.subscription.id,
-    amount: result.subscription.plan.price,
-    currency: result.subscription.plan.currency,
-    status: "paid",
-    gatewayInvoiceId: result.paymentId,
-  });
-}
+  adminRoutes: true,
+  adminGuard: isPlanAdministrator,
+}));
 ```
 
-## 7. Keep Hot-Path Counters Outside the Package When Needed
+These auth functions belong to your application. Verify the session, current tenant membership, and operation permission against server-controlled records. A selected tenant ID alone does not prove membership. All subscriber routes fail closed without a trusted resolver. If you omit `authorizeSubscriber`, the resolver must enforce the relevant membership and operation permissions itself. Administrative routes are disabled by default and require their own explicit guard when enabled.
 
-The package already persists usage through `UsageRecord` and exposes `permissions.use`, `release`, and `remaining`.
+The fetch handler, Hono wrapper, and Next.js wrapper follow the same trust contract. Do not derive identity directly from caller-supplied headers or request bodies.
 
-The backend adds a Redis-backed hot-path usage layer because some domain endpoints need lower latency and atomic counters shared across many writes.
+## Create Purchases and Bind Verified Payment Methods
 
-That pattern works well when you need:
-
-- faster admission checks than a database round trip
-- periodic reconciliation from domain entities
-- tenant-specific dashboards with near-real-time numbers
-
-The important boundary is this:
-
-- package: subscription policy, plan definitions, persisted usage records
-- app: performance optimizations, reconciliation jobs, tenant dashboards
-
-## 8. Add Renewal Scheduling in App Code
-
-Scheduled billing orchestration stays in application code, not the package.
-
-The backend project runs a cron job that:
-
-- finds subscriptions nearing expiry
-- charges saved payment sources through Moyasar
-- renews subscriptions on success
-- creates invoices
-- records payment failure metadata when renewals fail
-
-The package supports this well because the renewal step is small:
+Public `/subscribe` and `/create` accept the requested plan, then derive trial eligibility and duration from trusted policy. They reject client financial assertions, provider/resource bindings, administrative grant policies, and trial overrides. New purchases into inactive plans are rejected.
 
 ```ts
+const subscription = await subscriptions.subscriptions.createSelfService(tenantId, planId);
+// A paid plan without an eligible trial has status "incomplete".
+```
+
+Moyasar provides token payments, so the SDK schedules its renewals. After a server-side provider lookup verifies that a reusable payment method belongs to the authenticated subscriber and the intended merchant/environment, persist the ownership mapping and subscription binding. This is a trusted application operation; the example assumes verification already happened:
+
+```ts
+await subscriptions.bindProviderResource({
+  providerId: "moyasar-sa-live",
+  accountId: "your-merchant-account-id",
+  environment: "live",
+  kind: "payment_method",
+  localId: `${tenantId}:${verifiedPaymentMethodId}`,
+  externalId: verifiedPaymentMethodId,
+});
+
+const current = await subscriptions.subscriptions.get(tenantId);
+if (!current?.billing) throw new Error("Verified provider ownership backfill required");
+// Retain the existing billing ownership; replace only verified resource fields.
+await database.subscriptions.update(current.id, {
+  billing: {
+    ...current.billing,
+    externalPaymentMethodId: verifiedPaymentMethodId,
+    ...(verifiedCustomerId ? { externalCustomerId: verifiedCustomerId } : {}),
+  },
+});
+
+// Trusted server collection for the incomplete purchase.
 await subscriptions.subscriptions.renew(tenantId);
 ```
 
-Everything around that call, including selection logic, retries, notifications, and failure thresholds, belongs in your app.
+Keep customer IDs, reusable payment-method IDs, and native subscription IDs distinct. A token's existence does not prove settlement. `renew` persists an immutable purchase/attempt before calling the provider, then verifies settlement amount, currency, scope, and resource/purchase binding before granting paid entitlement and persisting its invoice. Server resource association must never be exposed as a generic public metadata update.
 
-## 9. Expose Tenant-Specific Dashboard Endpoints Separately
+Legacy subscriptions require an explicit backfill of provider/account/environment ownership, mapped resources, and verified historical paid-price snapshots where proration credit applies. A default provider affects new subscriptions; changing it does not migrate existing billing ownership.
 
-The backend project adds custom routes such as tenant usage summaries and tenant batch capability checks. Those routes sit next to the package plugin rather than inside it.
+## Confirm Plan-Change Quotes and Use the Returned Invoice
 
-This is a good pattern whenever you need:
+```ts
+const preview = await subscriptions.subscriptions.previewChangePlan(tenantId, newPlanId, {
+  immediately: true,
+  prorate: true,
+});
+// Present preview.amountDueFormatted (major units), currency, and validUntil.
+// After the authenticated subscriber confirms this quote:
+const result = await subscriptions.subscriptions.changePlan(tenantId, newPlanId, {
+  quoteId: preview.quoteId,
+  immediately: true,
+  prorate: true,
+});
 
-- auth or tenant rules that are app-specific
-- response shapes tailored to a frontend dashboard
-- data combined from subscriptions and domain entities
+if (result.invoice) {
+  return { subscription: result.subscription, invoice: result.invoice };
+}
+```
 
-## 10. Other Adapters and Runtimes
+`amountDue` is in minor units; `amountDueFormatted` is the display amount in major units. Payable changes require the persisted quote identity. Expiration, subscription changes, or price changes require another preview and confirmation. Preserve the same timing/proration options. Immediate remaining-period proration preserves the existing billing anchor; deferred changes collect at renewal. Cross-currency and interval changes require an explicit migration policy and currently reject.
 
-The backend pattern above uses Prisma + Moyasar + a custom Redis cache, but the same architecture works with the other shipped adapters:
+The operation creates the invoice using the actual immutable settlement quote. Do not create a second invoice using the full destination plan price. A callback URL or browser confirmation does not constitute payment evidence. Payment authentication/unknown outcomes are reconciled through persisted attempts and verified provider data; the SDK does not promise a working hosted frontend flow for every provider.
 
-- **Database**: `drizzleAdapter` (`@abshahin/subscriptions/adapters/drizzle`) for D1, Turso, `bun:sqlite`, and other Drizzle drivers — see `adapters.md` and `drizzle-schema.md`.
-- **Cache**: `redisCacheAdapter`, `upstashCacheAdapter`, or `kvCacheAdapter` instead of a hand-rolled `CacheAdapter` — see `adapters.md`.
-- **Payments**: `stripeAdapter`, `paddleAdapter`, or `lemonSqueezyAdapter` as drop-in `payment` options — see `adapters.md`.
-- **HTTP layer**: `honoPlugin`, `createNextHandlers`, or the framework-neutral `createSubscriptionsHttpHandler` instead of the Elysia plugin — see `runtime-support.md` for per-runtime recipes.
+## Explicit Administrative Grants
 
-## Checklist
+```ts
+// Authorized server staff/policy only:
+await subscriptions.subscriptions.create(tenantId, planId, { policy: "manual_invoice" });
+// Or create(..., { policy: "complimentary" }) for deliberate free access.
+await subscriptions.subscriptions.renewAdministrative(tenantId, { policy: "manual_invoice" });
+```
 
-Before shipping your integration, verify the following:
+Manual invoicing grants entitlement under your explicit authorized credit policy and creates an open invoice; complimentary access grants deliberately without treating it as paid credit. Neither policy is a public purchase field. Trial start/extension and staff grants must remain protected administrative operations.
 
-- Prisma models match the package adapter expectations
-- feature keys are stable and centrally defined
-- subscriber ID extraction is consistent across routes
-- payment adapter configuration is optional in non-billing environments
-- invoice creation happens after confirmed payment events
-- cache failures never break subscription logic
-- renewal jobs are idempotent
+## Durable Usage Admission
 
-If you expose invoice downloads through the Elysia plugin, add one more deployment check:
+```ts
+const admitted = await subscriptions.use(tenantId, "maxProducts", 1);
+try {
+  await createProductInYourDomain();
+} catch (error) {
+  await subscriptions.release(tenantId, "maxProducts", 1);
+  throw error;
+}
+```
 
-- invoice download routes run on Node.js and have `puppeteer-html-pdf` installed
+`use` performs conditional database admission; previews and read caches do not reserve capacity. Align admission/release with domain transaction or durable operation IDs if requests can retry after a crash. The SDK's usage API is not a complete distributed transaction with arbitrary domain writes. Reconcile inventories from domain records when necessary. Metered overage and unlimited caps still require subscription eligibility; all quantities must be safe integers. Do not replace admission with a Redis read/check/increment sequence.
+
+## Scheduling, Webhooks, and Delivery
+
+Your scheduler selects due SDK-managed subscriptions and invokes `renew`. The SDK owns stable attempts, settlement invoice creation, cycle-scoped dunning, and payment reconciliation. Avoid collecting directly and then manually marking a renewal paid. Unknown payment outcomes must be reconciled before starting a new collection. Provider-managed subscriptions reject local scheduled collection; authoritative provider settlement/period events drive their owning integration.
+
+Webhook URLs identify the registered provider account, for example `/subscriptions/webhooks/moyasar-sa-live`. Forward the original body and provider headers. Moyasar authenticates a body `secret_token`; HMAC providers use their documented raw-body headers. Provider snapshots are not payment evidence.
+
+With supported local transaction capabilities, domain events and business effects commit together. `withEvents` relays persisted outbox events; delivery is at least once, so consumers deduplicate by event ID. A delivery failure leaves the outbox record retryable. See [events.md](events.md).
+
+## Provider and Runtime Limits
+
+Moyasar, Stripe, Paddle, and Lemon Squeezy adapters expose different capabilities; they are not interchangeable billing schedulers. Polar and Creem integrations are not implemented. The registry supports explicit account identity, persisted ownership, and scoped resource routing as a foundation for future integrations; unsupported native checkout/catalog/subscription paths fail explicitly.
+
+See [runtime-support.md](runtime-support.md) for runtime and transaction limits, [adapters.md](adapters.md) for contracts, and [AUDIT_REMEDIATION.md](AUDIT_REMEDIATION.md) for actual checks and remaining external verification.

@@ -42,6 +42,8 @@ export interface OutboxStore {
      * Mark a previously claimed event as successfully delivered.
      */
     markSent?(id: string): Promise<void>;
+    /** Release a failed delivery claim so it can be retried. */
+    releaseClaim?(id: string): Promise<void>;
 }
 
 // ==================== Outbox Events Adapter ====================
@@ -50,14 +52,15 @@ export interface OutboxStore {
  * Create an {@link EventsAdapter} that persists every event to an
  * {@link OutboxStore} for later relay instead of delivering it immediately.
  *
- * Combine with {@link withEvents} and {@link relayOutbox}:
+ * This is a delivery sink. It does not make a separate business mutation
+ * atomic. SDK services already write their transaction-owned outbox; relay
+ * that outbox to a receiver (or a different durable store). Do not relay a
+ * store back into itself and then mark its records sent.
  *
  * @example
  * ```typescript
- * const subs = withEvents(createSubscriptions(config), createOutboxEventsAdapter(store));
- *
- * // Later, in a cron job / queue worker:
- * await relayOutbox(store, { emit: (e) => queue.publish(e.type, e) });
+ * const subs = createSubscriptions(config);
+ * await relayOutbox(subs.eventOutbox!, { emit: (e) => queue.publish(e.type, e) });
  * ```
  */
 export function createOutboxEventsAdapter(store: OutboxStore): EventsAdapter {
@@ -152,6 +155,7 @@ export async function relayOutbox(
             sent += 1;
         } catch (error) {
             failed += 1;
+            await store.releaseClaim?.(record.id);
             onError?.(error, record);
         }
     }

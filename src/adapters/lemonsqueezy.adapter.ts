@@ -9,7 +9,6 @@ import type {
   CheckoutSession,
   CreateCheckoutInput,
   CreateCustomerInput,
-  CreateGatewaySubscriptionInput,
   GatewayCustomer,
   GatewaySubscription,
   PaymentGatewayAdapter,
@@ -30,6 +29,8 @@ export interface LemonSqueezyConfig {
   storeId: string | number;
   /** Webhook signing secret for X-Signature verification */
   webhookSecret?: string;
+  /** Expected webhook environment (defaults to production). */
+  environment?: "production" | "sandbox";
   /** API base URL (defaults to production) */
   apiUrl?: string;
 }
@@ -260,6 +261,11 @@ function toGatewaySubscription(
   };
 }
 
+function flatMetadata(value: unknown): Record<string, string> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+  return Object.fromEntries(Object.entries(value).filter(([, v]) => ["string", "number", "boolean"].includes(typeof v)).map(([k, v]) => [k, String(v)]));
+}
+
 async function verifySignature(
   payload: string | Uint8Array,
   signature: string,
@@ -308,8 +314,7 @@ async function verifySignature(
  * **Notes on Lemon Squeezy's model**:
  *
  * - Subscriptions are created exclusively through hosted checkouts; there is
- *   no API to create a subscription server-side, so `createSubscription()`
- *   throws a descriptive error. Use `createCheckoutSession()` instead and
+ *   no API to create a subscription server-side. Use `createCheckoutSession()` and
  *   handle the resulting `subscription_created` webhook.
  * - `createCheckoutSession()` passes `metadata` through as `checkout_data.custom`,
  *   which Lemon Squeezy echoes back in webhook `meta.custom_data` - use it to
@@ -338,6 +343,10 @@ export function lemonSqueezyAdapter(
 
   return {
     provider: "lemonsqueezy",
+    capabilities: {
+      customers: true, nativeSubscriptions: true, checkout: "hosted", portal: true,
+      directPayments: false, paymentLookup: false, idempotentCharges: false,
+    },
 
     // ==================== Customer Management ====================
     // Customers are usually created automatically by Lemon Squeezy at checkout;
@@ -370,8 +379,9 @@ export function lemonSqueezyAdapter(
           JsonApiResponse<LemonSqueezyCustomerAttributes>
         >("GET", `/customers/${encodeURIComponent(customerId)}`);
         return toGatewayCustomer(response.data);
-      } catch {
-        return null;
+      } catch (error) {
+        if (error instanceof LemonSqueezyAdapterError && error.statusCode === 404) return null;
+        throw error;
       }
     },
 
@@ -397,15 +407,6 @@ export function lemonSqueezyAdapter(
 
     // ==================== Subscription Management ====================
 
-    async createSubscription(
-      _data: CreateGatewaySubscriptionInput,
-    ): Promise<GatewaySubscription> {
-      throw new LemonSqueezyAdapterError(
-        "Lemon Squeezy does not support creating subscriptions via API. " +
-          "Use createCheckoutSession() and handle the subscription_created webhook instead.",
-      );
-    },
-
     async getSubscription(
       subscriptionId: string,
     ): Promise<GatewaySubscription | null> {
@@ -414,8 +415,9 @@ export function lemonSqueezyAdapter(
           JsonApiResponse<LemonSqueezySubscriptionAttributes>
         >("GET", `/subscriptions/${encodeURIComponent(subscriptionId)}`);
         return toGatewaySubscription(response.data);
-      } catch {
-        return null;
+      } catch (error) {
+        if (error instanceof LemonSqueezyAdapterError && error.statusCode === 404) return null;
+        throw error;
       }
     },
 
@@ -503,6 +505,9 @@ export function lemonSqueezyAdapter(
     async createCheckoutSession(
       data: CreateCheckoutInput,
     ): Promise<CheckoutSession> {
+      if (data.trialDays !== undefined) {
+        throw new LemonSqueezyAdapterError("Lemon Squeezy trials must be configured on the variant; per-checkout trialDays overrides are unsupported", 400);
+      }
       const response = await client.request<
         JsonApiResponse<LemonSqueezyCheckoutAttributes>
       >("POST", "/checkouts", {
@@ -519,8 +524,6 @@ export function lemonSqueezyAdapter(
               redirect_url: data.successUrl,
               enabled_variants: [Number(data.priceId)],
             },
-            // Trials are configured on the variant in Lemon Squeezy and
-            // cannot be overridden per-checkout; trialDays is ignored here.
             // Lemon Squeezy checkouts do not expire by default.
             expires_at: null,
           },
@@ -539,10 +542,7 @@ export function lemonSqueezyAdapter(
       return {
         id: response.data.id,
         url: attrs.url,
-        // Non-expiring checkouts: report a far-future date
-        expiresAt: attrs.expires_at
-          ? new Date(attrs.expires_at)
-          : new Date("9999-12-31T23:59:59.999Z"),
+        ...(attrs.expires_at && { expiresAt: new Date(attrs.expires_at) }),
       };
     },
 
@@ -595,6 +595,7 @@ export function lemonSqueezyAdapter(
     async constructWebhookEvent(
       payload: string | Uint8Array,
       signature: string,
+      context?: { headers: Record<string, string> },
     ): Promise<WebhookEvent> {
       if (!config.webhookSecret) {
         throw new LemonSqueezyAdapterError(
@@ -604,7 +605,7 @@ export function lemonSqueezyAdapter(
 
       const isValid = await verifySignature(
         payload,
-        signature,
+        signature || Object.entries(context?.headers ?? {}).find(([name]) => name.toLowerCase() === "x-signature")?.[1] || "",
         config.webhookSecret,
       );
       if (!isValid) {
@@ -621,19 +622,58 @@ export function lemonSqueezyAdapter(
         throw new LemonSqueezyAdapterError("Invalid webhook payload JSON", 400);
       }
 
-      const createdAt = parsed.data.attributes?.["created_at"];
-
+      if (!parsed || !parsed.meta || typeof parsed.meta.event_name !== "string" || !parsed.data ||
+          typeof parsed.data.id !== "string" || !parsed.data.id || typeof parsed.data.type !== "string" ||
+          !parsed.data.attributes || typeof parsed.data.attributes !== "object" || Array.isArray(parsed.data.attributes)) {
+        throw new LemonSqueezyAdapterError("Invalid Lemon Squeezy webhook payload", 400);
+      }
+      const attrs = parsed.data.attributes;
+      if (String(attrs.store_id) !== storeId) throw new LemonSqueezyAdapterError("Webhook belongs to another Lemon Squeezy store", 401);
+      const sandbox = parsed.meta.test_mode === true || attrs.test_mode === true;
+      if (sandbox !== (config.environment === "sandbox")) throw new LemonSqueezyAdapterError("Webhook environment does not match the configured environment", 401);
+      const eventName = parsed.meta.event_name;
+      let type = eventName;
+      if ((eventName === "subscription_payment_success" || eventName === "subscription_payment_recovered") && attrs.status === "paid") type = "payment.paid";
+      else if (eventName === "subscription_payment_failed") type = "payment.failed";
+      else if (eventName === "order_created" && attrs.status === "paid") type = "payment.paid";
+      else if (eventName === "subscription_expired") type = "customer.subscription.deleted";
+      else if (eventName === "subscription_created") type = "customer.subscription.created";
+      else if (["subscription_updated", "subscription_cancelled", "subscription_resumed", "subscription_paused", "subscription_unpaused"].includes(eventName)) type = "customer.subscription.updated";
+      const metadata = flatMetadata(parsed.meta.custom_data);
+      // Billing reason is provider evidence of a renewal. A snapshot never supplies settlement.
+      if (attrs.billing_reason === "renewal") metadata.type = "subscription_renewal";
+      const settlement = type === "payment.paid" || type === "payment.failed";
+      if (settlement && (!Number.isSafeInteger(attrs.total) || (attrs.total as number) < 0 || typeof attrs.currency !== "string")) {
+        throw new LemonSqueezyAdapterError("Invalid Lemon Squeezy payment settlement", 400);
+      }
+      const timestamp = attrs.updated_at ?? attrs.created_at;
+      if (typeof timestamp !== "string" || !Number.isFinite(Date.parse(timestamp))) throw new LemonSqueezyAdapterError("Invalid webhook timestamp", 400);
+      // Lemon Squeezy supplies resource IDs but no event ID. Hash the authenticated
+      // body for replay deduplication, retaining the invoice/order ID for settlement.
+      const rawBytes = typeof payload === "string" ? new TextEncoder().encode(payload) : payload;
+      const digest = await crypto.subtle.digest("SHA-256", rawBytes as BufferSource);
+      const eventId = `ls_${Array.from(new Uint8Array(digest), byte => byte.toString(16).padStart(2, "0")).join("")}`;
+      const periodEnd = attrs.ends_at ?? attrs.renews_at;
       return {
-        id: parsed.data.id,
-        type: parsed.meta.event_name,
+        id: eventId,
+        type,
+        originalType: eventName,
+        environment: sandbox ? "test" : "live",
         data: {
-          ...parsed.data.attributes,
-          ...(parsed.meta.custom_data && {
-            custom_data: parsed.meta.custom_data,
-          }),
+          ...attrs,
+          id: parsed.data.id,
+          metadata,
+          resourceType: parsed.data.type,
+          providerEventType: eventName,
+          providerAccountId: storeId,
+          environment: sandbox ? "test" : "live",
+          ...(settlement && { paymentId: parsed.data.id, amount: attrs.total, currency: attrs.currency }),
+          ...(attrs.subscription_id !== undefined && { subscriptionId: String(attrs.subscription_id) }),
+          ...(type.startsWith("customer.subscription.") && { subscriptionId: parsed.data.id }),
+          ...(typeof periodEnd === "string" && { currentPeriodEnd: periodEnd }),
+          ...(parsed.meta.custom_data && { custom_data: parsed.meta.custom_data }),
         },
-        createdAt:
-          typeof createdAt === "string" ? new Date(createdAt) : new Date(),
+        createdAt: new Date(timestamp),
       };
     },
   };

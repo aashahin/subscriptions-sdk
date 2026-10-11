@@ -19,12 +19,19 @@ import type {
     UpdateSubscriptionInput,
     UsageRecord,
 } from '../core/types.js';
+import { queue, serialAdapter, hydrateCoupon, usagePeriod, validateUsageCount, validateUsageLimit, validateProviderResource, providerResourceScope } from './persistence-utils.js';
+import type { OutboxRecord } from './outbox.adapter.js';
+import type { Coupon } from '../core/coupons.js';
 import type {
+    BillingOperationRecord, ProviderResourceMapping, ProviderResourceScope, UsageMutationOptions, UsagePeriodOptions, UsageReservationOptions,
     DatabaseAdapter,
     PlanQueryOptions,
     SubscriptionQueryOptions,
 } from './database.adapter.js';
 import {
+    providerResources as providerResourcesTable,
+    billingOperations as billingOperationsTable, billingOutbox as billingOutboxTable,
+    coupons as couponsTable, couponRedemptions as couponRedemptionsTable,
     billingSequences as billingSequencesTable,
     invoices as invoicesTable,
     subscriptionPlans as plansTable,
@@ -40,6 +47,8 @@ export * from './drizzle-schema.js';
  * not use the Drizzle adapter.
  */
 type DrizzleOps = typeof import('drizzle-orm');
+
+const connectionQueues = new WeakMap<object, ReturnType<typeof queue>>();
 
 let opsPromise: Promise<DrizzleOps> | undefined;
 
@@ -59,6 +68,9 @@ const bundledSchema = {
     invoices: invoicesTable,
     usageRecords: usageRecordsTable,
     billingSequences: billingSequencesTable,
+    providerResources: providerResourcesTable,
+    billingOperations: billingOperationsTable, billingOutbox: billingOutboxTable,
+    coupons: couponsTable, couponRedemptions: couponRedemptionsTable,
 };
 
 /**
@@ -78,7 +90,8 @@ export interface DrizzleDatabase {
     insert: (table: any) => any;
     update: (table: any) => any;
     delete: (table: any) => any;
-    transaction: (fn: (tx: any) => any) => any;
+    $client?: any;
+    transaction: (fn: (tx: any) => any, config?: any) => any;
 }
 
 /**
@@ -90,6 +103,11 @@ export interface DrizzleAdapterOptions {
      * (e.g. different column names). Must match the bundled table shapes.
      */
     schema?: DrizzleAdapterSchema;
+    /** Unknown drivers fail closed. D1 cannot run interactive async transactions. */
+    transactionMode?: 'async' | 'sqlite' | 'unsupported';
+    dialect?: 'sqlite' | 'postgresql';
+    /** Explicit SQLite connection when the driver does not expose $client.exec(). */
+    sqliteClient?: { exec(sql: string): unknown };
 }
 
 /**
@@ -116,7 +134,88 @@ export function drizzleAdapter<TFeatures extends FeatureRegistry = FeatureRegist
 ): DatabaseAdapter<TFeatures> {
     const schema: DrizzleAdapterSchema = { ...bundledSchema, ...options?.schema };
 
-    const createAdapter = (client: DrizzleDatabase): DatabaseAdapter<TFeatures> => ({
+    const sqliteClient = options?.sqliteClient ?? (typeof db.$client?.exec === 'function' ? db.$client : undefined);
+    const mode = options?.transactionMode ?? (sqliteClient ? 'sqlite' : 'unsupported');
+    if (mode === 'sqlite' && !sqliteClient) throw new Error('SQLite transactions require an exec-capable connection');
+    let run = connectionQueues.get((sqliteClient ?? db) as object);
+    if (!run) { run = queue(); connectionQueues.set((sqliteClient ?? db) as object, run); }
+    const createAdapter = (client: DrizzleDatabase, inTransaction = false): DatabaseAdapter<TFeatures> => ({
+        capabilities: { asyncTransactions: mode !== 'unsupported' },
+        providerResources: {
+            async bind(mapping) {
+                const scope=providerResourceScope(mapping);validateProviderResource(scope,mapping.localId);validateProviderResource(scope,mapping.externalId);
+                const rows=await client.insert(schema.providerResources).values(mapping).onConflictDoNothing().returning();
+                const record=rows[0]??await this.findByExternal(scope,mapping.externalId);
+                if(!record||record.localId!==mapping.localId||record.externalId!==mapping.externalId)throw new Error('Provider resource is already bound to another local or external identity');
+                return record as ProviderResourceMapping;
+            },
+            async findByExternal(scope,externalId) {validateProviderResource(scope,externalId);const {eq,and}=await loadOps();const t=schema.providerResources;
+                const rows=await client.select().from(t).where(and(eq(t.providerId,scope.providerId),eq(t.accountId,scope.accountId),eq(t.environment,scope.environment),eq(t.kind,scope.kind),eq(t.externalId,externalId))).limit(1);
+                return rows[0] as ProviderResourceMapping??null;
+            },
+            async findByLocal(scope,localId) {validateProviderResource(scope,localId);const {eq,and}=await loadOps();const t=schema.providerResources;
+                const rows=await client.select().from(t).where(and(eq(t.providerId,scope.providerId),eq(t.accountId,scope.accountId),eq(t.environment,scope.environment),eq(t.kind,scope.kind),eq(t.localId,localId))).limit(1);
+                return rows[0] as ProviderResourceMapping??null;
+            },
+        },
+        billingOperations: {
+            async reserve(key, payload) {
+                const rows = await client.insert(schema.billingOperations).values({ key, payload, status: 'reserved' })
+                    .onConflictDoNothing({ target: schema.billingOperations.key }).returning();
+                const record = rows[0] ?? await this.find(key);
+                if (!record) throw new Error('Billing operation reservation was not persisted');
+                return { created: rows.length === 1, record: record as BillingOperationRecord };
+            },
+            async find(key) { const { eq } = await loadOps(); const rows = await client.select().from(schema.billingOperations)
+                .where(eq(schema.billingOperations.key, key)).limit(1); return rows[0] as BillingOperationRecord ?? null; },
+            async update(key, data) { const { eq } = await loadOps(); const rows = await client.update(schema.billingOperations)
+                .set({ ...data, updatedAt: new Date() }).where(eq(schema.billingOperations.key, key)).returning();
+                if (!rows[0]) throw new Error('Billing operation not found'); return rows[0] as BillingOperationRecord; },
+            async compareAndSet(key, expectedStatus, data) { const { eq, and } = await loadOps();
+                const rows = await client.update(schema.billingOperations).set({ ...data, updatedAt: new Date() })
+                    .where(and(eq(schema.billingOperations.key,key),eq(schema.billingOperations.status,expectedStatus))).returning({key:schema.billingOperations.key});
+                return rows.length === 1; },
+        },
+        outbox: {
+            async insert(record) { await client.insert(schema.billingOutbox).values({ id: record.id, event: record as unknown as Record<string, unknown>, status: 'pending' })
+                .onConflictDoNothing({ target: schema.billingOutbox.id }); },
+            async claimPending(limit = 100) {
+                const { eq, or, lt, and, inArray } = await loadOps(); const now = new Date();
+                const eligible = or(eq(schema.billingOutbox.status,'pending'),and(eq(schema.billingOutbox.status,'claimed'),lt(schema.billingOutbox.claimedAt,new Date(now.getTime()-300000))));
+                const candidates = await client.select({id:schema.billingOutbox.id}).from(schema.billingOutbox).where(eligible).limit(limit);
+                if (!candidates.length) return [];
+                const rows = await client.update(schema.billingOutbox).set({status:'claimed',claimedAt:now})
+                    .where(and(eligible,inArray(schema.billingOutbox.id,candidates.map((row:any)=>row.id)))).returning();
+                return rows.map((row:any)=>({...row.event,occurredAt:new Date(row.event.occurredAt)})) as OutboxRecord[];
+            },
+            async releaseClaim(id) { const {eq,and}=await loadOps();await client.update(schema.billingOutbox).set({status:'pending',claimedAt:null}).where(and(eq(schema.billingOutbox.id,id),eq(schema.billingOutbox.status,'claimed'))); },
+            async markSent(id) { const {eq}=await loadOps(); await client.update(schema.billingOutbox).set({status:'sent',claimedAt:null}).where(eq(schema.billingOutbox.id,id)); },
+        },
+        coupons: {
+            async findByCode(code) { const {eq}=await loadOps();const rows=await client.select().from(schema.coupons).where(eq(schema.coupons.code,code)).limit(1); return rows[0] as Coupon ?? null; },
+            async findById(id) { const {eq}=await loadOps();const rows=await client.select().from(schema.coupons).where(eq(schema.coupons.id,id)).limit(1); return rows[0] as Coupon ?? null; },
+            async create(data) {const rows=await client.insert(schema.coupons).values({...data,id:crypto.randomUUID()}).returning();return rows[0] as Coupon;},
+            async update(id,data) {const {eq}=await loadOps();const rows=await client.update(schema.coupons).set({...data,updatedAt:new Date()}).where(eq(schema.coupons.id,id)).returning();if(!rows[0])throw new Error('Coupon not found');return rows[0] as Coupon;},
+            async incrementRedemptions() { throw new Error('Coupon redemption requires a purchaseId; use redeem()'); },
+            async reserveRedemption(id,purchaseId,options) {return this.redeem!(id,purchaseId,options);},
+            async redeem(id,purchaseId,options) {
+                if(!purchaseId)throw new Error('Coupon redemption requires a purchaseId');
+                if(!inTransaction) return createAdapter(client).transaction(tx=>tx.coupons!.redeem!(id,purchaseId,options));
+                const {eq,and,or,isNull,gt,sql}=await loadOps();
+                const existing=await client.select().from(schema.couponRedemptions).where(eq(schema.couponRedemptions.purchaseId,purchaseId)).limit(1);
+                if(existing[0]) {if(existing[0].couponId!==id)throw new Error('Purchase already bound to another coupon');return existing[0].status==='reserved'?hydrateCoupon(existing[0].couponSnapshot as unknown as Coupon):null;}
+                const now=options?.now??new Date();const rows=await client.update(schema.coupons).set({timesRedeemed:sql`${schema.coupons.timesRedeemed}+1`,updatedAt:now})
+                    .where(and(eq(schema.coupons.id,id),eq(schema.coupons.isActive,true),or(isNull(schema.coupons.expiresAt),gt(schema.coupons.expiresAt,now)),or(isNull(schema.coupons.maxRedemptions),sql`${schema.coupons.timesRedeemed}<${schema.coupons.maxRedemptions}`))).returning();
+                if(!rows[0])return null;
+                await client.insert(schema.couponRedemptions).values({purchaseId,couponId:id,status:'reserved',couponSnapshot:rows[0]});return rows[0] as Coupon;
+            },
+            async releaseRedemption(id,purchaseId) {
+                if(!inTransaction)return createAdapter(client).transaction(tx=>tx.coupons!.releaseRedemption!(id,purchaseId));
+                const {eq,and,sql}=await loadOps();const rows=await client.update(schema.couponRedemptions).set({status:'released'})
+                    .where(and(eq(schema.couponRedemptions.purchaseId,purchaseId),eq(schema.couponRedemptions.couponId,id),eq(schema.couponRedemptions.status,'reserved'))).returning();
+                if(rows.length)await client.update(schema.coupons).set({timesRedeemed:sql`${schema.coupons.timesRedeemed}-1`}).where(eq(schema.coupons.id,id));
+            },
+        },
         // ==================== Plans ====================
         plans: {
             async findById(id: string): Promise<Plan<TFeatures> | null> {
@@ -184,6 +283,7 @@ export function drizzleAdapter<TFeatures extends FeatureRegistry = FeatureRegist
             },
 
             async create(data: CreatePlanInput<TFeatures>): Promise<Plan<TFeatures>> {
+        if (data.metadata && Object.hasOwn(data.metadata, BILLING_METADATA_KEY)) throw new Error('_billing is reserved metadata');
                 const now = new Date();
                 const row = {
                     id: crypto.randomUUID(),
@@ -219,6 +319,7 @@ export function drizzleAdapter<TFeatures extends FeatureRegistry = FeatureRegist
                     id,
                     data.metadata,
                     { prices: data.prices },
+                    options?.dialect,
                 );
 
                 const set: Record<string, unknown> = { updatedAt: new Date() };
@@ -357,6 +458,7 @@ export function drizzleAdapter<TFeatures extends FeatureRegistry = FeatureRegist
             },
 
             async create(data: CreateSubscriptionInput): Promise<Subscription> {
+        if (data.metadata && Object.hasOwn(data.metadata, BILLING_METADATA_KEY)) throw new Error('_billing is reserved metadata');
                 const now = new Date();
                 const row = {
                     id: crypto.randomUUID(),
@@ -376,6 +478,7 @@ export function drizzleAdapter<TFeatures extends FeatureRegistry = FeatureRegist
                     // column (same convention as the Prisma adapter).
                     metadata: mergeBillingExtras(data.metadata ?? null, {
                         quantity: data.quantity,
+              binding: data.billing,
                         addOns: data.addOns,
                     }),
                     createdAt: now,
@@ -393,7 +496,8 @@ export function drizzleAdapter<TFeatures extends FeatureRegistry = FeatureRegist
                     schema.subscriptions.id,
                     id,
                     data.metadata,
-                    { quantity: data.quantity, addOns: data.addOns },
+                    { quantity: data.quantity, addOns: data.addOns, binding: data.billing },
+                    options?.dialect,
                 );
 
                 const set: Record<string, unknown> = { updatedAt: new Date() };
@@ -530,6 +634,7 @@ export function drizzleAdapter<TFeatures extends FeatureRegistry = FeatureRegist
             },
 
             async create(data: CreateInvoiceInput): Promise<Invoice> {
+        if (data.metadata && Object.hasOwn(data.metadata, BILLING_METADATA_KEY)) throw new Error('_billing is reserved metadata');
                 const { eq } = await loadOps();
 
                 // First, get the subscription to extract tenantId
@@ -593,6 +698,7 @@ export function drizzleAdapter<TFeatures extends FeatureRegistry = FeatureRegist
                         total: data.total,
                         creditNoteOfId: data.creditNoteOfId,
                     },
+                    options?.dialect,
                 );
 
                 const set: Record<string, unknown> = { updatedAt: new Date() };
@@ -637,16 +743,8 @@ export function drizzleAdapter<TFeatures extends FeatureRegistry = FeatureRegist
                     })
                     .returning({ value: schema.billingSequences.value });
 
-                let value = Number(returned[0]?.value ?? 0);
-                if (!value) {
-                    // Fallback for drivers without RETURNING support.
-                    const rows = await client
-                        .select({ value: schema.billingSequences.value })
-                        .from(schema.billingSequences)
-                        .where(eq(schema.billingSequences.prefix, prefix))
-                        .limit(1);
-                    value = Number(rows[0]?.value ?? 1);
-                }
+                const value = Number(returned[0]?.value);
+                if (!Number.isSafeInteger(value) || value < 1) throw new Error('Atomic invoice numbering requires RETURNING');
 
                 return `${prefix}${String(value).padStart(6, '0')}`;
             },
@@ -657,7 +755,7 @@ export function drizzleAdapter<TFeatures extends FeatureRegistry = FeatureRegist
             async get(
                 subscriberId: string,
                 feature: string,
-                options?: { period?: Date; tenantId?: string | null },
+                options?: UsagePeriodOptions & { period?: Date; tenantId?: string | null },
             ): Promise<number> {
                 const { and, eq, gte, lte } = await loadOps();
                 const now = options?.period ?? new Date();
@@ -671,7 +769,7 @@ export function drizzleAdapter<TFeatures extends FeatureRegistry = FeatureRegist
                             eq(schema.usageRecords.subscriberId, subscriberId),
                             eq(schema.usageRecords.tenantId, tenantId),
                             eq(schema.usageRecords.feature, feature),
-                            lte(schema.usageRecords.periodStart, now),
+                            options?.periodStart ? eq(schema.usageRecords.periodStart, options.periodStart) : lte(schema.usageRecords.periodStart, now),
                             gte(schema.usageRecords.periodEnd, now),
                         ),
                     )
@@ -682,20 +780,20 @@ export function drizzleAdapter<TFeatures extends FeatureRegistry = FeatureRegist
             async increment(
                 subscriberId: string,
                 feature: string,
-                options?: { count?: number; tenantId?: string | null },
+                options?: UsageMutationOptions,
             ): Promise<number> {
                 const { sql } = await loadOps();
                 const count = options?.count ?? 1;
+                validateUsageCount(count);
                 const tenantId = options?.tenantId ?? subscriberId;
                 const now = new Date();
-                const periodStart = getMonthStart(now);
-                const periodEnd = getMonthEnd(now);
+                const { periodStart, periodEnd } = usagePeriod(options);
 
                 // Atomic upsert: a single INSERT ... ON CONFLICT DO UPDATE, so
                 // concurrent increments never lose updates. The conflict target
                 // matches the unique index on
                 // (subscriberId, tenantId, feature, periodStart).
-                await client
+                const returned = await client
                     .insert(schema.usageRecords)
                     .values({
                         id: crypto.randomUUID(),
@@ -719,28 +817,44 @@ export function drizzleAdapter<TFeatures extends FeatureRegistry = FeatureRegist
                             count: sql`${schema.usageRecords.count} + ${count}`,
                             updatedAt: now,
                         },
-                    });
+                    }).returning({ count: schema.usageRecords.count });
 
-                return readUsageCount(client, schema, subscriberId, tenantId, feature, periodStart);
+                return Number(returned[0]?.count ?? 0);
+            },
+
+            async reserve(subscriberId: string, feature: string, options?: UsageReservationOptions) {
+                const { sql } = await loadOps(); const count = options?.count ?? 1;
+                validateUsageCount(count); validateUsageLimit(options?.limit);
+                const limit = options?.limit ?? Number.MAX_SAFE_INTEGER;
+                const tenantId = options?.tenantId ?? subscriberId;
+                const { periodStart, periodEnd } = usagePeriod(options);
+                if (count > limit) return { accepted: false, count: await readUsageCount(client,schema,subscriberId,tenantId,feature,periodStart) };
+                const now = new Date();
+                const rows = await client.insert(schema.usageRecords).values({id:crypto.randomUUID(),subscriberId,tenantId,feature,count,periodStart,periodEnd,createdAt:now,updatedAt:now})
+                    .onConflictDoUpdate({target:[schema.usageRecords.subscriberId,schema.usageRecords.tenantId,schema.usageRecords.feature,schema.usageRecords.periodStart],
+                        set:{count:sql`${schema.usageRecords.count}+${count}`,updatedAt:now},setWhere:sql`${schema.usageRecords.count} <= ${limit-count}`})
+                    .returning({count:schema.usageRecords.count});
+                return rows[0] ? {accepted:true,count:Number(rows[0].count)} : {accepted:false,count:await readUsageCount(client,schema,subscriberId,tenantId,feature,periodStart)};
             },
 
             async decrement(
                 subscriberId: string,
                 feature: string,
-                options?: { count?: number; tenantId?: string | null },
+                options?: UsageMutationOptions,
             ): Promise<number> {
                 const { and, eq, sql } = await loadOps();
                 const count = options?.count ?? 1;
+                validateUsageCount(count);
                 const tenantId = options?.tenantId ?? subscriberId;
                 const now = new Date();
-                const periodStart = getMonthStart(now);
+                const { periodStart } = usagePeriod(options);
 
                 // Atomic decrement that never drops below zero: a single guarded
                 // UPDATE floors the counter at 0, so concurrent decrements can
                 // neither lose updates nor go negative. The CASE expression is
                 // portable across SQLite and PostgreSQL (unlike scalar `max()`,
                 // which PostgreSQL does not provide).
-                await client
+                const returned = await client
                     .update(schema.usageRecords)
                     .set({
                         count: sql`case when ${schema.usageRecords.count} >= ${count} then ${schema.usageRecords.count} - ${count} else 0 end`,
@@ -753,9 +867,9 @@ export function drizzleAdapter<TFeatures extends FeatureRegistry = FeatureRegist
                             eq(schema.usageRecords.feature, feature),
                             eq(schema.usageRecords.periodStart, periodStart),
                         ),
-                    );
+                    ).returning({ count: schema.usageRecords.count });
 
-                return readUsageCount(client, schema, subscriberId, tenantId, feature, periodStart);
+                return Number(returned[0]?.count ?? 0);
             },
 
             async set(
@@ -763,11 +877,12 @@ export function drizzleAdapter<TFeatures extends FeatureRegistry = FeatureRegist
                 feature: string,
                 count: number,
                 tenantId?: string | null,
+                options?: UsagePeriodOptions,
             ): Promise<void> {
+                validateUsageCount(count, true);
                 const tid = tenantId ?? subscriberId;
                 const now = new Date();
-                const periodStart = getMonthStart(now);
-                const periodEnd = getMonthEnd(now);
+                const { periodStart, periodEnd } = usagePeriod(options);
 
                 await client
                     .insert(schema.usageRecords)
@@ -840,21 +955,25 @@ export function drizzleAdapter<TFeatures extends FeatureRegistry = FeatureRegist
         },
 
         // ==================== Transactions ====================
-        transaction<T>(fn: (tx: DatabaseAdapter<TFeatures>) => Promise<T>): Promise<T> {
-            // Async drivers (D1, libSQL/Turso, PG drivers) support async
-            // transaction callbacks and give a real transactional boundary.
-            // Synchronous drivers (bun:sqlite, better-sqlite3) execute
-            // statements serially on a single connection: the operations still
-            // run, but the commit boundary is best-effort because the async
-            // callback cannot be awaited by the driver. Use an async driver
-            // when strict transactional guarantees matter.
-            return client.transaction((tx: DrizzleDatabase) =>
-                fn(createAdapter(tx)),
-            ) as Promise<T>;
+        async transaction<T>(fn: (tx: DatabaseAdapter<TFeatures>) => Promise<T>): Promise<T> {
+            if (inTransaction) return fn(createAdapter(client, true));
+            if (mode === 'unsupported') throw new Error('This Drizzle driver does not support awaited async transactions; financial operations are unavailable');
+            if (mode === 'async') {
+                for(let attempt=0;;attempt++) {
+                    try { return await client.transaction((tx:DrizzleDatabase)=>fn(createAdapter(tx,true)),{isolationLevel:'serializable'}); }
+                    catch(error) {const code=(error as {code?:string;cause?:{code?:string}}).code??(error as {cause?:{code?:string}}).cause?.code;
+                        if(attempt>=4||!['40001','40P01','SQLITE_BUSY','SQLITE_BUSY_SNAPSHOT','23505'].includes(code??''))throw error;
+                    }
+                }
+            }
+            sqliteClient!.exec('BEGIN IMMEDIATE');
+            try { const result = await fn(createAdapter(client, true)); sqliteClient!.exec('COMMIT'); return result; }
+            catch (error) { sqliteClient!.exec('ROLLBACK'); throw error; }
         },
     });
 
-    return createAdapter(db);
+    const adapter = createAdapter(db);
+    return mode === 'sqlite' ? serialAdapter(adapter, run!) : adapter;
 }
 
 // ==================== Internal helpers ====================
@@ -953,32 +1072,26 @@ function extractBillingExtras<T extends Record<string, unknown>>(
  * row's metadata is loaded first so unrelated keys are not wiped out.
  */
 async function metadataForUpdate(
-    client: DrizzleDatabase,
-    table: any,
-    idColumn: any,
-    id: string,
-    provided: Record<string, unknown> | undefined,
-    extras: Record<string, unknown>,
-): Promise<Record<string, unknown> | null | undefined> {
-    const hasExtras = Object.values(extras).some((value) => value !== undefined);
-
-    if (provided === undefined && !hasExtras) {
-        return undefined;
+    _client: DrizzleDatabase, table: any, _idColumn: any, _id: string,
+    provided: Record<string, unknown> | undefined, extras: Record<string, unknown>,
+    dialect: 'sqlite' | 'postgresql' = 'sqlite',
+): Promise<any> {
+    const entries = Object.entries(extras).filter(([,value])=>value!==undefined);
+    if (provided === undefined && !entries.length) return undefined;
+    if (provided && Object.hasOwn(provided, BILLING_METADATA_KEY)) throw new Error('_billing is reserved metadata');
+    const {sql}=await loadOps();
+    if (dialect === 'postgresql') {
+        let billing:any=sql`coalesce(${table.metadata}::jsonb -> '_billing', '{}'::jsonb)`;
+        for(const [key,value] of entries) billing=sql`jsonb_set(${billing}, ARRAY[${key}], ${JSON.stringify(value)}::jsonb, true)`;
+        const publicPart=provided===undefined?sql`coalesce(${table.metadata}::jsonb, '{}'::jsonb)`:sql`${JSON.stringify(provided)}::jsonb`;
+        return sql`jsonb_set(${publicPart}, '{_billing}', ${billing}, true)`;
     }
-
-    let base = provided;
-    if (base === undefined) {
-        const { eq } = await loadOps();
-        const rows = await client
-            .select({ metadata: table.metadata })
-            .from(table)
-            .where(eq(idColumn, id))
-            .limit(1);
-        base =
-            parseJsonField<Record<string, unknown> | null>(rows[0]?.metadata, null) ?? undefined;
-    }
-
-    return mergeBillingExtras(base ?? null, extras);
+    // Construct from the row's current JSON inside the UPDATE: concurrent public
+    // replacement and billing changes cannot overwrite each other's reserved fields.
+    let billing:any=sql`coalesce(json_extract(${table.metadata}, '$._billing'), '{}')`;
+    for(const [key,value] of entries) billing=sql`json_set(${billing}, ${'$.'+key}, json(${JSON.stringify(value)}))`;
+    const publicPart=provided===undefined?sql`coalesce(${table.metadata}, '{}')`:sql`json(${JSON.stringify(provided)})`;
+    return sql`json_set(${publicPart}, '$._billing', json(${billing}))`;
 }
 
 /**
@@ -1043,6 +1156,7 @@ function mapPlanFromDrizzle<TFeatures extends FeatureRegistry>(row: any): Plan<T
 function mapSubscriptionFromDrizzle(row: any): Subscription {
     const { metadata, extras } = extractBillingExtras<{
         quantity?: number;
+        binding?: Subscription['billing'];
         addOns?: string[];
     }>(row.metadata);
     const quantity = row.quantity ?? extras.quantity;
@@ -1064,6 +1178,7 @@ function mapSubscriptionFromDrizzle(row: any): Subscription {
         gatewayCustomerId: row.gatewayCustomerId ?? null,
         ...(quantity !== undefined && quantity !== null ? { quantity } : {}),
         ...(addOns ? { addOns } : {}),
+    ...(extras.binding && {billing:extras.binding}),
         metadata,
         createdAt: toDate(row.createdAt),
         updatedAt: toDate(row.updatedAt),

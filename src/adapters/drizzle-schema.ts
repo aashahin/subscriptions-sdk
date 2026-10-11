@@ -18,6 +18,7 @@ import {
   text,
   uniqueIndex,
 } from 'drizzle-orm/sqlite-core';
+import type { ProviderResourceMapping } from './database.adapter.js';
 import type {
   BillingInterval,
   InvoiceLineItem,
@@ -189,6 +190,60 @@ export const billingSequences = sqliteTable('billing_sequences', {
     .$defaultFn(() => new Date()),
 });
 
+/** Immutable provider-scoped identifiers, separate for every resource kind. */
+export const providerResources = sqliteTable('provider_resources', {
+  providerId: text('provider_id').notNull(),
+  accountId: text('account_id').notNull(),
+  environment: text('environment').$type<ProviderResourceMapping['environment']>().notNull(),
+  kind: text('kind').$type<ProviderResourceMapping['kind']>().notNull(),
+  localId: text('local_id').notNull(),
+  externalId: text('external_id').notNull(),
+}, table => [
+  uniqueIndex('provider_resources_scope_external_unique').on(table.providerId,table.accountId,table.environment,table.kind,table.externalId),
+  uniqueIndex('provider_resources_scope_local_unique').on(table.providerId,table.accountId,table.environment,table.kind,table.localId),
+]);
+
+/** Local billing attempts and webhook acceptance keys. Payload contains immutable quotes/bindings. */
+export const billingOperations = sqliteTable('billing_operations', {
+  key: text('key').primaryKey(),
+  status: text('status').notNull(),
+  payload: text('payload', { mode: 'json' }).$type<Record<string, unknown>>().notNull(),
+  createdAt: integer('created_at', { mode: 'timestamp_ms' }).notNull().$defaultFn(() => new Date()),
+  updatedAt: integer('updated_at', { mode: 'timestamp_ms' }).notNull().$defaultFn(() => new Date()),
+});
+
+/** Stable event id is the deduplication key. Claims expire so a crashed relay can retry. */
+export const billingOutbox = sqliteTable('billing_outbox', {
+  id: text('id').primaryKey(),
+  event: text('event', { mode: 'json' }).$type<Record<string, unknown>>().notNull(),
+  status: text('status').notNull().default('pending'),
+  claimedAt: integer('claimed_at', { mode: 'timestamp_ms' }),
+});
+
+export const coupons = sqliteTable('coupons', {
+  id: text('id').primaryKey(),
+  code: text('code').notNull().unique(),
+  type: text('type').notNull(),
+  value: real('value').notNull(),
+  currency: text('currency'),
+  duration: text('duration').notNull().default('once'),
+  durationInMonths: integer('duration_in_months'),
+  maxRedemptions: integer('max_redemptions'),
+  expiresAt: integer('expires_at', { mode: 'timestamp_ms' }),
+  isActive: integer('is_active', { mode: 'boolean' }).notNull().default(true),
+  timesRedeemed: integer('times_redeemed').notNull().default(0),
+  metadata: text('metadata', { mode: 'json' }).$type<Record<string, unknown> | null>(),
+  createdAt: integer('created_at', { mode: 'timestamp_ms' }).notNull().$defaultFn(() => new Date()),
+  updatedAt: integer('updated_at', { mode: 'timestamp_ms' }).notNull().$defaultFn(() => new Date()),
+});
+
+export const couponRedemptions = sqliteTable('coupon_redemptions', {
+  purchaseId: text('purchase_id').primaryKey(),
+  couponId: text('coupon_id').notNull().references(() => coupons.id),
+  couponSnapshot: text('coupon_snapshot', {mode:'json'}).$type<Record<string,unknown>>().notNull(),
+  status: text('status').notNull().default('reserved'),
+});
+
 /**
  * Schema object ready to pass to `drizzle(client, { schema })`.
  */
@@ -198,6 +253,11 @@ export const subscriptionsSchema = {
   invoices,
   usageRecords,
   billingSequences,
+  billingOperations,
+  providerResources,
+  billingOutbox,
+  coupons,
+  couponRedemptions,
 } as const;
 
 export type SubscriptionsSchema = typeof subscriptionsSchema;

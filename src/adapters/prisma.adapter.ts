@@ -23,7 +23,10 @@ import type {
     UpdateSubscriptionInput,
     UsageRecord,
 } from "../core/types.js";
+import { jsonData, hydrateCoupon, usagePeriod, validateUsageCount, validateUsageLimit, validateProviderResource, providerResourceScope } from './persistence-utils.js';
+import type { OutboxRecord } from './outbox.adapter.js';
 import type {
+    BillingOperationRecord, ProviderResourceMapping, ProviderResourceScope, UsageMutationOptions, UsagePeriodOptions, UsageReservationOptions,
     DatabaseAdapter,
     PlanQueryOptions,
     SubscriptionQueryOptions,
@@ -42,8 +45,12 @@ type PrismaClient = {
   invoice: any;
   usageRecord: any;
   coupon?: any;
+  couponRedemption?: any;
+  billingOperation?: any;
+  providerResource?: any;
+  billingOutbox?: any;
   billingSequence?: any;
-  $transaction: <T>(fn: (tx: any) => Promise<T>) => Promise<T>;
+  $transaction: <T>(fn: (tx: any) => Promise<T>, options?: { isolationLevel: string }) => Promise<T>;
 };
 
 /**
@@ -79,12 +86,50 @@ export function prismaAdapter<TFeatures extends FeatureRegistry>(
   prisma: PrismaClient,
   _options?: PrismaAdapterOptions,
 ): DatabaseAdapter<TFeatures> {
-  const createAdapter = (client: PrismaClient): DatabaseAdapter<TFeatures> => {
+  const transact = async <T>(fn: (tx: DatabaseAdapter<TFeatures>) => Promise<T>): Promise<T> => {
+    for (let attempt = 0; ; attempt++) {
+      try { return await prisma.$transaction(tx => fn(createAdapter(tx, true)), { isolationLevel: 'Serializable' }); }
+      catch (error) { if (attempt >= 4 || !['P2034','P2002'].includes((error as {code?:string}).code ?? '')) throw error; }
+    }
+  };
+  const createAdapter = (client: PrismaClient, inTransaction = false): DatabaseAdapter<TFeatures> => {
     // Optional coupon persistence — undefined when the Prisma schema has no
     // Coupon model, so CouponsService can raise a helpful setup error.
-    const coupons = createCouponsSection(client);
+    const coupons = createCouponsSection(client, inTransaction, transact);
 
     return {
+    capabilities: { asyncTransactions: typeof prisma.$transaction === 'function' },
+    ...(client.providerResource ? { providerResources: {
+      async bind(mapping:ProviderResourceMapping) {
+        const scope=providerResourceScope(mapping);validateProviderResource(scope,mapping.localId);validateProviderResource(scope,mapping.externalId);
+        const row=await client.providerResource.upsert({where:{providerScopeExternal:{...scope,externalId:mapping.externalId}},create:mapping,update:{}});
+        if(row.localId!==mapping.localId)throw new Error('Provider resource is already bound to another local identity');
+        return row as ProviderResourceMapping;
+      },
+      async findByExternal(scope:ProviderResourceScope,externalId:string) {validateProviderResource(scope,externalId);return await client.providerResource.findUnique({where:{providerScopeExternal:{...scope,externalId}}}) as ProviderResourceMapping|null;},
+      async findByLocal(scope:ProviderResourceScope,localId:string) {validateProviderResource(scope,localId);return await client.providerResource.findUnique({where:{providerScopeLocal:{...scope,localId}}}) as ProviderResourceMapping|null;},
+    }} : {}),
+    ...(client.billingOperation ? { billingOperations: {
+      async reserve(key: string,payload: Record<string,unknown>) {
+        const reservationId=crypto.randomUUID(); const row=await client.billingOperation.upsert({where:{key},create:{key,payload:jsonData(payload),status:'reserved',reservationId},update:{}});
+        return {created:row.reservationId===reservationId,record:row as BillingOperationRecord};
+      },
+      async find(key: string) {return await client.billingOperation.findUnique({where:{key}}) as BillingOperationRecord|null;},
+      async update(key:string,data:{status:BillingOperationRecord['status'];payload?:Record<string,unknown>}) {return await client.billingOperation.update({where:{key},data:jsonData(data)}) as BillingOperationRecord;},
+      async compareAndSet(key:string,expectedStatus:BillingOperationRecord['status'],data:{status:BillingOperationRecord['status'];payload?:Record<string,unknown>}) {const result=await client.billingOperation.updateMany({where:{key,status:expectedStatus},data:jsonData(data)});return result.count===1;},
+    }} : {}),
+    ...(client.billingOutbox ? { outbox: {
+      async insert(record:OutboxRecord) {await client.billingOutbox.upsert({where:{id:record.id},create:{id:record.id,event:jsonData(record),status:'pending'},update:{}});},
+      async claimPending(limit=100) {
+        const now=new Date();const claimToken=crypto.randomUUID();const eligible={OR:[{status:'pending'},{status:'claimed',claimedAt:{lt:new Date(now.getTime()-300000)}}]};
+        const candidates=await client.billingOutbox.findMany({where:eligible,take:limit,select:{id:true}});
+        if(!candidates.length)return [];
+        await client.billingOutbox.updateMany({where:{...eligible,id:{in:candidates.map((r:any)=>r.id)}},data:{status:'claimed',claimedAt:now,claimToken}});
+        const rows=await client.billingOutbox.findMany({where:{claimToken}});return rows.map((row:any)=>({...row.event,occurredAt:new Date(row.event.occurredAt)})) as OutboxRecord[];
+      },
+      async releaseClaim(id:string) {await client.billingOutbox.updateMany({where:{id,status:'claimed'},data:{status:'pending',claimedAt:null,claimToken:null}});},
+      async markSent(id:string) {await client.billingOutbox.update({where:{id},data:{status:'sent',claimedAt:null,claimToken:null}});},
+    }} : {}),
     // ==================== Plans ====================
     plans: {
       async findById(id: string): Promise<Plan<TFeatures> | null> {
@@ -134,6 +179,7 @@ export function prismaAdapter<TFeatures extends FeatureRegistry>(
       },
 
       async create(data: CreatePlanInput<TFeatures>): Promise<Plan<TFeatures>> {
+        if (data.metadata && Object.hasOwn(data.metadata, BILLING_METADATA_KEY)) throw new Error('_billing is reserved metadata');
         const plan = await client.subscriptionPlan.create({
           data: {
             name: data.name,
@@ -160,6 +206,7 @@ export function prismaAdapter<TFeatures extends FeatureRegistry>(
         id: string,
         data: UpdatePlanInput<TFeatures>,
       ): Promise<Plan<TFeatures>> {
+        if (!inTransaction) return transact(tx => tx.plans.update(id,data));
         const metadata = await metadataForUpdate(
           client.subscriptionPlan,
           id,
@@ -275,6 +322,7 @@ export function prismaAdapter<TFeatures extends FeatureRegistry>(
       },
 
       async create(data: CreateSubscriptionInput): Promise<Subscription> {
+        if (data.metadata && Object.hasOwn(data.metadata, BILLING_METADATA_KEY)) throw new Error('_billing is reserved metadata');
         const now = new Date();
         const subscription = await client.subscription.create({
           data: {
@@ -294,6 +342,7 @@ export function prismaAdapter<TFeatures extends FeatureRegistry>(
             // they are persisted inside the metadata JSON column.
             metadata: mergeBillingExtras(data.metadata ?? null, {
               quantity: data.quantity,
+              binding: data.billing,
               addOns: data.addOns,
             }),
           },
@@ -305,11 +354,12 @@ export function prismaAdapter<TFeatures extends FeatureRegistry>(
         id: string,
         data: UpdateSubscriptionInput,
       ): Promise<Subscription> {
+        if (!inTransaction) return transact(tx => tx.subscriptions.update(id,data));
         const metadata = await metadataForUpdate(
           client.subscription,
           id,
           data.metadata,
-          { quantity: data.quantity, addOns: data.addOns },
+          { quantity: data.quantity, addOns: data.addOns, binding: data.billing },
         );
 
         const subscription = await client.subscription.update({
@@ -430,6 +480,7 @@ export function prismaAdapter<TFeatures extends FeatureRegistry>(
       },
 
       async create(data: CreateInvoiceInput): Promise<Invoice> {
+        if (data.metadata && Object.hasOwn(data.metadata, BILLING_METADATA_KEY)) throw new Error('_billing is reserved metadata');
         // First, get the subscription to extract tenantId
         const subscription = await client.subscription.findUnique({
           where: { id: data.subscriptionId },
@@ -469,6 +520,7 @@ export function prismaAdapter<TFeatures extends FeatureRegistry>(
       },
 
       async update(id: string, data: UpdateInvoiceInput): Promise<Invoice> {
+        if (!inTransaction) return transact(tx => tx.invoices.update(id,data));
         const metadata = await metadataForUpdate(client.invoice, id, data.metadata, {
           invoiceNumber: data.invoiceNumber,
           subtotal: data.subtotal,
@@ -508,12 +560,7 @@ export function prismaAdapter<TFeatures extends FeatureRegistry>(
           return `${prefix}${String(row.value).padStart(6, "0")}`;
         }
 
-        // Fallback when the BillingSequence model is not present: derive the
-        // next number from the current invoice count. This is NOT
-        // concurrency-safe — add the BillingSequence model for strictly
-        // sequential, gap-free numbering.
-        const count = await client.invoice.count();
-        return `${prefix}${String(count + 1).padStart(6, "0")}`;
+        throw new Error('Atomic invoice numbering requires the BillingSequence model; migrate the schema');
       },
     },
 
@@ -522,7 +569,7 @@ export function prismaAdapter<TFeatures extends FeatureRegistry>(
       async get(
         subscriberId: string,
         feature: string,
-        options?: { period?: Date; tenantId?: string | null },
+        options?: UsagePeriodOptions & { period?: Date; tenantId?: string | null },
       ): Promise<number> {
         const now = options?.period ?? new Date();
         const tenantId = options?.tenantId ?? subscriberId;
@@ -532,7 +579,7 @@ export function prismaAdapter<TFeatures extends FeatureRegistry>(
             subscriberId,
             tenantId: tenantId,
             feature,
-            periodStart: { lte: now },
+            periodStart: options?.periodStart ?? { lte: now },
             periodEnd: { gte: now },
           },
         });
@@ -542,13 +589,13 @@ export function prismaAdapter<TFeatures extends FeatureRegistry>(
       async increment(
         subscriberId: string,
         feature: string,
-        options?: { count?: number; tenantId?: string | null },
+        options?: UsageMutationOptions,
       ): Promise<number> {
         const count = options?.count ?? 1;
+        validateUsageCount(count);
         const tenantId = options?.tenantId ?? subscriberId;
         const now = new Date();
-        const periodStart = getMonthStart(now);
-        const periodEnd = getMonthEnd(now);
+        const { periodStart, periodEnd } = usagePeriod(options);
 
         const record = await client.usageRecord.upsert({
           where: {
@@ -575,15 +622,28 @@ export function prismaAdapter<TFeatures extends FeatureRegistry>(
         return record.count;
       },
 
+      async reserve(subscriberId:string,feature:string,options?:UsageReservationOptions) {
+        if(!inTransaction)return transact(tx=>tx.usage.reserve!(subscriberId,feature,options));
+        const count=options?.count??1;validateUsageCount(count);validateUsageLimit(options?.limit);
+        const limit=options?.limit??Number.MAX_SAFE_INTEGER;const tenantId=options?.tenantId??subscriberId;const {periodStart,periodEnd}=usagePeriod(options);
+        const key={subscriberId,tenantId,feature,periodStart};
+        await client.usageRecord.upsert({where:{subscriberId_tenantId_feature_periodStart:key},create:{...key,count:0,periodEnd},update:{}});
+        const result=await client.usageRecord.updateMany({where:{...key,count:{lte:limit-count}},data:{count:{increment:count}}});
+        const row=await client.usageRecord.findUnique({where:{subscriberId_tenantId_feature_periodStart:key}});
+        return {accepted:result.count===1,count:row.count};
+      },
+
       async decrement(
         subscriberId: string,
         feature: string,
-        options?: { count?: number; tenantId?: string | null },
+        options?: UsageMutationOptions,
       ): Promise<number> {
+        if (!inTransaction) return transact(tx => tx.usage.decrement(subscriberId,feature,options));
         const count = options?.count ?? 1;
+        validateUsageCount(count);
         const tenantId = options?.tenantId ?? subscriberId;
         const now = new Date();
-        const periodStart = getMonthStart(now);
+        const { periodStart } = usagePeriod(options);
 
         // Atomic decrement that never drops below zero.
         //
@@ -608,7 +668,7 @@ export function prismaAdapter<TFeatures extends FeatureRegistry>(
           });
         }
 
-        return this.get(subscriberId, feature, { tenantId });
+        return this.get(subscriberId, feature, { tenantId, ...usagePeriod(options) });
       },
 
       async set(
@@ -616,11 +676,12 @@ export function prismaAdapter<TFeatures extends FeatureRegistry>(
         feature: string,
         count: number,
         tenantId?: string | null,
+        options?: UsagePeriodOptions,
       ): Promise<void> {
+        validateUsageCount(count,true);
         const tid = tenantId ?? subscriberId;
         const now = new Date();
-        const periodStart = getMonthStart(now);
-        const periodEnd = getMonthEnd(now);
+        const { periodStart, periodEnd } = usagePeriod(options);
 
         await client.usageRecord.upsert({
           where: {
@@ -681,10 +742,8 @@ export function prismaAdapter<TFeatures extends FeatureRegistry>(
     transaction<T>(
       fn: (tx: DatabaseAdapter<TFeatures>) => Promise<T>,
     ): Promise<T> {
-      return prisma.$transaction(async (txClient) => {
-        const txAdapter = createAdapter(txClient);
-        return fn(txAdapter);
-      });
+      if (inTransaction) return fn(createAdapter(client, true));
+      return transact(fn);
     },
 
     // ==================== Coupons (optional) ====================
@@ -797,18 +856,11 @@ async function metadataForUpdate(
     return undefined;
   }
 
-  let base = provided;
-  if (base === undefined) {
-    const existing = await model.findUnique({
-      where: { id },
-      select: { metadata: true },
-    });
-    base =
-      parseJsonField<Record<string, unknown> | null>(
-        existing?.metadata,
-        null,
-      ) ?? undefined;
-  }
+  if (provided && Object.hasOwn(provided, BILLING_METADATA_KEY)) throw new Error('_billing is reserved metadata');
+  const existing = await model.findUnique({where:{id},select:{metadata:true}});
+  const stored=parseJsonField<Record<string,unknown>|null>(existing?.metadata,null);
+  const reserved=(stored?.[BILLING_METADATA_KEY]??{}) as Record<string,unknown>;
+  const base=provided===undefined?stored:{...provided,[BILLING_METADATA_KEY]:reserved};
 
   return mergeBillingExtras(base ?? null, extras);
 }
@@ -847,6 +899,7 @@ function mapPlanFromPrisma<TFeatures extends FeatureRegistry>(
 function mapSubscriptionFromPrisma(subscription: any): Subscription {
   const { metadata, extras } = extractBillingExtras<{
     quantity?: number;
+    binding?: Subscription['billing'];
     addOns?: string[];
   }>(subscription.metadata);
   const quantity = subscription.quantity ?? extras.quantity;
@@ -868,6 +921,7 @@ function mapSubscriptionFromPrisma(subscription: any): Subscription {
     gatewayCustomerId: subscription.gatewayCustomerId,
     ...(quantity !== undefined && quantity !== null ? { quantity } : {}),
     ...(addOns ? { addOns } : {}),
+    ...(extras.binding && {billing:extras.binding}),
     metadata,
     createdAt: subscription.createdAt,
     updatedAt: subscription.updatedAt,
@@ -962,6 +1016,8 @@ function mapCouponFromPrisma(coupon: any): Coupon {
  */
 function createCouponsSection(
   client: PrismaClient,
+  inTransaction: boolean,
+  transact: <T>(fn: (tx: DatabaseAdapter<any>)=>Promise<T>)=>Promise<T>,
 ): NonNullable<DatabaseAdapter["coupons"]> | undefined {
   if (!client.coupon) {
     return undefined;
@@ -1019,12 +1075,27 @@ function createCouponsSection(
       return mapCouponFromPrisma(coupon);
     },
 
-    async incrementRedemptions(id: string): Promise<Coupon> {
-      const coupon = await client.coupon.update({
-        where: { id },
-        data: { timesRedeemed: { increment: 1 } },
-      });
-      return mapCouponFromPrisma(coupon);
+    async incrementRedemptions() { throw new Error('Coupon redemption requires a purchaseId; use redeem()'); },
+    async reserveRedemption(id,purchaseId,options) {return this.redeem!(id,purchaseId,options);},
+    async redeem(id,purchaseId,options) {
+      if(!purchaseId)throw new Error('Coupon redemption requires a purchaseId');
+      if(!client.couponRedemption)throw new Error('Coupon redemption requires the CouponRedemption model; migrate the schema');
+      if(!inTransaction)return transact(tx=>tx.coupons!.redeem!(id,purchaseId,options));
+      const existing=await client.couponRedemption.findUnique({where:{purchaseId}});
+      if(existing){if(existing.couponId!==id)throw new Error('Purchase already bound to another coupon');return existing.status==='reserved'?hydrateCoupon(existing.couponSnapshot as Coupon):null;}
+      const coupon=await client.coupon.findUnique({where:{id}});if(!coupon)return null;
+      const now=options?.now??new Date();
+      const result=await client.coupon.updateMany({where:{id,isActive:true,OR:[{expiresAt:null},{expiresAt:{gt:now}}],...(coupon.maxRedemptions!==null?{timesRedeemed:{lt:coupon.maxRedemptions}}:{})},data:{timesRedeemed:{increment:1}}});
+      if(!result.count)return null;
+      const redeemed=await this.findById(id);
+      await client.couponRedemption.create({data:{purchaseId,couponId:id,status:'reserved',couponSnapshot:jsonData(redeemed)}});
+      return redeemed;
+    },
+    async releaseRedemption(id,purchaseId) {
+      if(!client.couponRedemption)throw new Error('Coupon release requires the CouponRedemption model');
+      if(!inTransaction)return transact(tx=>tx.coupons!.releaseRedemption!(id,purchaseId));
+      const result=await client.couponRedemption.updateMany({where:{purchaseId,couponId:id,status:'reserved'},data:{status:'released'}});
+      if(result.count)await client.coupon.update({where:{id},data:{timesRedeemed:{decrement:1}}});
     },
   };
 }

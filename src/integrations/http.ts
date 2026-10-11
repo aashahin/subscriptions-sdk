@@ -18,6 +18,33 @@ export type SubscriberInfoResolver = (
   subscriberId: string,
 ) => Promise<SubscriptionInvoiceData["subscriber"] | null>;
 
+/** Operation names supplied to host authorization policies. */
+export type SubscriptionOperation =
+  | "current"
+  | "subscribe"
+  | "cancel"
+  | "change-plan"
+  | "preview-change-plan"
+  | "resume"
+  | "reactivate"
+  | "features"
+  | "usage"
+  | "can"
+  | "invoices"
+  | "invoice"
+  | "consume-usage";
+
+/** Provider verification errors belong to the request; outages stay retryable. */
+export function webhookFailureStatus(error: unknown): 400 | 401 | undefined {
+  const code = error && typeof error === "object" && "code" in error ? error.code : undefined;
+  if (code === "WEBHOOK_SECRET_INVALID" || code === "WEBHOOK_SCOPE_MISMATCH") return 401;
+  if (error instanceof SyntaxError ||
+    (error instanceof Error && /signature|verification|invalid (webhook|payload)|unknown payment provider/i.test(error.message))) {
+    return 400;
+  }
+  return undefined;
+}
+
 /**
  * Options for the web-standard HTTP handler
  */
@@ -32,17 +59,26 @@ export interface SubscriptionsHttpOptions {
   prefix?: string;
 
   /**
-   * Resolve the subscriber ID for the incoming request.
-   * Defaults to reading the `x-subscriber-id` header.
+   * Resolve the subscriber ID from a trusted authenticated session.
+   * Subscriber routes return 401 when this is absent or cannot resolve an ID.
+   * The resolver must validate tenant membership when authorizeSubscriber is
+   * omitted; an incoming subscriber header is not authentication.
    */
   getSubscriberId?: (
     request: Request,
   ) => string | null | undefined | Promise<string | null | undefined>;
 
+  /** Validate tenant membership and permission for each subscriber operation. */
+  authorizeSubscriber?: (
+    request: Request,
+    subscriberId: string,
+    operation: SubscriptionOperation,
+  ) => boolean | Promise<boolean>;
+
   /**
-   * Header carrying the webhook signature for `POST /webhooks/:provider`.
-   * Falls back to common gateway headers (`x-moyasar-signature`,
-   * `stripe-signature`, `x-webhook-signature`) when absent.
+   * Optional signature header hint for `POST /webhooks/:provider`.
+   * All headers and the raw body are sent to provider-specific verification;
+   * providers such as Moyasar authenticate a body secret instead.
    * @default 'x-signature'
    */
   webhookSignatureHeader?: string;
@@ -123,6 +159,7 @@ interface Route {
   pattern: string[];
   /** Whether a subscriber ID is required (401 when unresolved) */
   auth: boolean;
+  operation?: SubscriptionOperation;
   handler: RouteHandler;
 }
 
@@ -134,9 +171,10 @@ interface Route {
  * Routes (under `options.prefix`, default `/subscriptions`):
  * - `GET  /plans`               — list active plans
  * - `GET  /current`             — current subscription for the subscriber
- * - `POST /subscribe`           — `{ planId, trialDays?, verifiedTokenId?, paymentId? }`
+ * - `POST /subscribe`           — `{ planId }`; trusted self-service policy
  * - `POST /cancel`              — `{ immediately?, reason? }`
- * - `POST /change-plan`         — `{ planId, ... }`
+ * - `GET /change-plan/preview/:planId` — trusted quote for a plan change
+ * - `POST /change-plan`         — `{ planId, quoteId, immediately?, prorate? }`
  * - `GET  /usage`               — usage for all limit features
  * - `GET  /invoices`            — invoices for the subscriber
  * - `GET  /invoices/:id`        — invoice as HTML (`?print=1` / `?autoPrint=1`
@@ -147,7 +185,7 @@ interface Route {
  * @example
  * ```typescript
  * const handler = createSubscriptionsHttpHandler(subs, {
- *   getSubscriberId: (req) => req.headers.get('x-tenant-id'),
+ *   getSubscriberId: async (req) => (await authenticate(req))?.subscriberId,
  * });
  *
  * // Cloudflare Workers / plain fetch
@@ -162,8 +200,7 @@ export function createSubscriptionsHttpHandler<
 ): SubscriptionsHttpHandler {
   const prefix = options?.prefix ?? "/subscriptions";
   const getSubscriberId =
-    options?.getSubscriberId ??
-    ((request: Request) => request.headers.get("x-subscriber-id"));
+    options?.getSubscriberId ?? (() => null);
   const webhookSignatureHeader =
     options?.webhookSignatureHeader ?? "x-signature";
 
@@ -211,6 +248,28 @@ export function createSubscriptionsHttpHandler<
       return {};
     } catch {
       return {};
+    }
+  };
+
+  const rejectUnknownFields = (
+    body: Record<string, unknown>,
+    allowed: string[],
+  ): void => {
+    const unknown = Object.keys(body).find((field) => !allowed.includes(field));
+    if (unknown) {
+      throw new SubscriptionError(
+        `Public request field is not allowed: ${unknown}`,
+        "INVALID_PUBLIC_INPUT",
+        400,
+      );
+    }
+  };
+
+  const validateBooleanFields = (body: Record<string, unknown>, fields: string[]): void => {
+    for (const field of fields) {
+      if (field in body && typeof body[field] !== "boolean") {
+        throw new SubscriptionError(`${field} must be a boolean`, "INVALID_PUBLIC_INPUT", 400);
+      }
     }
   };
 
@@ -276,40 +335,14 @@ export function createSubscriptionsHttpHandler<
     subscriberId,
   ) => {
     const body = await readJsonBody(request);
+    rejectUnknownFields(body, ["planId"]);
     const planId = body.planId;
     if (typeof planId !== "string" || !planId) {
       return json({ error: "planId is required" }, 400);
     }
-    const trialDays = body.trialDays;
-    const verifiedTokenId = body.verifiedTokenId;
-    const paymentId = body.paymentId;
-
-    // Throws PlanNotFoundError (404) when the plan does not exist.
-    const plan = await subs.plans.get(planId);
-
-    const effectiveTrialDays =
-      typeof trialDays === "number" ? trialDays : plan.trialDays;
-
-    // The service is the single source of truth for invoicing. When the
-    // frontend already collected payment (verifiedTokenId + paymentId), tell
-    // the service to record the initial invoice as paid.
-    const paidExternally =
-      typeof verifiedTokenId === "string" &&
-      !!verifiedTokenId &&
-      typeof paymentId === "string" &&
-      !!paymentId;
-
-    const subscription = await subs.subscriptions.create(
+    const subscription = await subs.subscriptions.createSelfService(
       subscriberId as string,
       planId,
-      {
-        ...(effectiveTrialDays > 0 && { trialDays: effectiveTrialDays }),
-        ...(typeof verifiedTokenId === "string" &&
-          verifiedTokenId && { gatewayCustomerId: verifiedTokenId }),
-        ...(paidExternally && { paidExternally: true }),
-        ...(typeof paymentId === "string" &&
-          paymentId && { gatewayInvoiceId: paymentId }),
-      },
     );
 
     return json({ subscription }, 201);
@@ -321,6 +354,8 @@ export function createSubscriptionsHttpHandler<
     subscriberId,
   ) => {
     const body = await readJsonBody(request);
+    rejectUnknownFields(body, ["immediately", "reason"]);
+    validateBooleanFields(body, ["immediately"]);
     const subscription = await subs.subscriptions.cancel(
       subscriberId as string,
       {
@@ -339,12 +374,15 @@ export function createSubscriptionsHttpHandler<
     subscriberId,
   ) => {
     const body = await readJsonBody(request);
+    rejectUnknownFields(body, ["planId", "immediately", "prorate", "quoteId"]);
+    validateBooleanFields(body, ["immediately", "prorate"]);
     const planId = body.planId;
     if (typeof planId !== "string" || !planId) {
       return json({ error: "planId is required" }, 400);
     }
-    // The service creates the upgrade invoice itself; pass payment references
-    // through so it can record an externally-collected payment on that invoice.
+    if (typeof body.quoteId !== "string" || !body.quoteId) {
+      return json({ error: "quoteId is required; preview the plan change first" }, 400);
+    }
     const result = await subs.subscriptions.changePlan(
       subscriberId as string,
       planId,
@@ -353,20 +391,28 @@ export function createSubscriptionsHttpHandler<
           immediately: body.immediately,
         }),
         ...(typeof body.prorate === "boolean" && { prorate: body.prorate }),
-        ...(typeof body.tokenId === "string" && { tokenId: body.tokenId }),
-        ...(typeof body.callbackUrl === "string" && {
-          callbackUrl: body.callbackUrl,
-        }),
-        ...(typeof body.skipPayment === "boolean" && {
-          skipPayment: body.skipPayment,
-        }),
-        ...(typeof body.verifiedTokenId === "string" &&
-          body.verifiedTokenId && { verifiedTokenId: body.verifiedTokenId }),
-        ...(typeof body.paymentId === "string" &&
-          body.paymentId && { gatewayInvoiceId: body.paymentId }),
+        quoteId: body.quoteId,
       },
     );
     return json(result);
+  };
+
+  const previewChangePlan: RouteHandler = async (request, params, subscriberId) => {
+    const query = new URL(request.url).searchParams;
+    for (const field of ["immediately", "prorate"]) {
+      if (query.has(field) && query.get(field) !== "true" && query.get(field) !== "false") {
+        throw new SubscriptionError(`${field} must be true or false`, "INVALID_PUBLIC_INPUT", 400);
+      }
+    }
+    const preview = await subs.subscriptions.previewChangePlan(
+      subscriberId as string,
+      params.planId as string,
+      {
+        ...(query.has("immediately") && { immediately: query.get("immediately") === "true" }),
+        ...(query.has("prorate") && { prorate: query.get("prorate") === "true" }),
+      },
+    );
+    return json({ preview });
   };
 
   const getUsage: RouteHandler = async (
@@ -525,24 +571,20 @@ export function createSubscriptionsHttpHandler<
   ) => {
     const provider = params.provider as string;
     const signature = extractWebhookSignature(request.headers);
-    if (!signature) {
-      return json({ error: "Missing webhook signature" }, 400);
-    }
     const body = await request.text();
     try {
-      const event = await subs.handleWebhook(provider, body, signature);
+      const event = await subs.handleWebhook(provider, body, signature ?? "", {
+        headers: Object.fromEntries(request.headers.entries()),
+      });
       return json({ received: true, eventId: event.id });
     } catch (error) {
       const message =
         error instanceof Error ? error.message : "Webhook handling failed";
-      const isVerificationFailure =
-        /signature|verification|invalid (webhook|payload)|unknown payment provider/i.test(
-          message,
-        );
-      if (!isVerificationFailure) {
+      const status = webhookFailureStatus(error);
+      if (!status) {
         return errorResponse(error);
       }
-      return json({ error: message }, 400);
+      return json({ error: message }, status);
     }
   };
 
@@ -550,26 +592,36 @@ export function createSubscriptionsHttpHandler<
 
   const routes: Route[] = [
     { method: "GET", pattern: ["plans"], auth: false, handler: listPlans },
-    { method: "GET", pattern: ["current"], auth: true, handler: getCurrent },
-    { method: "POST", pattern: ["subscribe"], auth: true, handler: subscribe },
-    { method: "POST", pattern: ["cancel"], auth: true, handler: cancel },
+    { method: "GET", pattern: ["current"], auth: true, operation: "current", handler: getCurrent },
+    { method: "POST", pattern: ["subscribe"], auth: true, operation: "subscribe", handler: subscribe },
+    { method: "POST", pattern: ["cancel"], auth: true, operation: "cancel", handler: cancel },
     {
       method: "POST",
       pattern: ["change-plan"],
       auth: true,
+      operation: "change-plan",
       handler: changePlan,
     },
-    { method: "GET", pattern: ["usage"], auth: true, handler: getUsage },
+    {
+      method: "GET",
+      pattern: ["change-plan", "preview", ":planId"],
+      auth: true,
+      operation: "preview-change-plan",
+      handler: previewChangePlan,
+    },
+    { method: "GET", pattern: ["usage"], auth: true, operation: "usage", handler: getUsage },
     {
       method: "GET",
       pattern: ["invoices"],
       auth: true,
+      operation: "invoices",
       handler: listInvoices,
     },
     {
       method: "GET",
       pattern: ["invoices", ":id"],
       auth: true,
+      operation: "invoice",
       handler: getInvoiceHtml,
     },
     {
@@ -614,10 +666,14 @@ export function createSubscriptionsHttpHandler<
       let subscriberId: string | null = null;
       if (matched.route.auth) {
         const resolved = await getSubscriberId(request);
-        if (!resolved) {
+        if (typeof resolved !== "string" || !resolved.trim()) {
           return json({ error: "Unauthorized" }, 401);
         }
         subscriberId = resolved;
+        if (options?.authorizeSubscriber &&
+          await options.authorizeSubscriber(request, subscriberId, matched.route.operation as SubscriptionOperation) !== true) {
+          return json({ error: "Access denied" }, 403);
+        }
       }
       return await matched.route.handler(request, matched.params, subscriberId);
     } catch (error) {

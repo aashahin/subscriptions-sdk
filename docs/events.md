@@ -1,136 +1,61 @@
-# Events
+# Events and durable delivery
 
-The package can emit a typed event for every meaningful subscription lifecycle change. Use events to trigger emails, sync an external CRM/warehouse, feed analytics, or drive application-level side effects without subclassing the services.
+Business services persist billing events in `database.outbox` in the same awaited
+local transaction as the subscription, invoice, operation, and numbering changes.
+An outbox insert failure rolls the business effect back. Network collection occurs
+outside the transaction; a saved settlement can be applied again without collecting
+again after a local persistence failure.
 
-Events are opt-in: a plain `createSubscriptions` instance emits nothing.
-
-## The Contract
-
-```ts
-interface SubscriptionEvent {
-  /** Unique event ID (crypto.randomUUID) */
-  id: string;
-  /** Event type, e.g. "subscription.created" */
-  type: string;
-  /** When the event occurred */
-  occurredAt: Date;
-  /** The subscriber the event relates to, when applicable */
-  subscriberId?: string;
-  /** Event-specific payload */
-  data: Record<string, unknown>;
-}
-
-interface EventsAdapter {
-  emit(event: SubscriptionEvent): Promise<void> | void;
-}
-```
-
-An `EventsAdapter` receives every event exactly as the service layer produced it. Events are emitted only after an operation completes successfully, and delivery is fire-and-forget: `emit` failures are reported via `options.onError` (or silently swallowed) and never roll back the underlying operation. For guaranteed delivery, use the outbox adapter below.
-
-## `withEvents`
-
-Wrap an existing subscriptions instance to start emitting:
+`withEvents` delivers these persisted records after operations. It requires an
+atomic adapter with `claimPending` and `markSent`; it does not manufacture events
+from webhook envelopes. Two authenticated deliveries describing the same payment
+produce one logical invoice-paid event. `invoices.markPaid` also deduplicates its
+already-paid transition.
 
 ```ts
-import { createSubscriptions, withEvents } from "@abshahin/subscriptions";
-// `withEvents` and the event types are also exported from
-// "@abshahin/subscriptions/core/events"
+import { createSubscriptions, withEvents, relayOutbox } from '@abshahin/subscriptions';
 
-const subs = createSubscriptions({ database, features });
-
-const subsWithEvents = withEvents(subs, {
+const subscriptions = createSubscriptions({ database, features });
+const target = {
   async emit(event) {
-    await fetch("https://hooks.example.com/billing", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify(event),
-    });
+    // Persist your consumer's deduplication of event.id with its own effect.
+    await queue.publish(event.type, event);
   },
-});
-```
-
-`withEvents(subs, adapter, options?)` accepts an optional third argument:
-
-```ts
-interface WithEventsOptions {
-  /** Called when emitting an event fails (defaults to silently swallowing) */
-  onError?: (error: unknown, event: SubscriptionEvent) => void;
-  /**
-   * Payment provider for the wrapped `handleWebhookRequest`. When provided,
-   * Request-based webhooks also emit events; when omitted, the original
-   * `handleWebhookRequest` is passed through unchanged.
-   */
-  webhookProvider?: string;
-  /** Signature header used with `webhookProvider` (default "x-signature") */
-  webhookSignatureHeader?: string;
-}
-```
-
-The wrapper has the exact same `Subscriptions<TFeatures>` shape — services, convenience methods, and `handleWebhook` — so you can pass it anywhere the unwrapped instance goes. The original instance is left untouched; the wrapper is a shallow copy with wrapped methods attached.
-
-## Event Types
-
-| Type | Emitted when | `data` highlights |
-| --- | --- | --- |
-| `plan.created` | A plan is created | `planId`, `name` |
-| `plan.updated` | A plan is updated | `planId`, `name` |
-| `plan.deleted` | A plan is deleted | `planId` |
-| `subscription.created` | A subscription is created | `subscriptionId`, `planId`, `status` |
-| `subscription.renewed` | A renewal succeeds | `subscriptionId`, `planId`, `currentPeriodEnd` |
-| `subscription.plan_changed` | An upgrade/downgrade completes | `subscriptionId`, `newPlanId` |
-| `subscription.canceled` | `cancel()` runs, or a gateway `customer.subscription.deleted` webhook arrives | `subscriptionId`, `immediately` |
-| `subscription.payment_failed` | A payment failure is recorded | `subscriptionId`, `message` |
-| `usage.limit_reached` | `permissions.use()` consumes the last unit of a limited feature | `feature`, `used`, `limit` |
-| `invoice.paid` | `invoices.markPaid()` runs, or a gateway `payment.paid` webhook arrives | `invoiceId`, `amount`, `currency` (markPaid) or `gatewayInvoiceId` (webhook) |
-
-`SubscriptionEvent.type` is a plain `string`, so custom adapters may emit their own event names; the `SubscriptionEventType` union documents the names the SDK itself produces. `subscriberId` is set whenever the operation is subscriber-scoped.
-
-## Outbox Adapter (Guaranteed Delivery)
-
-In-process `emit` is fire-and-forget. If the process dies between the state change and your webhook call, the event is lost. The outbox adapter fixes this by persisting every event to a store you control — typically the same database (and ideally the same transaction) as the billing operation — and letting a separate relay deliver it.
-
-You implement the `OutboxStore` contract against your own table:
-
-```ts
-interface OutboxStore {
-  /** Persist an event for later relay (required) */
-  insert(record: OutboxRecord): Promise<void>;
-  /** Claim up to `limit` pending events for relay (needed for `relayOutbox`) */
-  claimPending?(limit?: number): Promise<OutboxRecord[]>;
-  /** Mark a claimed event as delivered */
-  markSent?(id: string): Promise<void>;
-}
-
-// OutboxRecord has the same shape as SubscriptionEvent;
-// your table may add bookkeeping columns (status, attempts, ...) on top.
-```
-
-Then plug the store into the event flow and run a relay on any schedule your platform offers (cron, Cron Trigger, queue consumer):
-
-```ts
-import {
-  withEvents,
-  createOutboxEventsAdapter,
-  relayOutbox,
-} from "@abshahin/subscriptions";
-// Also available from "@abshahin/subscriptions/core/events" (withEvents)
-// — the outbox helpers ship in the main entry point.
-
-const subsWithEvents = withEvents(subs, createOutboxEventsAdapter(store));
-
-// Delivers pending events to a target adapter and marks them sent.
-const result = await relayOutbox(store, {
-  emit: (event) => queue.publish(event.type, event),
+};
+const emittingSubscriptions = withEvents(subscriptions, target, {
+  onError(error, event) { logger.error({ error, eventId: event.id }); },
 });
 
-console.log(result.claimed, result.sent, result.failed);
+// Invoke on startup and through an existing scheduler to recover after crashes.
+const result = await relayOutbox(subscriptions.eventOutbox!, target, { limit: 100 });
 ```
 
-`relayOutbox(store, target, options?)` accepts `{ limit = 100, onError }` and returns `{ claimed, sent, failed }`.
+The relay provides **at-least-once delivery**, not exactly-once external side
+effects. A crash after the consumer accepts an event but before `markSent` can
+redeliver the same identity. Shipped stores reclaim a claim after five minutes;
+failed deliveries release their claim immediately. Consumers must deduplicate by
+`event.id`. There is no new scheduler infrastructure inside the SDK.
 
-Guidelines:
+Events include `plan.created/updated/deleted`, subscription creation, renewal,
+plan changes, cancellation, pause/resume/reactivation, payment failure/suspension,
+`usage.limit_reached`, and `invoice.paid`. Payment event identities use scoped
+actual payment resources; each confirmed failure uses its persisted attempt key.
+A scheduled plan change's event describes its effective date, rather than claiming
+that entitlement has already changed.
 
-- The relay is at-least-once: make downstream consumers idempotent (key on `event.id`).
-- A failed delivery leaves the event pending; it is retried on the next relay run.
-- `relayOutbox` requires the store to implement `claimPending`. A store with only `insert` still records events for an external relay (a CDC pipeline, or a cron worker querying the table directly).
-- Implement `claimPending` with row locking where your database supports it (e.g. `FOR UPDATE SKIP LOCKED` in Postgres) so concurrent relayers do not pick up the same events.
+`SubscriptionEvent` contains `id`, `type`, `occurredAt`, optional `subscriberId`,
+and `data`. `EventsAdapter.emit` accepts that record. `OutboxStore` supports
+`insert`, optional `claimPending`, `markSent`, and `releaseClaim`. Implement `insert`
+with a unique identity and use the transaction's store, not a separate connection.
+Claims require lease/locking behavior appropriate to your database.
+
+`createOutboxEventsAdapter(store)` remains a low-level sink for host-owned events.
+It does not make a separately committed business mutation atomic with its insert.
+Use the SDK's transaction-owned outbox for billing. The old fire-and-forget wrapper
+and its envelope-derived webhook events are removed; the wrapper's legacy webhook
+options are deprecated because the underlying Request handler already preserves
+raw payload and full provider headers.
+
+D1 and unknown Drizzle transaction modes do not support the SDK's durable billing
+mutations or `withEvents`. Ordinary driver reads and single-statement quota
+operations remain available. See the schema guides for the required migrations.
